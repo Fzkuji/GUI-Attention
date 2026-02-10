@@ -134,6 +134,7 @@ def train(args):
     print(f"  Learning rate: {args.lr}")
     print(f"  Total steps: {total_steps}")
 
+    os.makedirs(args.output_dir, exist_ok=True)
     global_step = 0
     best_loss = float("inf")
 
