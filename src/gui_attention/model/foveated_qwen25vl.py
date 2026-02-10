@@ -63,11 +63,11 @@ class FoveatedQwen25VL(nn.Module):
         self.sampler = FoveatedSampler(**(fovea_config or {}))
 
         # Grounding head
-        config = self.model.config
+        text_config = self.model.config.text_config
         self.grounding_head = FoveatedGroundingHead(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_layers=config.num_hidden_layers,
+            hidden_size=text_config.hidden_size,
+            num_heads=text_config.num_attention_heads,
+            num_layers=text_config.num_hidden_layers,
             **(grounding_config or {}),
         )
 
@@ -133,30 +133,24 @@ class FoveatedQwen25VL(nn.Module):
             x1, y1, x2, y2 = bbox
 
             # Number of visual tokens for this crop from image_grid_thw
+            # Qwen2.5-VL applies spatial_merge (2x2) so actual tokens = t * (h/m) * (w/m)
+            merge = self.config.vision_config.spatial_merge_size  # typically 2
             if i < image_grid_thw.shape[0]:
                 t, h, w = image_grid_thw[i].tolist()
-                n_tokens = int(t * h * w)
+                h_m, w_m = int(h) // merge, int(w) // merge
+                n_tokens = int(t) * h_m * w_m
             else:
                 n_tokens = 0
+                h_m = w_m = 0
 
-            # Generate grid coords mapped back to original image space
-            for row in range(int(h) if n_tokens > 0 else 0):
-                for col in range(int(w) if n_tokens > 0 else 0):
-                    # Token center in crop-local normalized coords
-                    lx = (col + 0.5) / w
-                    ly = (row + 0.5) / h
-                    # Map to original image coords
-                    ox = x1 + lx * (x2 - x1)
-                    oy = y1 + ly * (y2 - y1)
-                    all_coords.append([ox, oy])
-                    all_levels.append(crop["level"])
-
-            # If temporal dim > 1, repeat (unlikely for screenshots)
-            for _ in range(int(t) - 1 if n_tokens > 0 else 0):
-                for row in range(int(h)):
-                    for col in range(int(w)):
-                        lx = (col + 0.5) / w
-                        ly = (row + 0.5) / h
+            # Generate grid coords on the MERGED grid (post spatial-merge)
+            for rep in range(int(t) if n_tokens > 0 else 0):
+                for row in range(h_m):
+                    for col in range(w_m):
+                        # Token center in crop-local normalized coords
+                        lx = (col + 0.5) / w_m
+                        ly = (row + 0.5) / h_m
+                        # Map to original image coords
                         ox = x1 + lx * (x2 - x1)
                         oy = y1 + ly * (y2 - y1)
                         all_coords.append([ox, oy])
