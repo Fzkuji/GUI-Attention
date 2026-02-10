@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gui-attention"
+version = "0.1.0"
+description = "Foveated Visual Attention for Efficient GUI Grounding and Agent"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Zichuan Fu"},
+]
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.45.0",
+    "accelerate>=0.34.0",
+    "qwen-vl-utils",
+    "Pillow",
+    "einops",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+train = [
+    "deepspeed>=0.14.0",
+    "wandb",
+]
+eval = [
+    "datasets",
+    "tqdm",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "pre-commit",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
