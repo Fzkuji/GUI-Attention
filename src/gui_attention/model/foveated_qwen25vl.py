@@ -113,8 +113,11 @@ class FoveatedQwen25VL(nn.Module):
 
     def _compute_visual_token_coords(
         self, crops: list[dict], input_ids: torch.Tensor, image_grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute normalized (x,y) coords and level IDs for each visual token.
+
+        Uses image_grid_thw from the processor to determine exact token counts
+        per crop after spatial merging (2x2 by default in Qwen2.5-VL).
 
         Returns:
             token_coords: (num_visual_tokens, 2) in original image space [0,1].
@@ -128,23 +131,21 @@ class FoveatedQwen25VL(nn.Module):
         all_coords = []
         all_levels = []
 
+        merge = self.model.config.vision_config.spatial_merge_size  # typically 2
+
         for i, crop in enumerate(crops):
             bbox = crop["bbox"]  # (x1_n, y1_n, x2_n, y2_n) normalized
             x1, y1, x2, y2 = bbox
 
-            # Number of visual tokens for this crop from image_grid_thw
-            # Qwen2.5-VL applies spatial_merge (2x2) so actual tokens = t * (h/m) * (w/m)
-            merge = self.config.vision_config.spatial_merge_size  # typically 2
             if i < image_grid_thw.shape[0]:
                 t, h, w = image_grid_thw[i].tolist()
-                h_m, w_m = int(h) // merge, int(w) // merge
-                n_tokens = int(t) * h_m * w_m
+                t, h, w = int(t), int(h), int(w)
+                h_m, w_m = h // merge, w // merge
             else:
-                n_tokens = 0
-                h_m = w_m = 0
+                continue
 
             # Generate grid coords on the MERGED grid (post spatial-merge)
-            for rep in range(int(t) if n_tokens > 0 else 0):
+            for _ in range(t):
                 for row in range(h_m):
                     for col in range(w_m):
                         # Token center in crop-local normalized coords
