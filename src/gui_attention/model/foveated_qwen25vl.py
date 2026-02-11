@@ -291,96 +291,130 @@ class FoveatedQwen25VL(nn.Module):
             "gt_coords": gt_coords,
         }
 
-    def _calculate_attention_from_hidden_states(
+    def _single_image_forward(
         self,
-        hidden_states: tuple,
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        query_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Recompute QK attention from hidden states (like GUI-AIMA).
-
-        This extracts attention AFTER generation, when the model has already
-        "thought about" the instruction, producing semantically meaningful attention.
+        image: "Image.Image",
+        instruction: str,
+        max_new_tokens: int = 10,
+    ) -> tuple[str, torch.Tensor, torch.Tensor]:
+        """Forward a single image through Qwen2.5-VL and get generated text + attention.
 
         Args:
-            hidden_states: Tuple of (per_layer_hidden_states,) per generation step.
-                           hidden_states[t][layer_idx] = (B, seq_len, hidden_dim)
-            position_ids: Position IDs for RoPE.
-            attention_mask: Attention mask.
-            query_indices: Indices of query tokens to compute attention for.
+            image: Single PIL Image (one resolution level).
+            instruction: Text instruction.
+            max_new_tokens: Number of tokens to generate.
 
         Returns:
-            attention: (num_layers, num_heads, num_query, seq_len) attention weights.
+            (generated_text, attention_over_visual_tokens, visual_token_coords)
+            - generated_text: str
+            - attn_map: (num_visual_tokens,) aggregated attention weights
+            - token_coords: (num_visual_tokens, 2) normalized coords in [0,1]
         """
-        qwen_decoder = self.model.model
-        num_layers = len(qwen_decoder.layers)
+        # Build message with single image
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": f"Instruction: {instruction}\nPlease identify the location of the target element."},
+        ]}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=[image], padding=True, return_tensors="pt")
+        inputs = inputs.to(self.model.device)
 
-        # Use hidden states from timestep 0 (prefill), which contains all layers
-        hs_per_layer = hidden_states[0]  # tuple of (B, seq_len, hidden) per layer
-        bsz, seq_len, _ = hs_per_layer[0].shape
-
-        # Compute position_ids if not provided
-        if position_ids is None:
-            # Simple sequential position IDs (3D for Qwen2.5-VL multimodal RoPE)
-            seq_ids = torch.arange(seq_len, device=hs_per_layer[0].device).unsqueeze(0).expand(bsz, -1)
-            position_ids = seq_ids.unsqueeze(0).expand(3, -1, -1)  # (3, B, seq_len)
-
-        # Compute RoPE
-        cos, sin = qwen_decoder.rotary_emb(hs_per_layer[0], position_ids)
-
-        # Build causal mask
-        orig_impl = qwen_decoder.config._attn_implementation
-        qwen_decoder.config._attn_implementation = "eager"
-        causal_mask = qwen_decoder._update_causal_mask(
-            attention_mask,
-            hs_per_layer[0],
-            cache_position=torch.arange(seq_len, device=hs_per_layer[0].device),
-            past_key_values=None,
+        # Generate with attention
+        results = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            return_dict_in_generate=True,
             output_attentions=True,
+            temperature=0.1,
         )
-        qwen_decoder.config._attn_implementation = orig_impl
 
-        all_layer_attns = []
+        # Decode generated text
+        input_ids = inputs["input_ids"][0]
+        generated_ids = results.sequences[0][len(input_ids):]
+        generated_text = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-        for layer_idx in range(num_layers):
-            layer = qwen_decoder.layers[layer_idx]
-            self_attn = layer.self_attn
+        # Extract visual token indices
+        visual_mask = (input_ids == IMAGE_PAD_ID)
+        visual_indices = visual_mask.nonzero(as_tuple=True)[0]
+        n_visual = visual_indices.shape[0]
 
-            # Get layer input (hidden state from previous layer, after layernorm)
-            layer_input = hs_per_layer[layer_idx]
-            layer_input = layer.input_layernorm(layer_input)
+        if n_visual == 0:
+            return generated_text, torch.zeros(0), torch.zeros(0, 2)
 
-            # Project Q (only for query indices) and K (full sequence)
-            layer_input_q = layer_input[:, query_indices, :]
-            q_proj = self_attn.q_proj(layer_input_q)
-            k_proj = self_attn.k_proj(layer_input)
+        # Aggregate attention from generated tokens → visual tokens
+        # Use attention from all generation steps
+        # results.attentions[0] = prefill attentions (tuple of layers)
+        # results.attentions[t] = generation step t attentions (tuple of layers, but only 1 query token)
+        num_layers = len(results.attentions[0])
 
-            # Reshape
-            n_q = len(query_indices)
-            q = q_proj.view(bsz, n_q, -1, self_attn.head_dim).transpose(1, 2)
-            k = k_proj.view(bsz, seq_len, -1, self_attn.head_dim).transpose(1, 2)
+        # Use the LAST generated token's attention (most informed)
+        # For generation steps > 0, attention is (B, H, 1, current_seq_len)
+        # But we need attention over original visual tokens
+        # Simpler: use prefill attention from the last text token before generation
+        last_input_pos = len(input_ids) - 1
+        prefill_attns = results.attentions[0]  # tuple of (B, H, seq, seq) per layer
 
-            # Expand KV heads
-            k = repeat_kv(k, self_attn.num_key_value_groups)
+        agg_attn = torch.zeros(n_visual, device=input_ids.device, dtype=torch.float32)
+        for layer_attn in prefill_attns:
+            # layer_attn: (B, H, seq, seq) — average over heads
+            attn = layer_attn[0, :, last_input_pos, visual_indices]  # (H, n_visual)
+            agg_attn += attn.float().mean(dim=0)  # average over heads
+        agg_attn /= num_layers  # average over layers
 
-            # Apply RoPE
-            cos_q = cos[:, :, query_indices, :]
-            sin_q = sin[:, :, query_indices, :]
-            q, _ = apply_multimodal_rotary_pos_emb(q, q.clone(), cos_q, sin_q, self_attn.rope_scaling["mrope_section"])
-            k, _ = apply_multimodal_rotary_pos_emb(k, k.clone(), cos, sin, self_attn.rope_scaling["mrope_section"])
+        # Compute visual token coordinates (full image = bbox (0,0,1,1))
+        image_grid_thw = inputs.get("image_grid_thw", torch.zeros(0, 3))
+        merge = self.model.config.vision_config.spatial_merge_size
+        coords = []
+        if image_grid_thw.shape[0] > 0:
+            t, h, w = image_grid_thw[0].tolist()
+            t, h, w = int(t), int(h), int(w)
+            h_m, w_m = h // merge, w // merge
+            for _t in range(t):
+                for row in range(h_m):
+                    for col in range(w_m):
+                        coords.append([(col + 0.5) / w_m, (row + 0.5) / h_m])
 
-            # Compute attention scores
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self_attn.head_dim)
+        token_coords = torch.tensor(coords, dtype=torch.float32, device=input_ids.device)
 
-            if causal_mask is not None:
-                attn_scores = attn_scores + causal_mask[:, :, query_indices, :].to(attn_scores.dtype)
+        # Align
+        min_n = min(len(token_coords), n_visual)
+        token_coords = token_coords[:min_n]
+        agg_attn = agg_attn[:min_n]
 
-            attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            all_layer_attns.append(attn_weights[0])  # (num_heads, n_q, seq_len)
+        return generated_text, agg_attn, token_coords
 
-        # Stack: (num_layers, num_heads, n_q, seq_len)
-        return torch.stack(all_layer_attns, dim=0)
+    def _find_attention_peak(
+        self,
+        attn_map: torch.Tensor,
+        token_coords: torch.Tensor,
+        bbox: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    ) -> tuple[float, float]:
+        """Find the peak attention location in original image coordinates.
+
+        Args:
+            attn_map: (N,) attention weights over visual tokens.
+            token_coords: (N, 2) coords in crop-local [0,1] space.
+            bbox: (x1, y1, x2, y2) of the crop in original image space.
+
+        Returns:
+            (x, y) in original image normalized coordinates.
+        """
+        if len(attn_map) == 0:
+            return 0.5, 0.5
+
+        # Softmax to get distribution
+        attn_probs = F.softmax(attn_map, dim=0)
+
+        # Weighted average of coordinates (in crop space)
+        cx = (attn_probs * token_coords[:, 0]).sum().item()
+        cy = (attn_probs * token_coords[:, 1]).sum().item()
+
+        # Map to original image space
+        x1, y1, x2, y2 = bbox
+        ox = x1 + cx * (x2 - x1)
+        oy = y1 + cy * (y2 - y1)
+
+        return ox, oy
 
     @torch.no_grad()
     def predict(
@@ -388,18 +422,21 @@ class FoveatedQwen25VL(nn.Module):
         image,
         instruction: str,
         fixation: Optional[tuple[float, float]] = None,
-        max_new_tokens: int = 1,
+        num_rounds: int = 3,
+        gen_tokens_per_round: int = 10,
     ) -> tuple[float, float]:
-        """Generation-based inference: screenshot + instruction → (x, y).
+        """Iterative foveated inference: progressively zoom in on the target.
 
-        Uses model.generate() to produce semantically meaningful attention,
-        then extracts anchor→visual attention for grounding.
+        Round 1: Input periphery (low-res full image) → generate → find attention peak
+        Round 2: Crop parafovea around peak → generate → refine peak
+        Round 3: Crop fovea around refined peak → generate → final coordinates
 
         Args:
             image: PIL Image or path to screenshot.
-            instruction: Text instruction (e.g., "Click the search button").
-            fixation: Optional initial fixation point. If None, uses center.
-            max_new_tokens: Tokens to generate (more = better attention, slower).
+            instruction: Text instruction.
+            fixation: Optional initial fixation (overrides Round 1 center).
+            num_rounds: Number of refinement rounds (1-3).
+            gen_tokens_per_round: Tokens to generate per round.
 
         Returns:
             (x, y) normalized coordinates of predicted click point.
@@ -409,75 +446,41 @@ class FoveatedQwen25VL(nn.Module):
         if isinstance(image, str):
             image = PILImage.open(image).convert("RGB")
 
-        # Step 1: Foveated sampling
-        foveated = self.sampler.sample(image, fixation=fixation)
-        crops = foveated["crops"]
+        W, H = image.size
 
-        # Step 2: Build messages and process
-        messages = self._build_foveated_messages(crops, instruction)
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        crop_images = [c["image"] for c in crops]
-        inputs = self.processor(
-            text=[text],
-            images=crop_images,
-            padding=True,
-            return_tensors="pt",
+        # Round 1: Periphery (full image, low resolution)
+        periphery = image.resize(
+            (self.sampler.periphery_resolution,
+             int(self.sampler.periphery_resolution * H / W)),
+            PILImage.LANCZOS,
         )
-        inputs = inputs.to(self.model.device)
-
-        # Step 3: Generate tokens with hidden states for QK attention recomputation
-        results = self.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            return_dict_in_generate=True,
-            output_hidden_states=True,
-            temperature=0.1,
+        gen_text, attn_map, token_coords = self._single_image_forward(
+            periphery, instruction, max_new_tokens=gen_tokens_per_round
         )
+        fx, fy = self._find_attention_peak(attn_map, token_coords, bbox=(0.0, 0.0, 1.0, 1.0))
 
-        # Step 4: Extract visual token info from original input
-        input_ids = inputs["input_ids"][0]
-        visual_mask = (input_ids == IMAGE_PAD_ID)
-        visual_indices = visual_mask.nonzero(as_tuple=True)[0]
+        if num_rounds < 2:
+            return (fx, fy)
 
-        # Find anchor position
-        anchor_pos = self._find_anchor_position(input_ids)
-
-        # Step 5: Recompute QK attention from hidden states (like GUI-AIMA)
-        # This gives semantically meaningful attention after the model has "thought"
-        query_indices = torch.tensor([anchor_pos], device=input_ids.device)
-        attention = self._calculate_attention_from_hidden_states(
-            hidden_states=results.hidden_states,
-            position_ids=None,  # Will be computed inside
-            attention_mask=inputs["attention_mask"],
-            query_indices=query_indices,
+        # Round 2: Parafovea (medium crop around attention peak)
+        para_crop_data = self.sampler._extract_crop(
+            image, fx, fy, self.sampler.parafovea_size, self.sampler.parafovea_resolution
         )
-        # attention: (num_layers, num_heads, 1, seq_len)
-        anchor_attn = attention[:, :, 0, visual_indices]  # (num_layers, num_heads, n_visual)
-        anchor_attn = anchor_attn.unsqueeze(0)  # (1, num_layers, num_heads, n_visual)
-
-        # Step 7: Compute visual token coordinates
-        crop_bboxes = [c["bbox"] for c in crops]
-        crop_levels = [c["level"] for c in crops]
-        token_coords, level_ids, _ = self._compute_visual_token_coords(
-            crop_bboxes, crop_levels, input_ids,
-            inputs.get("image_grid_thw", torch.zeros(0, 3))
+        gen_text2, attn_map2, token_coords2 = self._single_image_forward(
+            para_crop_data["image"], instruction, max_new_tokens=gen_tokens_per_round
         )
+        fx, fy = self._find_attention_peak(attn_map2, token_coords2, bbox=para_crop_data["bbox"])
 
-        # Align counts
-        n_coords = token_coords.shape[0]
-        n_visual = visual_indices.shape[0]
-        if n_coords != n_visual:
-            min_n = min(n_coords, n_visual)
-            token_coords = token_coords[:min_n]
-            level_ids = level_ids[:min_n]
-            anchor_attn = anchor_attn[:, :, :, :min_n]
+        if num_rounds < 3:
+            return (fx, fy)
 
-        # Step 8: Grounding head prediction
-        coords = self.grounding_head(
-            anchor_attention=anchor_attn,
-            visual_token_coords=token_coords.unsqueeze(0),
-            fovea_level_ids=level_ids.unsqueeze(0),
+        # Round 3: Fovea (high-res crop around refined attention peak)
+        fovea_crop_data = self.sampler._extract_crop(
+            image, fx, fy, self.sampler.fovea_size, self.sampler.fovea_resolution
         )
+        gen_text3, attn_map3, token_coords3 = self._single_image_forward(
+            fovea_crop_data["image"], instruction, max_new_tokens=gen_tokens_per_round
+        )
+        fx, fy = self._find_attention_peak(attn_map3, token_coords3, bbox=fovea_crop_data["bbox"])
 
-        x, y = coords[0].tolist()
-        return (x, y)
+        return (fx, fy)
