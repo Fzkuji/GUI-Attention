@@ -341,25 +341,35 @@ class FoveatedQwen25VL(nn.Module):
         if n_visual == 0:
             return generated_text, torch.zeros(0), torch.zeros(0, 2)
 
-        # Aggregate attention from generated tokens → visual tokens
-        # Use attention from all generation steps
-        # results.attentions[0] = prefill attentions (tuple of layers)
-        # results.attentions[t] = generation step t attentions (tuple of layers, but only 1 query token)
-        num_layers = len(results.attentions[0])
-
-        # Use the LAST generated token's attention (most informed)
-        # For generation steps > 0, attention is (B, H, 1, current_seq_len)
-        # But we need attention over original visual tokens
-        # Simpler: use prefill attention from the last text token before generation
-        last_input_pos = len(input_ids) - 1
-        prefill_attns = results.attentions[0]  # tuple of (B, H, seq, seq) per layer
+        # Aggregate attention from GENERATION steps (not prefill!)
+        # results.attentions[0] = prefill attentions (flat, useless)
+        # results.attentions[t] for t>=1 = generation step t: tuple of layers, each (B, H, 1, seq_len_so_far)
+        # Visual token indices are still valid in the KV cache positions
+        num_gen_steps = len(results.attentions) - 1  # exclude prefill
+        if num_gen_steps > 0:
+            num_layers = len(results.attentions[1])
+        else:
+            num_layers = len(results.attentions[0])
 
         agg_attn = torch.zeros(n_visual, device=input_ids.device, dtype=torch.float32)
-        for layer_attn in prefill_attns:
-            # layer_attn: (B, H, seq, seq) — average over heads
-            attn = layer_attn[0, :, last_input_pos, visual_indices]  # (H, n_visual)
-            agg_attn += attn.float().mean(dim=0)  # average over heads
-        agg_attn /= num_layers  # average over layers
+
+        if num_gen_steps > 0:
+            # Use attention from all generation steps → visual tokens
+            for step in range(1, len(results.attentions)):
+                step_attns = results.attentions[step]  # tuple of layers
+                for layer_attn in step_attns:
+                    # layer_attn: (B, H, 1, current_seq_len)
+                    # visual_indices are positions in original input, still valid
+                    attn = layer_attn[0, :, 0, visual_indices]  # (H, n_visual)
+                    agg_attn += attn.float().mean(dim=0)
+            agg_attn /= (num_gen_steps * num_layers)
+        else:
+            # Fallback to prefill (shouldn't happen if max_new_tokens > 0)
+            last_input_pos = len(input_ids) - 1
+            for layer_attn in results.attentions[0]:
+                attn = layer_attn[0, :, last_input_pos, visual_indices]
+                agg_attn += attn.float().mean(dim=0)
+            agg_attn /= num_layers
 
         # Compute visual token coordinates (full image = bbox (0,0,1,1))
         image_grid_thw = inputs.get("image_grid_thw", torch.zeros(0, 3))
