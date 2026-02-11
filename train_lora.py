@@ -82,7 +82,7 @@ def collate_fn(batch, processor):
     for item in batch:
         img = Image.open(item["image_path"]).convert("RGB")
         # Resize to reduce memory (ScreenSpot-Pro images are huge 3840x2160)
-        max_size = 1280
+        max_size = 800
         w, h = img.size
         if max(w, h) > max_size:
             scale = max_size / max(w, h)
@@ -207,13 +207,13 @@ def main():
         lr_scheduler_type="cosine",
         logging_steps=10,
         save_strategy="epoch",
-        eval_strategy="epoch",
+        eval_strategy="no",
         bf16=True,
         dataloader_num_workers=2,
         remove_unused_columns=False,
         report_to="none",
         save_total_limit=2,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
     )
 
     # Custom collate
