@@ -341,16 +341,18 @@ class FoveatedQwen25VL(nn.Module):
         target_idx = torch.tensor([len(input_ids) - 1], device=input_ids.device)
         merged_indices = torch.cat([query_indices, target_idx], dim=0)
 
-        # QK-recompute attention from hidden states
+        # QK-recompute attention from prefill hidden states ONLY
+        # results.hidden_states[0] = prefill (full seq), [t>0] = gen steps (1 token each)
         calculated_attention = calculate_attention_from_qk(
             model=self.model,
-            all_hidden_states=results.hidden_states,
+            all_hidden_states=[results.hidden_states[0]],
             all_position_ids=position_ids,
             query_indices=merged_indices,
             all_attention_mask=inputs["attention_mask"],
         )
 
         # Get hidden states for query weighting (cosine similarity)
+        # hidden_states[0] has (num_layers+1) tensors; skip layer 0 (embeddings)
         all_layer_hs = torch.stack(results.hidden_states[0][1:], dim=0)  # (n_layer, B, seq, d)
         sample_layer_hs = all_layer_hs[:, 0, :, :]  # (n_layer, seq, d)
 
