@@ -320,6 +320,12 @@ class FoveatedQwen25VL(nn.Module):
         hs_per_layer = hidden_states[0]  # tuple of (B, seq_len, hidden) per layer
         bsz, seq_len, _ = hs_per_layer[0].shape
 
+        # Compute position_ids if not provided
+        if position_ids is None:
+            # Simple sequential position IDs (3D for Qwen2.5-VL multimodal RoPE)
+            seq_ids = torch.arange(seq_len, device=hs_per_layer[0].device).unsqueeze(0).expand(bsz, -1)
+            position_ids = seq_ids.unsqueeze(0).expand(3, -1, -1)  # (3, B, seq_len)
+
         # Compute RoPE
         cos, sin = qwen_decoder.rotary_emb(hs_per_layer[0], position_ids)
 
@@ -419,15 +425,7 @@ class FoveatedQwen25VL(nn.Module):
         )
         inputs = inputs.to(self.model.device)
 
-        # Step 3: Compute position_ids for RoPE
-        position_ids, _ = self.model.get_rope_index(
-            input_ids=inputs["input_ids"],
-            image_grid_thw=inputs.get("image_grid_thw"),
-            video_grid_thw=None,
-            attention_mask=inputs["attention_mask"],
-        )
-
-        # Step 4: Generate with hidden states output
+        # Step 3: Generate tokens with hidden states for QK attention recomputation
         results = self.model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -436,7 +434,7 @@ class FoveatedQwen25VL(nn.Module):
             temperature=0.1,
         )
 
-        # Step 5: Extract visual token info
+        # Step 4: Extract visual token info from original input
         input_ids = inputs["input_ids"][0]
         visual_mask = (input_ids == IMAGE_PAD_ID)
         visual_indices = visual_mask.nonzero(as_tuple=True)[0]
@@ -444,18 +442,16 @@ class FoveatedQwen25VL(nn.Module):
         # Find anchor position
         anchor_pos = self._find_anchor_position(input_ids)
 
-        # Use anchor as query token
+        # Step 5: Recompute QK attention from hidden states (like GUI-AIMA)
+        # This gives semantically meaningful attention after the model has "thought"
         query_indices = torch.tensor([anchor_pos], device=input_ids.device)
-
-        # Step 6: Recompute attention from hidden states
         attention = self._calculate_attention_from_hidden_states(
             hidden_states=results.hidden_states,
-            position_ids=position_ids,
+            position_ids=None,  # Will be computed inside
             attention_mask=inputs["attention_mask"],
             query_indices=query_indices,
         )
         # attention: (num_layers, num_heads, 1, seq_len)
-        # Extract anchor→visual attention
         anchor_attn = attention[:, :, 0, visual_indices]  # (num_layers, num_heads, n_visual)
         anchor_attn = anchor_attn.unsqueeze(0)  # (1, num_layers, num_heads, n_visual)
 
