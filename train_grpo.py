@@ -359,10 +359,17 @@ class FoveationGRPOTrainer:
     
     def _build_prompt(self, sample):
         """Build conversation prompt for a single sample."""
+        # Modified system message to encourage thinking before pointing
+        system_msg = (
+            "You are a GUI grounding assistant. "
+            "Given a screenshot and an instruction, first briefly describe where the target element is located, "
+            "then click on it using pyautogui.click(<|pointer_pad|>). "
+            "Example: The save button is in the top-right toolbar area. pyautogui.click(<|pointer_pad|>)"
+        )
         conversation = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": grounding_system_message}]
+                "content": [{"type": "text", "text": system_msg}]
             },
             {
                 "role": "user",
@@ -379,8 +386,10 @@ class FoveationGRPOTrainer:
             add_generation_prompt=False,
             chat_template=chat_template
         )
-        # Add generation prompt (assistant header)
+        # Add generation prompt — encourage thinking before pointing
+        # The model should generate free-form analysis, then pyautogui.click(<pointer_pad>)
         text += "<|im_start|>assistant<|recipient|>os\n"
+        # Don't pre-fill anything — let the model generate both thinking and action
         
         image_inputs, _ = process_vision_info(conversation)
         inputs = self.processor(
