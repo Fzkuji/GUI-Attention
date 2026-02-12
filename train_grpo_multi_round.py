@@ -293,7 +293,10 @@ def sample_from_attention(attn_weights, n_w, n_h, temperature=1.0):
         probs = F.softmax(logits, dim=-1)
     else:
         probs = attn_weights
-    dist = torch.distributions.Categorical(probs=probs.squeeze(0))
+    # Renormalize to satisfy Simplex constraint (bf16 precision can drift)
+    p = probs.squeeze(0).float()
+    p = p / p.sum().clamp(min=1e-8)
+    dist = torch.distributions.Categorical(probs=p)
     idx = dist.sample()
     lp = dist.log_prob(idx)
     px = idx.item() % n_w
