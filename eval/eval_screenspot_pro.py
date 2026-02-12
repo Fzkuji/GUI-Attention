@@ -1,18 +1,25 @@
 """
-Unified ScreenSpot-Pro evaluation script for GUI-Attention project.
+ScreenSpot-Pro evaluation script for GUI-Attention project.
 Fully aligned with GUI-AIMA original evaluation methodology.
 
-Modes:
-  standard   - GUI-AIMA standard single-round (high-res, ~44%)
-  low_res    - Single-round with lower max_pixels
-  two_stage  - GUI-AIMA 2-step crop strategy
-  our_single - Our single-round attention approach
-  our_multi  - Our multi-round foveation approach
+Instead of fixed modes, evaluation is configured via composable parameters:
+  --rounds          Number of inference rounds (1 = single-round)
+  --multi_strategy  Multi-round strategy: "crop_resize" (GUI-AIMA) or "token_concat" (ours)
+  --resolution      Per-round resolution: "high" or "low"
+  --crop_ratio      Crop ratio for multi-round (default 0.3)
 
-Usage:
-  python eval/eval_screenspot_pro.py --mode standard --model_name_or_path <path>
-  python eval/eval_screenspot_pro.py --mode two_stage --model_name_or_path <path>
-  python eval/eval_screenspot_pro.py --mode our_multi --model_name_or_path <path> --max_rounds 5
+Examples:
+  # GUI-AIMA standard single-round (high-res)
+  python eval/eval_screenspot_pro.py --rounds 1 --resolution high
+
+  # GUI-AIMA two-stage crop
+  python eval/eval_screenspot_pro.py --rounds 2 --multi_strategy crop_resize
+
+  # Our multi-round foveation (token concat), 5 rounds, low first round
+  python eval/eval_screenspot_pro.py --rounds 5 --multi_strategy token_concat --resolution low
+
+  # Single-round low-res
+  python eval/eval_screenspot_pro.py --rounds 1 --resolution low
 """
 
 import argparse
@@ -74,7 +81,6 @@ def crop_subimage(img_width, img_height, cx, cy, crop_size):
     start_y = max(0, cy - half)
     end_x = min(img_width, start_x + crop_size)
     end_y = min(img_height, start_y + crop_size)
-    # Adjust if we hit the edge
     if end_x - start_x < crop_size:
         start_x = max(0, end_x - crop_size)
     if end_y - start_y < crop_size:
@@ -83,7 +89,8 @@ def crop_subimage(img_width, img_height, cx, cy, crop_size):
 
 
 def crop_image_ratio(image, center_x, center_y, crop_ratio):
-    """Crop a region around (center_x, center_y) in normalized [0,1] coords."""
+    """Crop a region around (center_x, center_y) in normalized [0,1] coords.
+    Returns (cropped_image, crop_bbox_normalized)."""
     W, H = image.size
     crop_w = int(W * crop_ratio)
     crop_h = int(H * crop_ratio)
@@ -216,7 +223,7 @@ def load_model(model_name_or_path, max_pixels, device="cuda:0"):
 
 
 # ---------------------------------------------------------------------------
-# Inference helpers
+# Inference functions
 # ---------------------------------------------------------------------------
 
 def make_conversation(image, instruction, system_message=GROUNDING_SYSTEM_MESSAGE):
@@ -230,14 +237,14 @@ def make_conversation(image, instruction, system_message=GROUNDING_SYSTEM_MESSAG
     ]
 
 
-def run_single_inference(image, instruction, model, tokenizer, processor,
-                         use_placeholder=True, topk=3, resize_to_pixels=None):
-    """Run standard single-round inference, optionally resizing the image."""
-    image_width, image_height = image.size
-    if resize_to_pixels is not None and (image_width * image_height) != resize_to_pixels:
-        ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
-        new_w, new_h = int(image_width * ratio), int(image_height * ratio)
-        image = image.resize((new_w, new_h))
+def run_single_round(image, instruction, model, tokenizer, processor,
+                     use_placeholder=True, topk=3, resize_to_pixels=None):
+    """Single-round inference, optionally resizing the image first."""
+    if resize_to_pixels is not None and resize_to_pixels > 0:
+        w, h = image.size
+        if w * h != resize_to_pixels:
+            ratio = (resize_to_pixels / (w * h)) ** 0.5
+            image = image.resize((int(w * ratio), int(h * ratio)))
 
     conversation = make_conversation(image, instruction)
     pred = inference(conversation, model, tokenizer, processor,
@@ -245,66 +252,72 @@ def run_single_inference(image, instruction, model, tokenizer, processor,
     return pred
 
 
-def run_two_stage_inference(image, instruction, model, tokenizer, processor,
-                            use_placeholder=True, topk=3):
-    """GUI-AIMA two-stage: full image → crop around prediction → re-predict."""
-    ori_image = image.copy()
-    img_w, img_h = ori_image.size
+def run_multi_crop_resize(image, instruction, model, tokenizer, processor,
+                          use_placeholder=True, topk=3, rounds=2,
+                          resize_to_pixels=None):
+    """GUI-AIMA style multi-round: predict → crop around prediction → upscale → re-predict.
+    Each subsequent round crops around the previous prediction."""
+    img_w, img_h = image.size
 
-    # Stage 1: full image (no resize, processor handles it via max_pixels)
-    conversation = make_conversation(image, instruction)
-    pred1 = inference(conversation, model, tokenizer, processor,
-                      logits_processor=None, use_placeholder=use_placeholder, topk=topk)
-    topk_points_1 = pred1["topk_points"]
-    norm_cx, norm_cy = topk_points_1[0]
-
-    # Compute crop size (matches GUI-AIMA two_stage formula)
-    portion_size = 560 ** 2
-    crop_size = int(((img_w * img_h * portion_size / 5760000) ** 0.5) / 28) * 28
-
-    # Stage 2: crop and 2x upscale
-    px_center = int(norm_cx * img_w)
-    py_center = int(norm_cy * img_h)
-    start_x, start_y, end_x, end_y = crop_subimage(img_w, img_h, px_center, py_center, crop_size)
-    cropped = ori_image.crop((start_x, start_y, end_x, end_y))
-    cw, ch = cropped.size
-    cropped_upscaled = cropped.resize((cw * 2, ch * 2), Image.BICUBIC)
-
-    conversation2 = make_conversation(cropped_upscaled, instruction)
-    pred2 = inference(conversation2, model, tokenizer, processor,
-                      logits_processor=None, use_placeholder=use_placeholder, topk=topk)
-
-    # Map crop-local predictions back to original image coords
-    topk_points_final = []
-    cw2, ch2 = cropped_upscaled.size
-    for (norm_px, norm_py) in pred2["topk_points"]:
-        px_in_crop = int(norm_px * cw2)
-        py_in_crop = int(norm_py * ch2)
-        px_orig = px_in_crop / 2 + start_x
-        py_orig = py_in_crop / 2 + start_y
-        topk_points_final.append((px_orig / img_w, py_orig / img_h))
-
-    # Return a pred-like dict with remapped points and stage2 patch dims
-    return {
-        "topk_points": topk_points_final,
-        "n_width": pred2["n_width"],
-        "n_height": pred2["n_height"],
-    }
-
-
-def run_our_multi_inference(image, instruction, model, tokenizer, processor,
-                            use_placeholder=True, topk=3,
-                            max_rounds=5, crop_ratio=0.3,
-                            convergence_threshold=0.02):
-    """Our multi-round foveation: predict → crop → predict on (original + crop) → refine."""
     # Round 1
-    conversation = make_conversation(image, instruction)
-    pred = inference(conversation, model, tokenizer, processor,
-                     logits_processor=None, use_placeholder=use_placeholder, topk=topk)
-    px, py = pred["topk_points"][0]
-    prev_x, prev_y = px, py
+    pred = run_single_round(image, instruction, model, tokenizer, processor,
+                            use_placeholder=use_placeholder, topk=topk,
+                            resize_to_pixels=resize_to_pixels)
+    if rounds <= 1:
+        return pred
 
-    for round_idx in range(1, max_rounds):
+    cur_x, cur_y = pred["topk_points"][0]  # normalized [0,1]
+
+    for r in range(1, rounds):
+        # Compute crop size (GUI-AIMA formula)
+        portion_size = 560 ** 2
+        crop_size = int(((img_w * img_h * portion_size / 5760000) ** 0.5) / 28) * 28
+
+        px_center = int(cur_x * img_w)
+        py_center = int(cur_y * img_h)
+        start_x, start_y, end_x, end_y = crop_subimage(img_w, img_h, px_center, py_center, crop_size)
+        cropped = image.crop((start_x, start_y, end_x, end_y))
+        cw, ch = cropped.size
+        cropped_upscaled = cropped.resize((cw * 2, ch * 2), Image.BICUBIC)
+
+        conversation = make_conversation(cropped_upscaled, instruction)
+        pred_r = inference(conversation, model, tokenizer, processor,
+                           logits_processor=None, use_placeholder=use_placeholder, topk=topk)
+
+        # Map crop-local predictions back to original image coords
+        cw2, ch2 = cropped_upscaled.size
+        topk_mapped = []
+        for (nx, ny) in pred_r["topk_points"]:
+            px_orig = (nx * cw2) / 2 + start_x
+            py_orig = (ny * ch2) / 2 + start_y
+            topk_mapped.append((px_orig / img_w, py_orig / img_h))
+
+        cur_x, cur_y = topk_mapped[0]
+        pred = {
+            "topk_points": topk_mapped,
+            "n_width": pred_r["n_width"],
+            "n_height": pred_r["n_height"],
+        }
+
+    return pred
+
+
+def run_multi_token_concat(image, instruction, model, tokenizer, processor,
+                           use_placeholder=True, topk=3, rounds=5,
+                           crop_ratio=0.3, convergence_threshold=0.02,
+                           resize_to_pixels=None):
+    """Our multi-round foveation: predict → crop → feed (original + crop) → refine.
+    Uses token concatenation instead of crop+resize replacement."""
+    # Round 1
+    pred = run_single_round(image, instruction, model, tokenizer, processor,
+                            use_placeholder=use_placeholder, topk=topk,
+                            resize_to_pixels=resize_to_pixels)
+    if rounds <= 1:
+        return pred
+
+    prev_x, prev_y = pred["topk_points"][0]
+
+    for r in range(1, rounds):
         cropped, crop_bbox = crop_image_ratio(image, prev_x, prev_y, crop_ratio)
 
         # Multi-image conversation: full image + cropped region
@@ -326,23 +339,23 @@ def run_our_multi_inference(image, instruction, model, tokenizer, processor,
             pred_r = inference(conversation, model, tokenizer, processor,
                                logits_processor=None, use_placeholder=use_placeholder, topk=topk)
         except Exception as e:
-            print(f"  Round {round_idx + 1} error: {e}")
+            print(f"  Round {r + 1} error: {e}")
             break
 
-        if pred_r["topk_points"]:
-            local_x, local_y = pred_r["topk_points"][0]
-            bx1, by1, bx2, by2 = crop_bbox
-            cur_x = bx1 + local_x * (bx2 - bx1)
-            cur_y = by1 + local_y * (by2 - by1)
-        else:
+        if not pred_r["topk_points"]:
             break
+
+        # Map local crop coords back to global
+        local_x, local_y = pred_r["topk_points"][0]
+        bx1, by1, bx2, by2 = crop_bbox
+        cur_x = bx1 + local_x * (bx2 - bx1)
+        cur_y = by1 + local_y * (by2 - by1)
 
         dist = math.sqrt((cur_x - prev_x) ** 2 + (cur_y - prev_y) ** 2)
         prev_x, prev_y = cur_x, cur_y
         if dist < convergence_threshold:
             break
 
-    # Build final result
     return {
         "topk_points": [(prev_x, prev_y)],
         "n_width": pred["n_width"],
@@ -356,11 +369,6 @@ def run_our_multi_inference(image, instruction, model, tokenizer, processor,
 
 def evaluate_all(model, tokenizer, processor, data, image_dir, args):
     """Run evaluation over all examples."""
-    use_placeholder = args.use_placeholder
-    topk = args.topk
-    resize_to_pixels = args.resize_to_pixels if args.resize_to_pixels > 0 else None
-    mode = args.mode
-
     results = []
     for i, example in tqdm(enumerate(data), total=len(data)):
         ele = {
@@ -383,41 +391,31 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args):
         image = Image.open(image_path).convert("RGB")
         gt_bbox = ele["bbox_x1y1x2y2"]
 
-        # --- Select inference mode ---
-        if mode == "standard":
-            pred = run_single_inference(
+        # --- Dispatch based on composable params ---
+        if args.rounds <= 1 or args.multi_strategy == "none":
+            # Single-round
+            pred = run_single_round(
                 image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=use_placeholder, topk=topk,
-                resize_to_pixels=resize_to_pixels,
+                use_placeholder=args.use_placeholder, topk=args.topk,
+                resize_to_pixels=args.resize_to_pixels if args.resize_to_pixels > 0 else None,
             )
-        elif mode == "low_res":
-            # Low-res: no resize_to_pixels, processor's max_pixels handles it
-            pred = run_single_inference(
+        elif args.multi_strategy == "crop_resize":
+            pred = run_multi_crop_resize(
                 image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=use_placeholder, topk=topk,
-                resize_to_pixels=None,
+                use_placeholder=args.use_placeholder, topk=args.topk,
+                rounds=args.rounds,
+                resize_to_pixels=args.resize_to_pixels if args.resize_to_pixels > 0 else None,
             )
-        elif mode == "two_stage":
-            pred = run_two_stage_inference(
+        elif args.multi_strategy == "token_concat":
+            pred = run_multi_token_concat(
                 image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=use_placeholder, topk=topk,
-            )
-        elif mode == "our_single":
-            # Our single-round with attention (same as standard but potentially different model)
-            pred = run_single_inference(
-                image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=use_placeholder, topk=topk,
-                resize_to_pixels=resize_to_pixels,
-            )
-        elif mode == "our_multi":
-            pred = run_our_multi_inference(
-                image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=use_placeholder, topk=topk,
-                max_rounds=args.max_rounds, crop_ratio=args.crop_ratio,
+                use_placeholder=args.use_placeholder, topk=args.topk,
+                rounds=args.rounds, crop_ratio=args.crop_ratio,
                 convergence_threshold=args.convergence_threshold,
+                resize_to_pixels=args.resize_to_pixels if args.resize_to_pixels > 0 else None,
             )
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            raise ValueError(f"Unknown multi_strategy: {args.multi_strategy}")
 
         topk_points = pred["topk_points"]
         patch_w = pred["n_width"]
@@ -457,58 +455,84 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ScreenSpot-Pro evaluation (aligned with GUI-AIMA)")
-
-    # Mode
-    parser.add_argument("--mode", type=str, default="standard",
-                        choices=["standard", "low_res", "two_stage", "our_single", "our_multi"],
-                        help="Evaluation mode")
+    parser = argparse.ArgumentParser(description="ScreenSpot-Pro evaluation (composable params)")
 
     # Model
     parser.add_argument("--model_name_or_path", type=str, default="smz8599/GUI-AIMA-3B")
-    parser.add_argument("--model_type", type=str, default="qwen25vl")
 
     # Data
     parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data/ScreenSpot-Pro")
-    parser.add_argument("--save_path", type=str, default=None,
-                        help="Directory to save results. Default: auto-generated.")
+    parser.add_argument("--save_path", type=str, default=None)
 
-    # Image processing (aligned with GUI-AIMA defaults)
-    parser.add_argument("--resize_to_pixels", type=int, default=3200 * 1800,
-                        help="Resize images to this many pixels. Set <0 to disable.")
-    parser.add_argument("--max_pixels", type=int, default=14777616,
-                        help="Max pixels for the processor.")
-    parser.add_argument("--low_res_max_pixels", type=int, default=1003520,
-                        help="Max pixels for low_res mode.")
+    # Resolution control
+    parser.add_argument("--resolution", type=str, default="high", choices=["high", "low"],
+                        help="Resolution preset: 'high' (resize_to=5760000, max=14777616) "
+                             "or 'low' (no resize, max=1003520)")
+    parser.add_argument("--resize_to_pixels", type=int, default=None,
+                        help="Override: resize images to this many pixels. -1 to disable.")
+    parser.add_argument("--max_pixels", type=int, default=None,
+                        help="Override: max pixels for processor.")
 
-    # Placeholder
+    # Multi-round control
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="Number of inference rounds (1 = single-round)")
+    parser.add_argument("--multi_strategy", type=str, default="none",
+                        choices=["none", "crop_resize", "token_concat"],
+                        help="Multi-round strategy: crop_resize (GUI-AIMA) or token_concat (ours)")
+
+    # Multi-round tuning
+    parser.add_argument("--crop_ratio", type=float, default=0.3,
+                        help="Crop ratio for token_concat multi-round")
+    parser.add_argument("--convergence_threshold", type=float, default=0.02,
+                        help="Early stop if prediction moves less than this between rounds")
+
+    # Inference options
     parser.add_argument("--no-placeholder", dest="use_placeholder", action="store_false")
     parser.set_defaults(use_placeholder=True)
-
-    # Topk
     parser.add_argument("--topk", type=int, default=3)
 
-    # Multi-round params
-    parser.add_argument("--max_rounds", type=int, default=5)
-    parser.add_argument("--crop_ratio", type=float, default=0.3)
-    parser.add_argument("--convergence_threshold", type=float, default=0.02)
-
     # Quick test
-    parser.add_argument("--max_samples", type=int, default=None,
-                        help="Limit number of samples for quick testing.")
+    parser.add_argument("--max_samples", type=int, default=None)
 
     args = parser.parse_args()
 
-    # Override max_pixels for low_res mode
-    effective_max_pixels = args.max_pixels
-    if args.mode == "low_res":
-        effective_max_pixels = args.low_res_max_pixels
-        print(f"[low_res mode] Using max_pixels={effective_max_pixels}")
+    # --- Resolve resolution presets (can be overridden) ---
+    if args.resolution == "high":
+        effective_resize = args.resize_to_pixels if args.resize_to_pixels is not None else 5760000
+        effective_max = args.max_pixels if args.max_pixels is not None else 14777616
+    else:  # low
+        effective_resize = args.resize_to_pixels if args.resize_to_pixels is not None else -1
+        effective_max = args.max_pixels if args.max_pixels is not None else 1003520
+
+    args.resize_to_pixels = effective_resize
+    args.max_pixels = effective_max
+
+    # Auto-infer multi_strategy from rounds if not set
+    if args.rounds > 1 and args.multi_strategy == "none":
+        print(f"Warning: --rounds={args.rounds} but --multi_strategy=none. "
+              f"Defaulting to crop_resize. Use --multi_strategy to specify.")
+        args.multi_strategy = "crop_resize"
 
     # Auto save path
     if args.save_path is None:
         model_name = Path(args.model_name_or_path).name
-        args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{model_name}/{args.mode}"
+        strategy_tag = f"r{args.rounds}_{args.multi_strategy}" if args.rounds > 1 else "single"
+        res_tag = args.resolution
+        args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{model_name}/{strategy_tag}_{res_tag}"
+
+    # Print config
+    print(f"=== Config ===")
+    print(f"  rounds:           {args.rounds}")
+    print(f"  multi_strategy:   {args.multi_strategy}")
+    print(f"  resolution:       {args.resolution}")
+    print(f"  resize_to_pixels: {args.resize_to_pixels}")
+    print(f"  max_pixels:       {args.max_pixels}")
+    print(f"  use_placeholder:  {args.use_placeholder}")
+    print(f"  topk:             {args.topk}")
+    if args.rounds > 1:
+        print(f"  crop_ratio:       {args.crop_ratio}")
+        print(f"  convergence_thr:  {args.convergence_threshold}")
+    print()
 
     # Load data
     data_fn = os.path.join(args.data_path, "annotations/all.json")
@@ -523,9 +547,9 @@ def main():
     image_dir = os.path.join(args.data_path, "images")
 
     # Load model
-    print(f"Loading model with max_pixels={effective_max_pixels}...")
+    print(f"Loading model with max_pixels={args.max_pixels}...")
     model, tokenizer, processor = load_model(
-        args.model_name_or_path, max_pixels=effective_max_pixels,
+        args.model_name_or_path, max_pixels=args.max_pixels,
     )
 
     # Check for cached predictions
@@ -539,11 +563,6 @@ def main():
         with open(pred_path, "r") as f:
             results = json.load(f)
     else:
-        print(f"\n=== Evaluating: mode={args.mode}, model={args.model_name_or_path} ===")
-        print(f"  resize_to_pixels={args.resize_to_pixels}")
-        print(f"  max_pixels={effective_max_pixels}")
-        print(f"  use_placeholder={args.use_placeholder}")
-
         t0 = time.time()
         results = evaluate_all(model, tokenizer, processor, data, image_dir, args)
         elapsed = time.time() - t0
@@ -555,7 +574,7 @@ def main():
 
     # Compute and save metrics
     if not os.path.exists(metric_path):
-        print(f"\n=== Metrics ({args.mode}) ===")
+        print(f"\n=== Metrics ===")
         metric_info = get_metric(results)
         with open(metric_path, "w") as f:
             f.write(metric_info)
