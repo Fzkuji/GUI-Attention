@@ -474,7 +474,9 @@ class FoveationGRPOTrainer:
                 image_grid_thw=completion_info["image_grid_thw"],
             )
         except Exception as e:
+            import traceback
             print(f"Attention extraction error: {e}")
+            traceback.print_exc()
             return 0.0, None
         
         if coord is None:
