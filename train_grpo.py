@@ -401,15 +401,22 @@ class FoveationGRPOTrainer:
     def _generate_completions(self, prompt_inputs, num_generations):
         """
         Generate multiple completions for a single prompt.
-        No need for hidden_states here — reward computation does its own forward pass.
+        
+        After generation, append <pointer_pad> token at the end so the
+        pointer head can extract attention-based coordinates.
+        The model generates free-form text, then we force the ANCHOR token.
         """
         device = self.model.device
         completions = []
         
+        pointer_pad_id = self.model.config.pointer_pad_token_id
+        if isinstance(pointer_pad_id, list):
+            pointer_pad_id = pointer_pad_id[0]
+        
         for g in range(num_generations):
             inputs = {k: v.clone().to(device) for k, v in prompt_inputs.items()}
             
-            # Generate (no need for hidden_states or attentions)
+            # Generate free-form text (no pointer tokens needed)
             with torch.no_grad():
                 result = self.model.generate(
                     **inputs,
@@ -420,9 +427,18 @@ class FoveationGRPOTrainer:
             prompt_len = inputs["input_ids"].shape[1]
             completion_ids = result.sequences[0, prompt_len:]
             
+            # Append <pointer_pad> at the end of the sequence
+            # This is the ANCHOR token — pointer head will use its hidden state
+            # to attend over visual patches
+            pointer_token = torch.tensor([pointer_pad_id], device=device)
+            full_sequence_with_pointer = torch.cat([result.sequences[0], pointer_token])
+            completion_ids_with_pointer = torch.cat([completion_ids, pointer_token])
+            
             completions.append({
-                "completion_ids": completion_ids,
-                "full_sequence": result.sequences[0],
+                "completion_ids": completion_ids,  # Original (without pointer) for log_prob
+                "completion_ids_with_pointer": completion_ids_with_pointer,
+                "full_sequence": full_sequence_with_pointer,  # With pointer for attention extraction
+                "full_sequence_no_pointer": result.sequences[0],  # Without pointer for policy gradient
                 "image_grid_thw": inputs.get("image_grid_thw"),
             })
         
@@ -543,7 +559,8 @@ class FoveationGRPOTrainer:
                 if advantage.abs() < 1e-6:
                     continue  # Skip zero advantage
                 
-                full_ids = comp["full_sequence"]
+                # Use the original generated sequence (without appended pointer) for policy gradient
+                full_ids = comp["full_sequence_no_pointer"]
                 completion_ids = comp["completion_ids"]
                 comp_len = len(completion_ids)
                 
