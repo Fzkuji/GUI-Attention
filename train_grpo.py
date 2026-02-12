@@ -168,9 +168,17 @@ def extract_attention_coordinate(model, prompt_input_ids, prompt_inputs, image_g
     else:
         query_end = target_indices[0]
     
-    query_indices = torch.arange(query_start, query_end, device=device)
+    if query_start >= query_end:
+        # Fallback: use last few tokens before pointer_pad
+        query_start_fallback = max(0, target_indices[0].item() - 20)
+        query_end_fallback = target_indices[0].item()
+        if query_start_fallback >= query_end_fallback:
+            return None
+        query_indices = torch.arange(query_start_fallback, query_end_fallback, device=device)
+    else:
+        query_indices = torch.arange(query_start, query_end, device=device)
     if len(query_indices) == 0:
-        query_indices = torch.arange(max(0, target_indices[0] - 10), target_indices[0], device=device)
+        query_indices = torch.arange(max(0, target_indices[0].item() - 10), target_indices[0].item(), device=device)
     
     merged_indices = torch.cat([query_indices, target_indices], dim=0)
     
