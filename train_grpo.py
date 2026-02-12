@@ -684,11 +684,13 @@ def main():
     
     print(f"Loading model from {script_args.model_name_or_path}...")
     
-    # Load model
+    # Load model with pointer head architecture
+    # If loading from base Qwen2.5-VL (no pointer weights), pointer head is randomly initialized
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         script_args.model_name_or_path,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16 if training_args.bf16 else None,
+        ignore_mismatched_sizes=True,  # Allow loading base model into pointer architecture
     )
     model.config.use_cache = False
     
@@ -709,12 +711,34 @@ def main():
     )
     processor.tokenizer = tokenizer
     
-    # Add special tokens
+    # Add special tokens (pointer_start, pointer_end, pointer_pad, etc.)
     num_new = tokenizer.add_special_tokens(
         {"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS}
     )
     if num_new > 0:
         model.resize_token_embeddings(len(tokenizer))
+        # Initialize new token embeddings with mean of existing
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+        input_embeddings[-num_new:] = input_embeddings[:-num_new].mean(dim=0, keepdim=True)
+        output_embeddings[-num_new:] = output_embeddings[:-num_new].mean(dim=0, keepdim=True)
+    
+    # Configure pointer token IDs in model config
+    model.config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
+    model.config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
+    model.config.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]
+    # Set defaults for query weighting
+    if not hasattr(model.config, 'query_topk'):
+        model.config.query_topk = 1
+    if not hasattr(model.config, 'kl_query_weighting'):
+        model.config.kl_query_weighting = False
+    if not hasattr(model.config, 'part_query_weighting'):
+        model.config.part_query_weighting = False
+    if not hasattr(model.config, 'layer_wise_query_weighting'):
+        model.config.layer_wise_query_weighting = False
+    
+    print(f"pointer_pad_token_id: {model.config.pointer_pad_token_id}")
+    print(f"Pointer head initialized: {hasattr(model, 'multi_patch_pointer_head_attention')}")
     
     model.to("cuda" if torch.cuda.is_available() else "cpu")
     
