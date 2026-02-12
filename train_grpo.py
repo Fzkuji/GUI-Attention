@@ -119,17 +119,25 @@ def gaussian_point_reward(pred_x, pred_y, gt_bbox, alpha=0.5):
     ))
 
 
-def extract_attention_coordinate(model, input_ids, hidden_states, position_ids, attention_mask, image_grid_thw):
+def extract_attention_coordinate(model, prompt_input_ids, prompt_inputs, image_grid_thw):
     """
     Extract predicted coordinate from <pointer_pad> token's attention map.
     
-    Uses GUI-AIMA's QK-recompute attention + pointer head to get 
-    attention-weighted coordinates over visual patches.
+    Does a fresh forward pass (prefill only, no generation) on the full
+    prompt+completion sequence to get all hidden states, then uses 
+    GUI-AIMA's QK-recompute attention + pointer head.
+    
+    Args:
+        model: GUI-AIMA model
+        prompt_input_ids: Full sequence (prompt + completion) input_ids, shape (seq_len,)
+        prompt_inputs: Dict with pixel_values, image_grid_thw, attention_mask for forward
+        image_grid_thw: Image grid info for coordinate conversion
     
     Returns:
         (pred_x, pred_y) in [0, 1] or None
     """
-    device = input_ids.device
+    device = prompt_input_ids.device
+    input_ids = prompt_input_ids
     
     # Find visual token indices
     visual_mask = (input_ids == model.config.image_token_id)
@@ -146,35 +154,64 @@ def extract_attention_coordinate(model, input_ids, hidden_states, position_ids, 
     if len(target_indices) == 0:
         return None
     
-    # Query indices: text tokens between last visual token and pointer_start
+    # Query indices: text tokens between last visual token and first pointer token
     query_start = visual_indices[-1] + 1
-    pointer_start_mask = (input_ids == model.config.pointer_start_token_id)
-    pointer_start_indices = torch.nonzero(pointer_start_mask, as_tuple=False).squeeze(-1)
-    if len(pointer_start_indices) == 0:
-        # If no pointer_start, use all text tokens between visual and pointer_pad
-        query_end = target_indices[0]
+    # Find first pointer-related token (pointer_start or pointer_pad)
+    pointer_start_id = getattr(model.config, 'pointer_start_token_id', None)
+    if pointer_start_id is not None:
+        pointer_start_mask = (input_ids == pointer_start_id)
+        ps_indices = torch.nonzero(pointer_start_mask, as_tuple=False).squeeze(-1)
+        if len(ps_indices) > 0:
+            query_end = ps_indices[0]
+        else:
+            query_end = target_indices[0]
     else:
-        query_end = pointer_start_indices[0]
+        query_end = target_indices[0]
     
     query_indices = torch.arange(query_start, query_end, device=device)
     if len(query_indices) == 0:
-        # Fallback: use the last few text tokens
         query_indices = torch.arange(max(0, target_indices[0] - 10), target_indices[0], device=device)
     
     merged_indices = torch.cat([query_indices, target_indices], dim=0)
     
+    # Do a fresh forward pass to get all hidden states
+    full_input_ids = input_ids.unsqueeze(0)
+    full_attn_mask = torch.ones_like(full_input_ids)
+    
+    with torch.no_grad():
+        # Get position_ids
+        position_ids, _ = model.get_rope_index(
+            input_ids=full_input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            attention_mask=full_attn_mask,
+        )
+        
+        # Forward pass with output_hidden_states
+        outputs = model(
+            input_ids=full_input_ids,
+            attention_mask=full_attn_mask,
+            pixel_values=prompt_inputs.get("pixel_values"),
+            image_grid_thw=image_grid_thw,
+            output_hidden_states=True,
+        )
+    
+    # hidden_states format: tuple of (n_layers+1) tensors, each (batch, seq_len, hidden_dim)
+    # We need format [[layer0_hs, layer1_hs, ...]] for calculate_attention_from_qk
+    hs_per_layer = list(outputs.hidden_states)  # list of (1, seq_len, d)
+    
     # Calculate attention via QK recomputation
     calculated_attention = calculate_attention_from_qk(
         model=model,
-        all_hidden_states=hidden_states,
+        all_hidden_states=[hs_per_layer],  # wrap in list for timestep dimension
         all_position_ids=position_ids,
         query_indices=merged_indices,
-        all_attention_mask=attention_mask,
+        all_attention_mask=full_attn_mask,
     )
     
-    # Cosine similarity for query weighting (same as GUI-AIMA inference.py)
-    all_layer_hs = torch.stack(hidden_states[0][1:], dim=0)
-    sample_layer_hs = all_layer_hs[:, 0, :, :]
+    # Cosine similarity for query weighting
+    all_layer_hs = torch.stack(hs_per_layer[1:], dim=0)  # skip embedding layer, (n_layers, 1, seq, d)
+    sample_layer_hs = all_layer_hs[:, 0, :, :]  # (n_layers, seq, d)
     query_hs = F.normalize(sample_layer_hs[:, query_indices, :], dim=-1)
     visual_hs = F.normalize(sample_layer_hs[:, visual_indices, :], dim=-1)
     sim_matrix = torch.einsum('lqd,lvd->lqv', query_hs, visual_hs)
@@ -355,7 +392,7 @@ class FoveationGRPOTrainer:
     def _generate_completions(self, prompt_inputs, num_generations):
         """
         Generate multiple completions for a single prompt.
-        Returns list of (completion_ids, full_hidden_states, position_ids).
+        No need for hidden_states here — reward computation does its own forward pass.
         """
         device = self.model.device
         completions = []
@@ -363,22 +400,12 @@ class FoveationGRPOTrainer:
         for g in range(num_generations):
             inputs = {k: v.clone().to(device) for k, v in prompt_inputs.items()}
             
-            # Get position_ids for attention extraction later
-            with torch.no_grad():
-                position_ids, _ = self.model.get_rope_index(
-                    input_ids=inputs["input_ids"],
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    video_grid_thw=None,
-                    attention_mask=inputs["attention_mask"],
-                )
-            
-            # Generate
+            # Generate (no need for hidden_states or attentions)
             with torch.no_grad():
                 result = self.model.generate(
                     **inputs,
                     generation_config=self.generation_config,
                     return_dict_in_generate=True,
-                    output_hidden_states=True,
                 )
             
             prompt_len = inputs["input_ids"].shape[1]
@@ -387,21 +414,19 @@ class FoveationGRPOTrainer:
             completions.append({
                 "completion_ids": completion_ids,
                 "full_sequence": result.sequences[0],
-                "hidden_states": result.hidden_states,
-                "position_ids": position_ids,
-                "attention_mask": inputs["attention_mask"],
                 "image_grid_thw": inputs.get("image_grid_thw"),
             })
         
         return completions
     
-    def _compute_reward(self, completion_info, bbox_gt):
+    def _compute_reward(self, completion_info, prompt_inputs, bbox_gt):
         """
         Compute reward for a single completion.
         
         1. Check format (has pointer_pad token)
-        2. Extract coordinate from attention
-        3. Gaussian point reward
+        2. Do forward pass to get hidden states
+        3. Extract coordinate from attention
+        4. Gaussian point reward
         """
         device = self.model.device
         full_ids = completion_info["full_sequence"]
@@ -415,14 +440,12 @@ class FoveationGRPOTrainer:
         if not has_pointer:
             return 0.0, None
         
-        # Extract coordinate from attention
+        # Extract coordinate from attention (does a fresh forward pass)
         try:
             coord = extract_attention_coordinate(
                 model=self.model,
-                input_ids=full_ids,
-                hidden_states=completion_info["hidden_states"],
-                position_ids=completion_info["position_ids"],
-                attention_mask=completion_info["attention_mask"],
+                prompt_input_ids=full_ids,
+                prompt_inputs=prompt_inputs,
                 image_grid_thw=completion_info["image_grid_thw"],
             )
         except Exception as e:
@@ -494,7 +517,7 @@ class FoveationGRPOTrainer:
             rewards = []
             coords = []
             for comp in completions:
-                r, c = self._compute_reward(comp, sample["bbox_gt"])
+                r, c = self._compute_reward(comp, prompt_inputs, sample["bbox_gt"])
                 rewards.append(r)
                 coords.append(c)
             
