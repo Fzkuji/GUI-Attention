@@ -621,6 +621,26 @@ class MultiRoundGRPOTrainer:
                         sum(1 for c in coords
                             if sample["bbox_gt"][0]<=c[0]<=sample["bbox_gt"][2]
                             and sample["bbox_gt"][1]<=c[1]<=sample["bbox_gt"][3]) / len(coords))
+
+                # Per-round distance monitoring: verify coarse-to-fine improvement
+                for g in gens:
+                    rc = g["round_coords"]
+                    if len(rc) > 0:
+                        round_dists = []
+                        for rx, ry in rc:
+                            d = math.sqrt((rx - gcx)**2 + (ry - gcy)**2)
+                            round_dists.append(d)
+                        for ri, d in enumerate(round_dists):
+                            key = f"round_{ri}_dist"
+                            if key not in self.metrics:
+                                self.metrics[key] = []
+                            self.metrics[key].append(d)
+                        # Log per-sample round progression every 50 steps
+                        if self.global_step % 50 == 0:
+                            prog = " → ".join(f"R{i}:{d:.4f}" for i, d in enumerate(round_dists))
+                            hit_str = "✓" if (sample["bbox_gt"][0]<=rc[-1][0]<=sample["bbox_gt"][2]
+                                              and sample["bbox_gt"][1]<=rc[-1][1]<=sample["bbox_gt"][3]) else "✗"
+                            print(f"  [Round Progress] step={self.global_step} {prog} {hit_str}")
             except Exception as e:
                 import traceback; traceback.print_exc()
         return acc_loss, acc_n
@@ -659,6 +679,14 @@ class MultiRoundGRPOTrainer:
                               f"reward={ar('reward'):.3f} dist={ar('avg_dist'):.4f} "
                               f"hit={ar('hit_rate'):.2%} rounds={ar('avg_rounds'):.1f} "
                               f"lr={self.scheduler.get_last_lr()[0]:.2e}")
+                        # Per-round distance summary
+                        rd_parts = []
+                        for ri in range(self.sa.max_rounds):
+                            key = f"round_{ri}_dist"
+                            if key in self.metrics and self.metrics[key]:
+                                rd_parts.append(f"R{ri}:{ar(key):.4f}")
+                        if rd_parts:
+                            print(f"           round_dists: {' → '.join(rd_parts)}")
 
                     if self.global_step % self.args.save_steps == 0:
                         self._save(f"checkpoint-{self.global_step}")
