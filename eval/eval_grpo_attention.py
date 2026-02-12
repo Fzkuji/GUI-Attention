@@ -31,6 +31,27 @@ from gui_aima.constants import (
     DEFAULT_POINTER_END_TOKEN, DEFAULT_POINTER_PAD_TOKEN,
 )
 from transformers import AutoProcessor, AutoTokenizer
+from qwen_vl_utils import process_vision_info
+
+
+def crop_image(image, center_x, center_y, crop_ratio):
+    """Crop a region around (center_x, center_y) in normalized [0,1] coords."""
+    W, H = image.size
+    crop_w = int(W * crop_ratio)
+    crop_h = int(H * crop_ratio)
+    cx_px = int(center_x * W)
+    cy_px = int(center_y * H)
+    x1 = max(0, cx_px - crop_w // 2)
+    y1 = max(0, cy_px - crop_h // 2)
+    x2 = min(W, x1 + crop_w)
+    y2 = min(H, y1 + crop_h)
+    if x2 - x1 < crop_w:
+        x1 = max(0, x2 - crop_w)
+    if y2 - y1 < crop_h:
+        y1 = max(0, y2 - crop_h)
+    cropped = image.crop((x1, y1, x2, y2))
+    bbox = (x1 / W, y1 / H, x2 / W, y2 / H)
+    return cropped, bbox
 
 
 def load_screenspot_pro(data_path):
@@ -111,8 +132,79 @@ class GRPOAttentionEvaluator:
             return pred["topk_points"][0]
         return 0.5, 0.5
 
+    @torch.no_grad()
+    def predict_multi_round(self, image, instruction, max_rounds=5,
+                            crop_ratio=0.3, convergence_threshold=0.02,
+                            fovea_max_pixels=56*56*28*28, verbose=False):
+        """
+        Multi-round foveation prediction (argmax mode for eval).
+        Round 1: low-res full image → predict
+        Round 2+: crop around prediction → predict on crop+original → refine
+        """
+        import math
 
-def evaluate(evaluator, data, image_dir, n_samples=None, verbose=False):
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+
+        # Round 1: standard prediction
+        px, py = self.predict(image, instruction, verbose=verbose)
+        if verbose:
+            print(f"  R1: pred=({px:.4f}, {py:.4f})")
+
+        prev_x, prev_y = px, py
+
+        for round_idx in range(1, max_rounds):
+            # Crop around previous prediction
+            cropped, crop_bbox = crop_image(image, prev_x, prev_y, crop_ratio)
+
+            # Build multi-image conversation
+            content_items = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": instruction},
+                {"type": "image", "image": cropped},
+                {"type": "text", "text": f"[Zoomed region around ({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"},
+            ]
+            conversation = [
+                {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
+                {"role": "user", "content": content_items},
+            ]
+
+            try:
+                pred = guiaima_inference(
+                    conversation, self.model, self.tokenizer, self.processor,
+                    use_placeholder=True, topk=3,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  R{round_idx+1}: error - {e}")
+                break
+
+            if pred["topk_points"] and len(pred["topk_points"]) > 0:
+                local_x, local_y = pred["topk_points"][0]
+                # Map crop-local coords back to original
+                bx1, by1, bx2, by2 = crop_bbox
+                cur_x = bx1 + local_x * (bx2 - bx1)
+                cur_y = by1 + local_y * (by2 - by1)
+            else:
+                break
+
+            if verbose:
+                print(f"  R{round_idx+1}: pred=({cur_x:.4f}, {cur_y:.4f})")
+
+            # Check convergence
+            dist = math.sqrt((cur_x - prev_x) ** 2 + (cur_y - prev_y) ** 2)
+            prev_x, prev_y = cur_x, cur_y
+
+            if dist < convergence_threshold:
+                if verbose:
+                    print(f"  Converged at round {round_idx+1}")
+                break
+
+        return prev_x, prev_y
+
+
+def evaluate(evaluator, data, image_dir, n_samples=None, verbose=False,
+             multi_round=False, max_rounds=5, crop_ratio=0.3, convergence_threshold=0.02):
     results = []
     samples = data[:n_samples] if n_samples else data
 
@@ -128,7 +220,15 @@ def evaluate(evaluator, data, image_dir, n_samples=None, verbose=False):
         gt_cx, gt_cy = (x1 + x2) / 2, (y1 + y2) / 2
 
         try:
-            px, py = evaluator.predict(image, ex["instruction"], verbose=verbose)
+            if multi_round:
+                px, py = evaluator.predict_multi_round(
+                    image, ex["instruction"],
+                    max_rounds=max_rounds, crop_ratio=crop_ratio,
+                    convergence_threshold=convergence_threshold,
+                    verbose=verbose,
+                )
+            else:
+                px, py = evaluator.predict(image, ex["instruction"], verbose=verbose)
         except Exception as e:
             print(f"Error on {i}: {e}")
             px, py = 0.5, 0.5
@@ -162,6 +262,11 @@ def main():
     parser.add_argument("--save_path", type=str, default="/root/autodl-tmp/results/grpo_attention")
     parser.add_argument("--n_samples", type=int, default=None)
     parser.add_argument("--max_pixels", type=int, default=1003520)
+    parser.add_argument("--multi_round", action="store_true",
+                        help="Enable multi-round foveation evaluation")
+    parser.add_argument("--max_rounds", type=int, default=5)
+    parser.add_argument("--crop_ratio", type=float, default=0.3)
+    parser.add_argument("--convergence_threshold", type=float, default=0.02)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -173,9 +278,14 @@ def main():
         args.model_path, max_pixels=args.max_pixels,
     )
 
-    print(f"\n=== Evaluating GRPO Attention Model ===")
+    mode_str = f"Multi-Round ({args.max_rounds} rounds)" if args.multi_round else "Single-Round"
+    print(f"\n=== Evaluating GRPO Attention Model ({mode_str}) ===")
     t0 = time.time()
-    results = evaluate(evaluator, data, image_dir, args.n_samples, args.verbose)
+    results = evaluate(
+        evaluator, data, image_dir, args.n_samples, args.verbose,
+        multi_round=args.multi_round, max_rounds=args.max_rounds,
+        crop_ratio=args.crop_ratio, convergence_threshold=args.convergence_threshold,
+    )
     elapsed = time.time() - t0
 
     n = len(results)

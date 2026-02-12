@@ -15,12 +15,29 @@ Flow:
 4. Compute reward based on distance to GT bbox
 5. GRPO updates via text_log_prob + attention_sampling_log_prob
 
+Multi-round mode (--multi_round):
+    Each generation performs iterative foveation:
+    Round 1: low-res full image → sample coord from attention → log_prob_1
+    Round 2: crop around sampled coord → forward → sample → log_prob_2
+    ...until convergence or --max_rounds reached.
+    Total log_prob = sum of all rounds' attention log_probs.
+    GRPO loss = -advantage * total_log_prob
+
 Usage:
+    # Single-round (default, backward compatible):
     python train_grpo_attention.py \\
         --model_name_or_path /root/autodl-tmp/models/GUI-AIMA-3B \\
         --data_path /root/autodl-tmp/data/GUI-Actor/guiact_bbox.json \\
         --image_folder /root/autodl-tmp/data/GUI-Actor/images/GUIAct/web_imgs \\
         --output_dir /root/autodl-tmp/checkpoints/grpo_attn_sampling \\
+        ...
+
+    # Multi-round foveation:
+    python train_grpo_attention.py \\
+        --multi_round --max_rounds 5 \\
+        --model_name_or_path /root/autodl-tmp/models/GUI-AIMA-3B \\
+        --data_path /root/autodl-tmp/data/GUI-Actor/guiact_bbox.json \\
+        --output_dir /root/autodl-tmp/checkpoints/grpo_multi_round \\
         ...
 """
 
@@ -84,6 +101,12 @@ class GRPOScriptArguments:
     max_pixels: int = field(default=1003520)
     format_reward_value: float = field(default=0.05, metadata={"help": "Reward for correct format"})
     use_placeholder: bool = field(default=True, metadata={"help": "Use placeholder inference mode"})
+    # Multi-round foveation
+    multi_round: bool = field(default=False, metadata={"help": "Enable multi-round foveation GRPO"})
+    max_rounds: int = field(default=5, metadata={"help": "Maximum number of foveation rounds"})
+    convergence_threshold: float = field(default=0.02, metadata={"help": "Distance threshold for convergence (normalized coords)"})
+    crop_ratio: float = field(default=0.3, metadata={"help": "Crop ratio for foveation rounds (fraction of image)"})
+    fovea_max_pixels: int = field(default=56*56*28*28, metadata={"help": "Max pixels for foveated crop"})
 
 
 @dataclass
@@ -358,6 +381,33 @@ def load_grounding_dataset(data_path, image_folder, max_samples=None):
 # GRPO Trainer with Attention Sampling
 # ============================================================
 
+def crop_image(image, center_x, center_y, crop_ratio):
+    """
+    Crop a region around (center_x, center_y) in normalized [0,1] coords.
+    Returns cropped PIL image and bbox (x1, y1, x2, y2) in normalized coords.
+    """
+    W, H = image.size
+    crop_w = int(W * crop_ratio)
+    crop_h = int(H * crop_ratio)
+
+    cx_px = int(center_x * W)
+    cy_px = int(center_y * H)
+
+    x1 = max(0, cx_px - crop_w // 2)
+    y1 = max(0, cy_px - crop_h // 2)
+    x2 = min(W, x1 + crop_w)
+    y2 = min(H, y1 + crop_h)
+
+    if x2 - x1 < crop_w:
+        x1 = max(0, x2 - crop_w)
+    if y2 - y1 < crop_h:
+        y1 = max(0, y2 - crop_h)
+
+    cropped = image.crop((x1, y1, x2, y2))
+    bbox = (x1 / W, y1 / H, x2 / W, y2 / H)
+    return cropped, bbox
+
+
 class AttentionSamplingGRPOTrainer:
     """
     GRPO trainer where the policy is:
@@ -368,6 +418,13 @@ class AttentionSamplingGRPOTrainer:
 
     Different samples from attention → different coordinates → different rewards
     → GRPO has variance to learn from.
+
+    Multi-round mode:
+      Each generation does iterative foveation:
+      Round 1: low-res full image → sample coord from attention → log_prob_1
+      Round 2: crop around sampled coord → new forward → sample → log_prob_2
+      ...until convergence or max_rounds.
+      Total log_prob = sum of all rounds' attention log_probs.
     """
 
     def __init__(self, model, ref_model, processor, tokenizer, train_data, args, script_args):
@@ -446,6 +503,213 @@ class AttentionSamplingGRPOTrainer:
             return_tensors="pt", padding=True,
         )
         return inputs
+
+    def _build_multi_round_inputs(self, sample, crop_image_pil, crop_bbox, round_idx):
+        """
+        Build inputs for a foveation round with the cropped image appended.
+        Uses a multi-image conversation: original low-res + crop.
+        The temporal dimension of M-RoPE encodes the round/resolution level.
+        """
+        content_items = [
+            {"type": "image", "image": sample["image_path"]},
+            {"type": "text", "text": sample["instruction"]},
+        ]
+        # Add crop images for this round
+        content_items.append({"type": "image", "image": crop_image_pil})
+        content_items.append({
+            "type": "text",
+            "text": f"[Zoomed region around ({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]",
+        })
+
+        conversation = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": grounding_system_message}],
+            },
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
+
+        text = self.processor.apply_chat_template(
+            conversation, tokenize=False,
+            add_generation_prompt=False,
+            chat_template=chat_template,
+        )
+        text += "<|im_start|>assistant<|recipient|>os\npyautogui.click(<|pointer_start|><|pointer_pad|><|pointer_end|>)"
+
+        image_inputs, _ = process_vision_info(conversation)
+
+        # Use fovea max_pixels for the crop processor
+        from transformers import AutoProcessor as AP
+        fovea_processor = AP.from_pretrained(
+            self.script_args.model_name_or_path,
+            min_pixels=self.script_args.min_pixels,
+            max_pixels=self.script_args.fovea_max_pixels,
+        )
+        fovea_processor.tokenizer = self.tokenizer
+
+        inputs = fovea_processor(
+            text=[text], images=image_inputs,
+            return_tensors="pt", padding=True,
+        )
+        return inputs
+
+    def _multi_round_generate_and_sample(self, prompt_inputs, sample, num_generations):
+        """
+        Multi-round foveation generation.
+        For each generation:
+          1. Round 1: forward on low-res full image, sample from attention
+          2. Crop around sampled position, build new inputs with crop appended
+          3. Round 2+: forward on extended inputs, sample again
+          4. Stop when converged or max_rounds reached
+          5. Total log_prob = sum of all rounds' log_probs
+        """
+        device = self.model.device
+        max_rounds = self.script_args.max_rounds
+        threshold = self.script_args.convergence_threshold
+        crop_ratio = self.script_args.crop_ratio
+
+        try:
+            img = Image.open(sample["image_path"]).convert("RGB")
+            img_w, img_h = img.size
+        except Exception:
+            img = None
+            img_w, img_h = 1920, 1080
+
+        generations = []
+
+        # Round 1: get attention distribution from low-res full image
+        inputs_r1 = {k: v.to(device) for k, v in prompt_inputs.items()}
+
+        self.model.eval()
+        with torch.no_grad():
+            attn_result_r1 = get_attention_distribution(
+                self.model,
+                inputs_r1["input_ids"],
+                inputs_r1.get("pixel_values"),
+                inputs_r1.get("image_grid_thw"),
+                inputs_r1.get("attention_mask", torch.ones_like(inputs_r1["input_ids"])),
+            )
+
+        if attn_result_r1 is None:
+            for _ in range(num_generations):
+                generations.append({
+                    "reward": 0.0,
+                    "total_log_prob": torch.tensor(0.0, device=device),
+                    "round_log_probs": [],
+                    "round_coords": [],
+                    "pred_coord": None,
+                    "input_ids_per_round": [inputs_r1["input_ids"][0]],
+                    "num_rounds": 0,
+                })
+            return generations
+
+        attn_r1 = attn_result_r1["attn_weights"]
+        n_w_r1, n_h_r1 = attn_result_r1["n_width"], attn_result_r1["n_height"]
+
+        for gen_idx in range(num_generations):
+            round_log_probs = []
+            round_coords = []  # original image coords
+            round_local_coords = []  # coords local to each round's image (for loss recompute)
+            input_ids_per_round = []
+            round_inputs_list = []
+
+            # Round 1 sample
+            pred_x, pred_y, log_prob, _ = sample_coordinate_from_attention(
+                attn_r1, n_w_r1, n_h_r1, temperature=self.args.attn_temperature,
+            )
+            round_log_probs.append(log_prob)
+            round_coords.append((pred_x, pred_y))
+            round_local_coords.append((pred_x, pred_y))  # round 1: local == original
+            input_ids_per_round.append(inputs_r1["input_ids"][0])
+            round_inputs_list.append(prompt_inputs)
+
+            prev_x, prev_y = pred_x, pred_y
+
+            # Subsequent rounds
+            for round_idx in range(1, max_rounds):
+                if img is None:
+                    break
+
+                # Crop around previous prediction
+                cropped, crop_bbox = crop_image(img, prev_x, prev_y, crop_ratio)
+
+                # Build inputs with crop appended
+                try:
+                    round_inputs = self._build_multi_round_inputs(
+                        sample, cropped, crop_bbox, round_idx,
+                    )
+                except Exception as e:
+                    break
+
+                inputs_r = {k: v.to(device) for k, v in round_inputs.items()}
+
+                with torch.no_grad():
+                    attn_result_r = get_attention_distribution(
+                        self.model,
+                        inputs_r["input_ids"],
+                        inputs_r.get("pixel_values"),
+                        inputs_r.get("image_grid_thw"),
+                        inputs_r.get("attention_mask", torch.ones_like(inputs_r["input_ids"])),
+                    )
+
+                if attn_result_r is None:
+                    break
+
+                # Sample from this round's attention
+                # The attention is over ALL visual patches (both images).
+                # We need to map back to original image coords via crop_bbox.
+                attn_r = attn_result_r["attn_weights"]
+                n_w_r, n_h_r = attn_result_r["n_width"], attn_result_r["n_height"]
+
+                cur_x, cur_y, log_prob_r, _ = sample_coordinate_from_attention(
+                    attn_r, n_w_r, n_h_r, temperature=self.args.attn_temperature,
+                )
+
+                # Map crop-local coords back to original image coords
+                bx1, by1, bx2, by2 = crop_bbox
+                orig_x = bx1 + cur_x * (bx2 - bx1)
+                orig_y = by1 + cur_y * (by2 - by1)
+
+                round_log_probs.append(log_prob_r)
+                round_coords.append((orig_x, orig_y))
+                round_local_coords.append((cur_x, cur_y))  # crop-local coords
+                input_ids_per_round.append(inputs_r["input_ids"][0])
+                round_inputs_list.append(round_inputs)
+
+                # Check convergence
+                dist = math.sqrt((orig_x - prev_x) ** 2 + (orig_y - prev_y) ** 2)
+                prev_x, prev_y = orig_x, orig_y
+
+                if dist < threshold:
+                    break
+
+            # Final prediction is last round's coordinate
+            final_x, final_y = round_coords[-1]
+
+            # Compute reward
+            fmt_r = self.script_args.format_reward_value
+            pos_r = position_reward(final_x, final_y, sample["bbox_gt"], img_w, img_h)
+            total_r = fmt_r + pos_r
+
+            # Total log_prob = sum of all rounds
+            total_log_prob = sum(round_log_probs)
+
+            generations.append({
+                "reward": total_r,
+                "total_log_prob": total_log_prob,
+                "round_log_probs": round_log_probs,
+                "round_coords": round_coords,
+                "round_local_coords": round_local_coords,
+                "pred_coord": (final_x, final_y),
+                "input_ids_per_round": input_ids_per_round,
+                "round_inputs_list": round_inputs_list,
+                "num_rounds": len(round_coords),
+            })
+
+        return generations
 
     def _generate_and_sample(self, prompt_inputs, sample, num_generations):
         """
@@ -598,6 +862,83 @@ class AttentionSamplingGRPOTrainer:
                 })
 
         return generations
+
+    def _compute_multi_round_grpo_loss(self, generations):
+        """
+        Compute GRPO loss for multi-round foveation.
+        
+        For each generation:
+            total_log_prob = sum of attention log_probs across all rounds
+            loss = -advantage * total_log_prob
+        
+        We re-run forward passes WITH gradients to get differentiable log_probs.
+        """
+        device = self.model.device
+        rewards = torch.tensor([g["reward"] for g in generations], device=device)
+
+        mean_r = rewards.mean()
+        std_r = rewards.std() + 1e-8
+        advantages = (rewards - mean_r) / std_r
+
+        total_loss = torch.tensor(0.0, device=device)
+        n_valid = 0
+
+        self.model.train()
+
+        for gen, adv in zip(generations, advantages):
+            if gen["pred_coord"] is None or abs(adv.item()) < 1e-8:
+                continue
+            if gen["num_rounds"] == 0:
+                continue
+
+            # Re-compute differentiable log_probs for each round
+            diff_total_log_prob = torch.tensor(0.0, device=device)
+
+            for round_idx, (round_inputs, local_coord) in enumerate(
+                zip(gen["round_inputs_list"], gen["round_local_coords"])
+            ):
+                inputs = {k: v.to(device) for k, v in round_inputs.items()}
+
+                attn_result = get_attention_distribution(
+                    self.model,
+                    inputs["input_ids"],
+                    inputs.get("pixel_values"),
+                    inputs.get("image_grid_thw"),
+                    inputs.get("attention_mask", torch.ones_like(inputs["input_ids"])),
+                )
+
+                if attn_result is None:
+                    continue
+
+                attn_weights = attn_result["attn_weights"]
+                n_w = attn_result["n_width"]
+                n_h = attn_result["n_height"]
+
+                local_x, local_y = local_coord
+
+                # Recover patch index from local coordinates
+                patch_x = int(local_x * n_w - 0.5 + 0.5)
+                patch_y = int(local_y * n_h - 0.5 + 0.5)
+                patch_x = max(0, min(patch_x, n_w - 1))
+                patch_y = max(0, min(patch_y, n_h - 1))
+                sampled_idx = patch_y * n_w + patch_x
+
+                if self.args.attn_temperature != 1.0:
+                    logits = torch.log(attn_weights.clamp(min=1e-10)) / self.args.attn_temperature
+                    log_probs = F.log_softmax(logits, dim=-1)
+                else:
+                    log_probs = torch.log(attn_weights.clamp(min=1e-10))
+
+                diff_total_log_prob = diff_total_log_prob + log_probs[0, sampled_idx]
+
+            loss_i = -adv * diff_total_log_prob
+            total_loss = total_loss + loss_i
+            n_valid += 1
+
+        if n_valid > 0:
+            total_loss = total_loss / n_valid
+
+        return total_loss, n_valid
 
     def _compute_grpo_loss(self, generations, prompt_inputs):
         """
@@ -765,13 +1106,18 @@ class AttentionSamplingGRPOTrainer:
                 # Build prompt
                 prompt_inputs = self._build_prompt_inputs(sample)
 
-                # Generate + sample attention (no gradients)
-                generations = self._generate_and_sample(
-                    prompt_inputs, sample, self.args.num_generations
-                )
-
-                # Compute GRPO loss (with gradients)
-                loss, n_valid = self._compute_grpo_loss(generations, prompt_inputs)
+                if self.script_args.multi_round:
+                    # Multi-round foveation GRPO
+                    generations = self._multi_round_generate_and_sample(
+                        prompt_inputs, sample, self.args.num_generations
+                    )
+                    loss, n_valid = self._compute_multi_round_grpo_loss(generations)
+                else:
+                    # Single-round GRPO (original behavior)
+                    generations = self._generate_and_sample(
+                        prompt_inputs, sample, self.args.num_generations
+                    )
+                    loss, n_valid = self._compute_grpo_loss(generations, prompt_inputs)
 
                 if n_valid > 0 and loss.requires_grad:
                     scaled_loss = loss / max(self.args.gradient_accumulation_steps, 1)
@@ -782,6 +1128,9 @@ class AttentionSamplingGRPOTrainer:
                 # Log metrics
                 rewards = [g["reward"] for g in generations]
                 self.metrics["reward"].append(sum(rewards) / len(rewards))
+                if self.script_args.multi_round:
+                    avg_rounds = sum(g.get("num_rounds", 1) for g in generations) / len(generations)
+                    self.metrics["avg_rounds"].append(avg_rounds)
                 valid_coords = [g["pred_coord"] for g in generations if g["pred_coord"] is not None]
                 if valid_coords:
                     gt_cx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
@@ -826,6 +1175,11 @@ class AttentionSamplingGRPOTrainer:
         print(f"  Attention temperature: {self.args.attn_temperature}")
         print(f"  Beta (KL): {self.args.beta}")
         print(f"  Use placeholder: {self.script_args.use_placeholder}")
+        print(f"  Multi-round: {self.script_args.multi_round}")
+        if self.script_args.multi_round:
+            print(f"  Max rounds: {self.script_args.max_rounds}")
+            print(f"  Convergence threshold: {self.script_args.convergence_threshold}")
+            print(f"  Crop ratio: {self.script_args.crop_ratio}")
         print(f"  Learning rate: {self.args.learning_rate}")
 
         self.optimizer.zero_grad()
