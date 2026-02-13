@@ -6,10 +6,9 @@ at increasing resolution, appending the crop as a new temporal image in the
 Qwen2.5-VL mrope framework.  Log-probs accumulate across rounds; reward is
 computed from the final-round prediction only.
 
-Precision levels:
+Precision levels (two-stage):
     Round 1  – low   (max_pixels ≈ 1 003 520)
-    Round 2  – mid   (max_pixels ≈ 3 000 000)
-    Round 3+ – high  (max_pixels ≈ 5 760 000)
+    Round 2+ – high  (max_pixels ≈ 5 760 000)
 
 Token layout per round (appended to the running sequence):
     <crop_image_tokens> [Zoomed …] <|im_start|>assistant<|recipient|>os
@@ -70,11 +69,10 @@ PRECISION_MID  = 3_000_000
 PRECISION_HIGH = 5_760_000   # ~56×56 × ~1836 patches
 
 def precision_for_round(round_idx: int) -> int:
-    """Return max_pixels for a given 0-based round index."""
+    """Return max_pixels for a given 0-based round index.
+    Two precision levels: round 0 = low, round 1+ = high."""
     if round_idx == 0:
         return PRECISION_LOW
-    elif round_idx == 1:
-        return PRECISION_MID
     else:
         return PRECISION_HIGH
 
@@ -304,6 +302,26 @@ def sample_from_attention(attn_weights, n_w, n_h, temperature=1.0):
     return (px + 0.5) / n_w, (py + 0.5) / n_h, lp, idx.item()
 
 
+
+def get_patch_bbox(px_norm, py_norm, n_width, n_height):
+    """Return the normalised bbox (x1,y1,x2,y2) of the patch containing (px_norm, py_norm).
+    
+    px_norm, py_norm are in [0,1].  The image is divided into n_width x n_height patches.
+    """
+    # Which patch column/row
+    col = min(int(px_norm * n_width), n_width - 1)
+    row = min(int(py_norm * n_height), n_height - 1)
+    x1 = col / n_width
+    y1 = row / n_height
+    x2 = (col + 1) / n_width
+    y2 = (row + 1) / n_height
+    return (x1, y1, x2, y2)
+
+
+def point_in_bbox(px, py, bbox):
+    """Check if point (px, py) falls within bbox (x1, y1, x2, y2)."""
+    return bbox[0] <= px <= bbox[2] and bbox[1] <= py <= bbox[3]
+
 # ── Data ──────────────────────────────────────────────────────────────────────
 
 def load_dataset(data_path, image_folder, max_samples=None):
@@ -481,6 +499,7 @@ class MultiRoundGRPOTrainer:
             round_inputs_list.append(r0_inputs)
 
             prev_x, prev_y = px, py
+            prev_nw, prev_nh = attn0["n_width"], attn0["n_height"]
             cur_text, cur_images = r0_text, list(r0_images)
 
             for ri in range(1, self.sa.max_rounds):
@@ -518,10 +537,36 @@ class MultiRoundGRPOTrainer:
                 round_inputs_list.append(ri_inputs)
                 round_crop_bboxes.append(cbbox)
 
-                d = math.sqrt((ox - prev_x) ** 2 + (oy - prev_y) ** 2)
-                prev_x, prev_y = ox, oy
-                if d < self.sa.convergence_threshold:
+                # Convergence: does the new prediction fall within the
+                # previous round's predicted patch (in original-image coords)?
+                # The previous round's patch bbox in its own local coords:
+                prev_patch_local = get_patch_bbox(
+                    round_local_coords[-2][0], round_local_coords[-2][1],
+                    prev_nw, prev_nh,
+                )
+                # Map previous patch bbox to original image coords
+                if round_crop_bboxes[-2] is not None:
+                    # Previous round was a crop
+                    pb = round_crop_bboxes[-2]
+                    pw = pb[2] - pb[0]
+                    ph = pb[3] - pb[1]
+                    prev_patch_orig = (
+                        pb[0] + prev_patch_local[0] * pw,
+                        pb[1] + prev_patch_local[1] * ph,
+                        pb[0] + prev_patch_local[2] * pw,
+                        pb[1] + prev_patch_local[3] * ph,
+                    )
+                else:
+                    # Previous round was the full image (round 0)
+                    prev_patch_orig = prev_patch_local
+
+                # Only allow convergence from round 2+ (round 0=low, round 1+=high,
+                # so ri>=2 means we've seen high-res at least once before)
+                if ri >= 2 and point_in_bbox(ox, oy, prev_patch_orig):
                     break
+
+                prev_x, prev_y = ox, oy
+                prev_nw, prev_nh = attn_ri["n_width"], attn_ri["n_height"]
 
             final_x, final_y = round_coords[-1]
             reward = self.sa.format_reward_value + position_reward(
@@ -612,18 +657,39 @@ class MultiRoundGRPOTrainer:
                 # metrics
                 rs = [g["reward"] for g in gens]
                 self.metrics["reward"].append(sum(rs) / len(rs))
+                self.metrics["reward_max"].append(max(rs))
+                self.metrics["reward_min"].append(min(rs))
+                self.metrics["reward_std"].append(
+                    (sum((r - sum(rs)/len(rs))**2 for r in rs) / len(rs)) ** 0.5)
                 self.metrics["avg_rounds"].append(
                     sum(g["num_rounds"] for g in gens) / len(gens))
+                self.metrics["max_rounds"].append(
+                    max(g["num_rounds"] for g in gens))
                 coords = [g["pred_coord"] for g in gens if g["pred_coord"]]
+                gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
+                gcy = (sample["bbox_gt"][1] + sample["bbox_gt"][3]) / 2
                 if coords:
-                    gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
-                    gcy = (sample["bbox_gt"][1] + sample["bbox_gt"][3]) / 2
-                    self.metrics["avg_dist"].append(
-                        sum(math.sqrt((c[0]-gcx)**2+(c[1]-gcy)**2) for c in coords) / len(coords))
-                    self.metrics["hit_rate"].append(
-                        sum(1 for c in coords
+                    dists = [math.sqrt((c[0]-gcx)**2+(c[1]-gcy)**2) for c in coords]
+                    self.metrics["avg_dist"].append(sum(dists) / len(dists))
+                    self.metrics["min_dist"].append(min(dists))
+                    hits = [1 for c in coords
                             if sample["bbox_gt"][0]<=c[0]<=sample["bbox_gt"][2]
-                            and sample["bbox_gt"][1]<=c[1]<=sample["bbox_gt"][3]) / len(coords))
+                            and sample["bbox_gt"][1]<=c[1]<=sample["bbox_gt"][3]]
+                    self.metrics["hit_rate"].append(len(hits) / len(coords))
+                    # Convergence stats
+                    converged = [g for g in gens if g["num_rounds"] < self.sa.max_rounds]
+                    self.metrics["convergence_rate"].append(len(converged) / len(gens))
+                    # Best vs worst generation reward spread
+                    self.metrics["advantage_spread"].append(max(rs) - min(rs))
+                    # Per-round hit rate (did each round's prediction hit?)
+                    for g in gens:
+                        for ri, (rx, ry) in enumerate(g["round_coords"]):
+                            key = f"round_{ri}_hit"
+                            if key not in self.metrics:
+                                self.metrics[key] = []
+                            self.metrics[key].append(
+                                1 if (sample["bbox_gt"][0]<=rx<=sample["bbox_gt"][2]
+                                      and sample["bbox_gt"][1]<=ry<=sample["bbox_gt"][3]) else 0)
 
                 # Per-round distance monitoring: verify coarse-to-fine improvement
                 for g in gens:
@@ -679,17 +745,24 @@ class MultiRoundGRPOTrainer:
                     if self.global_step % self.args.logging_steps == 0:
                         ar = lambda k: sum(self.metrics[k][-20:]) / max(len(self.metrics[k][-20:]),1)
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
-                              f"reward={ar('reward'):.3f} dist={ar('avg_dist'):.4f} "
-                              f"hit={ar('hit_rate'):.2%} rounds={ar('avg_rounds'):.1f} "
+                              f"reward={ar('reward'):.3f} (±{ar('reward_std'):.3f}) "
+                              f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
+                              f"rounds={ar('avg_rounds'):.1f}/{ar('max_rounds'):.0f} "
+                              f"conv={ar('convergence_rate'):.0%} "
                               f"lr={self.scheduler.get_last_lr()[0]:.2e}")
-                        # Per-round distance summary
+                        # Per-round distance + hit summary
                         rd_parts = []
                         for ri in range(self.sa.max_rounds):
-                            key = f"round_{ri}_dist"
-                            if key in self.metrics and self.metrics[key]:
-                                rd_parts.append(f"R{ri}:{ar(key):.4f}")
+                            key_d = f"round_{ri}_dist"
+                            key_h = f"round_{ri}_hit"
+                            if key_d in self.metrics and self.metrics[key_d]:
+                                d_str = f"d={ar(key_d):.4f}"
+                                h_str = f"h={ar(key_h):.0%}" if key_h in self.metrics and self.metrics[key_h] else ""
+                                rd_parts.append(f"R{ri}({d_str},{h_str})")
                         if rd_parts:
-                            print(f"           round_dists: {' → '.join(rd_parts)}")
+                            print(f"           rounds: {' → '.join(rd_parts)}")
+                        print(f"           spread={ar('advantage_spread'):.3f} "
+                              f"min_dist={ar('min_dist'):.4f}")
 
                     if self.global_step % self.args.save_steps == 0:
                         self._save(f"checkpoint-{self.global_step}")
