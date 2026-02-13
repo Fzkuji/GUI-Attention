@@ -13,5 +13,6 @@ wandb/
 .venv/
 .env
 *.log
-data/raw/
-data/cache/
+data/
+configs/
+*.bak

@@ -1,7 +1,5 @@
 #!/bin/bash
 # Multi-Round Progressive GRPO Training
-# Usage: bash scripts/train_grpo_multi_round.sh
-
 export PYTHONPATH="/root/GUI-AIMA/src:${PYTHONPATH}"
 
 python train_grpo_multi_round.py \
@@ -12,13 +10,13 @@ python train_grpo_multi_round.py \
     --format_reward_value 0.05 \
     --min_pixels 3136 \
     --max_pixels 1003520 \
-    --max_rounds 5 \
+    --max_rounds 3 \
     --convergence_threshold 0.02 \
     --crop_ratio 0.3 \
     --num_train_epochs 2 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
-    --num_generations 8 \
+    --num_generations 2 \
     --max_completion_length 256 \
     --temperature 0.9 \
     --attn_temperature 1.0 \
