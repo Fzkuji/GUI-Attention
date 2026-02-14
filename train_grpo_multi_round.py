@@ -428,6 +428,17 @@ class MultiRoundInputBuilder:
 
 # ── Trainer ───────────────────────────────────────────────────────────────────
 
+def _get_model_device(model):
+    """Get the input device for a model (works with device_map='auto')."""
+    if hasattr(model, 'hf_device_map'):
+        # device_map model: find the device of the first module
+        first_device = next(iter(model.hf_device_map.values()))
+        if isinstance(first_device, str):
+            return torch.device(first_device)
+        return torch.device(f"cuda:{first_device}")
+    return model.device
+
+
 class MultiRoundGRPOTrainer:
     def __init__(self, model, processor, tokenizer, train_data, args: TrainArgs, script_args: ScriptArgs):
         self.model = model
@@ -458,7 +469,7 @@ class MultiRoundGRPOTrainer:
 
     def _sample_generations(self, sample, num_gen):
         """For each generation, run multi-round foveation and collect log_probs."""
-        device = self.model.device
+        device = _get_model_device(self.model)
         try:
             img = Image.open(sample["image_path"]).convert("RGB")
             img_w, img_h = img.size
@@ -590,7 +601,7 @@ class MultiRoundGRPOTrainer:
     # ── loss phase (with grad) ────────────────────────────────────────────
 
     def _compute_loss(self, generations):
-        device = self.model.device
+        device = _get_model_device(self.model)
         rewards = torch.tensor([g["reward"] for g in generations], device=device)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
@@ -788,12 +799,16 @@ def main():
     sa, ta = parser.parse_args_into_dataclasses()
 
     print(f"Loading model: {sa.model_name_or_path}")
+    n_gpus = torch.cuda.device_count()
+    use_device_map = n_gpus > 1
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         sa.model_name_or_path,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
         ignore_mismatched_sizes=True,
+        device_map="auto" if use_device_map else None,
     )
+    print(f"  GPUs available: {n_gpus}, device_map={'auto' if use_device_map else 'None'}")
     model.config.use_cache = False
     if ta.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -821,7 +836,8 @@ def main():
         if not hasattr(model.config, attr):
             setattr(model.config, attr, 1 if attr == 'query_topk' else False)
 
-    model.to("cuda" if torch.cuda.is_available() else "cpu")
+    if not use_device_map:
+        model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples)
     os.makedirs(ta.output_dir, exist_ok=True)

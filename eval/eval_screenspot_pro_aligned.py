@@ -648,7 +648,7 @@ def main():
     # Misc
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="auto")
 
     args = parser.parse_args()
 
@@ -699,6 +699,11 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_name_or_path, max_pixels=args.max_pixels)
     tokenizer = processor.tokenizer
 
+    # Add special tokens if not present
+    num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
+    if num_new > 0:
+        print(f"Added {num_new} special tokens to tokenizer")
+
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
@@ -706,12 +711,23 @@ def main():
         attn_implementation="flash_attention_2",
     ).eval()
 
+    if num_new > 0:
+        model.resize_token_embeddings(len(tokenizer))
+
     for attr, default in [
         ('query_topk', None), ('kl_query_weighting', False),
         ('part_query_weighting', False), ('layer_wise_query_weighting', False),
     ]:
         if not hasattr(model.config, attr):
             setattr(model.config, attr, default)
+
+    # Ensure pointer token IDs are set (needed for attention extraction)
+    if not hasattr(model.config, 'pointer_pad_token_id') or model.config.pointer_pad_token_id is None:
+        model.config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
+        model.config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
+        model.config.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]
+        print(f"Set pointer token IDs: start={model.config.pointer_start_token_id}, "
+              f"pad={model.config.pointer_pad_token_id}, end={model.config.pointer_end_token_id}")
 
     # Builder for aligned mode
     builder = None
