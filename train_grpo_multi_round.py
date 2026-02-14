@@ -40,11 +40,18 @@ from typing import Optional, List, Tuple, Dict
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from PIL import Image, ImageFile
 from tqdm import tqdm
 
 import transformers
 from transformers import AutoProcessor, AutoTokenizer
+
+try:
+    import deepspeed
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -441,27 +448,47 @@ def _get_model_device(model):
 
 class MultiRoundGRPOTrainer:
     def __init__(self, model, processor, tokenizer, train_data, args: TrainArgs, script_args: ScriptArgs):
-        self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
         self.train_data = train_data
         self.args = args
         self.sa = script_args
+        self.use_deepspeed = HAS_DEEPSPEED and args.deepspeed is not None
 
         self.builder = MultiRoundInputBuilder(script_args.model_name_or_path, tokenizer, script_args.min_pixels)
 
-        self.optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=args.learning_rate, weight_decay=args.weight_decay,
-        )
         total_steps = (
             int(args.num_train_epochs) * len(train_data)
             // max(args.per_device_train_batch_size, 1)
             // max(args.gradient_accumulation_steps, 1)
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max(total_steps, 1), eta_min=1e-7,
-        )
+        if args.max_steps and args.max_steps > 0:
+            total_steps = min(total_steps, args.max_steps)
+
+        if self.use_deepspeed:
+            # DeepSpeed handles optimizer, scheduler, gradient accumulation
+            self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=model,
+                model_parameters=[p for p in model.parameters() if p.requires_grad],
+                config=args.deepspeed,
+            )
+            self.model = self.model_engine.module
+            self.rank = dist.get_rank() if dist.is_initialized() else 0
+            self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+            print(f"  [Rank {self.rank}] DeepSpeed initialized, world_size={self.world_size}")
+        else:
+            self.model = model
+            self.model_engine = None
+            self.optimizer = torch.optim.AdamW(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=args.learning_rate, weight_decay=args.weight_decay,
+            )
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max(total_steps, 1), eta_min=1e-7,
+            )
+            self.rank = 0
+            self.world_size = 1
+
         self.metrics = defaultdict(list)
         self.global_step = 0
 
@@ -662,7 +689,10 @@ class MultiRoundGRPOTrainer:
                     continue
                 loss, nv = self._compute_loss(gens)
                 if nv > 0 and loss.requires_grad:
-                    (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
+                    if self.use_deepspeed:
+                        self.model_engine.backward(loss)
+                    else:
+                        (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
                     acc_loss += loss.item()
                     acc_n += 1
                 # metrics
@@ -729,23 +759,37 @@ class MultiRoundGRPOTrainer:
         bs = self.args.per_device_train_batch_size
         ga = max(self.args.gradient_accumulation_steps, 1)
         epochs = int(self.args.num_train_epochs)
+        max_steps = getattr(self.args, 'max_steps', -1) or -1
 
-        print("=== Multi-Round Progressive GRPO ===")
-        print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
-        print(f"  generations={self.args.num_generations}  max_rounds={self.sa.max_rounds}")
-        print(f"  crop_ratio={self.sa.crop_ratio}  convergence={self.sa.convergence_threshold}")
-        print(f"  attn_temp={self.args.attn_temperature}  lr={self.args.learning_rate}")
+        if self.rank == 0:
+            print("=== Multi-Round Progressive GRPO ===")
+            print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
+            print(f"  generations={self.args.num_generations}  max_rounds={self.sa.max_rounds}")
+            print(f"  crop_ratio={self.sa.crop_ratio}  convergence={self.sa.convergence_threshold}")
+            print(f"  attn_temp={self.args.attn_temperature}  lr={self.args.learning_rate}")
+            print(f"  deepspeed={self.use_deepspeed}  world_size={self.world_size}  max_steps={max_steps}")
 
-        self.optimizer.zero_grad()
+        if not self.use_deepspeed:
+            self.optimizer.zero_grad()
         micro = 0
 
         for epoch in range(epochs):
             random.shuffle(self.train_data)
-            pbar = tqdm(range(0, len(self.train_data), bs), desc=f"Epoch {epoch+1}/{epochs}")
+            # Shard data across ranks for distributed training
+            if self.world_size > 1:
+                shard = self.train_data[self.rank::self.world_size]
+            else:
+                shard = self.train_data
+            pbar = tqdm(range(0, len(shard), bs), desc=f"Epoch {epoch+1}/{epochs}",
+                        disable=(self.rank != 0))
             for i in pbar:
-                loss_val, nv = self.train_step(self.train_data[i:i+bs])
+                loss_val, nv = self.train_step(shard[i:i+bs])
                 micro += 1
-                if micro % ga == 0:
+                if self.use_deepspeed:
+                    # DeepSpeed handles gradient accumulation internally
+                    self.model_engine.step()
+                    self.global_step += 1
+                elif micro % ga == 0:
                     if any(p.grad is not None for p in self.model.parameters()):
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                         self.optimizer.step()
@@ -753,14 +797,16 @@ class MultiRoundGRPOTrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
 
-                    if self.global_step % self.args.logging_steps == 0:
+                    if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                         ar = lambda k: sum(self.metrics[k][-20:]) / max(len(self.metrics[k][-20:]),1)
+                        lr_val = (self.model_engine.get_lr()[0] if self.use_deepspeed
+                                  else self.scheduler.get_last_lr()[0])
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
                               f"reward={ar('reward'):.3f} (±{ar('reward_std'):.3f}) "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f}/{ar('max_rounds'):.0f} "
                               f"conv={ar('convergence_rate'):.0%} "
-                              f"lr={self.scheduler.get_last_lr()[0]:.2e}")
+                              f"lr={lr_val:.2e}")
                         # Per-round distance + hit summary
                         rd_parts = []
                         for ri in range(self.sa.max_rounds):
@@ -778,10 +824,19 @@ class MultiRoundGRPOTrainer:
                     if self.global_step % self.args.save_steps == 0:
                         self._save(f"checkpoint-{self.global_step}")
 
+                    if max_steps > 0 and self.global_step >= max_steps:
+                        if self.rank == 0:
+                            print(f"Reached max_steps={max_steps}, stopping.")
+                        self._save(f"checkpoint-{self.global_step}")
+                        return
+
         self._save("final")
-        print(f"Done. Saved to {self.args.output_dir}")
+        if self.rank == 0:
+            print(f"Done. Saved to {self.args.output_dir}")
 
     def _save(self, name):
+        if self.rank != 0:
+            return
         p = os.path.join(self.args.output_dir, name)
         os.makedirs(p, exist_ok=True)
         self.model.save_pretrained(p)
@@ -799,16 +854,12 @@ def main():
     sa, ta = parser.parse_args_into_dataclasses()
 
     print(f"Loading model: {sa.model_name_or_path}")
-    n_gpus = torch.cuda.device_count()
-    use_device_map = n_gpus > 1
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         sa.model_name_or_path,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
         ignore_mismatched_sizes=True,
-        device_map="auto" if use_device_map else None,
     )
-    print(f"  GPUs available: {n_gpus}, device_map={'auto' if use_device_map else 'None'}")
     model.config.use_cache = False
     if ta.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -836,7 +887,8 @@ def main():
         if not hasattr(model.config, attr):
             setattr(model.config, attr, 1 if attr == 'query_topk' else False)
 
-    if not use_device_map:
+    # For DeepSpeed, don't move to device — deepspeed.initialize() handles it
+    if not (HAS_DEEPSPEED and ta.deepspeed):
         model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples)
