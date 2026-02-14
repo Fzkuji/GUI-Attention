@@ -9,41 +9,22 @@ from typing import Dict, List, Optional
 import torch
 from PIL import Image
 from transformers import AutoProcessor
-from qwen_vl_utils import process_vision_info
+from qwen_vl_utils import process_vision_info, smart_resize
 
 from gui_aima.constants import chat_template, grounding_system_message
 
 from gui_attention.constants import PLACEHOLDER_SUFFIX, precision_for_round
 
 
-def _smart_resize(image: Image.Image, max_pixels: int, min_pixels: int = 3136,
-                  factor: int = 28) -> Image.Image:
-    """Resize image the same way Qwen2.5-VL's image_processor does.
-
-    Ensures (h * w) is between min_pixels and max_pixels and both dimensions
-    are divisible by ``factor``.  Returns a new PIL Image.
-    """
+def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136) -> Image.Image:
+    """Pre-resize an image to the exact dimensions the Qwen2.5-VL processor
+    would use, so a subsequent processor call with large max_pixels won't
+    resize it further."""
     w, h = image.size
-    current = h * w
-
-    if current > max_pixels:
-        scale = (max_pixels / current) ** 0.5
-        h, w = int(h * scale), int(w * scale)
-    elif current < min_pixels:
-        scale = (min_pixels / current) ** 0.5
-        h, w = int(h * scale), int(w * scale)
-
-    # Round to nearest multiple of factor
-    h = max(factor, round(h / factor) * factor)
-    w = max(factor, round(w / factor) * factor)
-
-    # Clamp again after rounding
-    if h * w > max_pixels:
-        scale = (max_pixels / (h * w)) ** 0.5
-        h = max(factor, round(h * scale / factor) * factor)
-        w = max(factor, round(w * scale / factor) * factor)
-
-    return image.resize((w, h), Image.LANCZOS)
+    new_h, new_w = smart_resize(h, w, max_pixels=max_pixels, min_pixels=min_pixels)
+    if (new_w, new_h) != (w, h):
+        return image.resize((new_w, new_h), Image.LANCZOS)
+    return image
 
 
 class MultiRoundInputBuilder:
@@ -95,7 +76,7 @@ class MultiRoundInputBuilder:
         images, _ = process_vision_info(conv)
 
         # Pre-resize the round-0 image so its token count is locked in.
-        resized_r0 = _smart_resize(images[0], max_pixels, self.min_pixels)
+        resized_r0 = _presize_image(images[0], max_pixels, self.min_pixels)
         self._resized_images = [resized_r0]
 
         inputs = self._get_processor(max_pixels)(
@@ -124,7 +105,7 @@ class MultiRoundInputBuilder:
         new_images = prev_images + [crop_pil]
 
         # Pre-resize the crop at this round's resolution
-        resized_crop = _smart_resize(crop_pil, max_px, self.min_pixels)
+        resized_crop = _presize_image(crop_pil, max_px, self.min_pixels)
         self._resized_images.append(resized_crop)
 
         # Process with a large max_pixels so the processor doesn't resize
