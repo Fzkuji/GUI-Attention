@@ -22,7 +22,6 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -36,282 +35,26 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_aima.inference import inference, calculate_attention_from_qk
+from gui_aima.inference import inference
 from gui_aima.utils import do_boxes_overlap
 from gui_aima.constants import (
     ADDITIONAL_SPECIAL_TOKENS,
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
-    chat_template,
     grounding_system_message,
 )
 from transformers import AutoProcessor, AutoTokenizer
-from qwen_vl_utils import process_vision_info
-import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Precision levels (same as training)
-# ---------------------------------------------------------------------------
-PRECISION_LOW = 1_003_520
-PRECISION_MID = 3_000_000
-PRECISION_HIGH = 5_760_000
-
-PLACEHOLDER_SUFFIX = (
-    "<|im_start|>assistant<|recipient|>os\n"
-    "pyautogui.click(<|pointer_start|><|pointer_pad|><|pointer_end|>)"
-)
+from gui_attention.constants import precision_for_round
+from gui_attention.crop import crop_image, get_patch_bbox, point_in_bbox
+from gui_attention.attention import get_round_attention
+from gui_attention.sampling import argmax_from_attention, region_from_attention
+from gui_attention.builder import MultiRoundInputBuilder
 
 
 # ---------------------------------------------------------------------------
-# GUI-AIMA original system prompt
-# ---------------------------------------------------------------------------
-GROUNDING_SYSTEM_MESSAGE = (
-    "You are a GUI agent. Given a screenshot of the current GUI and a human "
-    "instruction, your task is to locate the screen element that corresponds "
-    "to the instruction. You should output a PyAutoGUI action that performs a "
-    "click on the correct position. To indicate the click location, we will "
-    "use some special tokens, which is used to refer to a visual patch later. "
-    "For example, you can output: pyautogui.click(<your_special_token_here>)."
-)
-
-
-# ---------------------------------------------------------------------------
-# Helpers (from training code)
-# ---------------------------------------------------------------------------
-
-def crop_image(image, cx_norm, cy_norm, crop_ratio):
-    """Crop around normalised centre. Returns (cropped_pil, (x1,y1,x2,y2) normalised)."""
-    W, H = image.size
-    cw, ch = int(W * crop_ratio), int(H * crop_ratio)
-    cx, cy = int(cx_norm * W), int(cy_norm * H)
-    x1 = max(0, cx - cw // 2)
-    y1 = max(0, cy - ch // 2)
-    x2 = min(W, x1 + cw)
-    y2 = min(H, y1 + ch)
-    if x2 - x1 < cw:
-        x1 = max(0, x2 - cw)
-    if y2 - y1 < ch:
-        y1 = max(0, y2 - ch)
-    return image.crop((x1, y1, x2, y2)), (x1 / W, y1 / H, x2 / W, y2 / H)
-
-
-def get_patch_bbox(px_norm, py_norm, n_width, n_height):
-    """Return the normalised bbox of the patch containing (px_norm, py_norm)."""
-    col = min(int(px_norm * n_width), n_width - 1)
-    row = min(int(py_norm * n_height), n_height - 1)
-    return (col / n_width, row / n_height, (col + 1) / n_width, (row + 1) / n_height)
-
-
-def point_in_bbox(px, py, bbox):
-    """Check if point (px, py) falls within bbox (x1, y1, x2, y2)."""
-    return bbox[0] <= px <= bbox[2] and bbox[1] <= py <= bbox[3]
-
-
-def precision_for_round(round_idx):
-    """Return max_pixels for a given 0-based round index (same as training)."""
-    return PRECISION_LOW if round_idx == 0 else PRECISION_HIGH
-
-
-# ---------------------------------------------------------------------------
-# Attention helpers (from training code)
-# ---------------------------------------------------------------------------
-
-def _find_nth_image_visual_range(input_ids, image_token_id, n):
-    """Return (start, end) indices of the n-th contiguous block of image tokens."""
-    ids = input_ids.tolist()
-    blocks = []
-    in_block = False
-    start = 0
-    for i, tid in enumerate(ids):
-        if tid == image_token_id:
-            if not in_block:
-                start = i
-                in_block = True
-        else:
-            if in_block:
-                blocks.append((start, i))
-                in_block = False
-    if in_block:
-        blocks.append((start, len(ids)))
-    return blocks[n] if n < len(blocks) else None
-
-
-def _find_nth_pointer_pad(input_ids, pointer_pad_id, n):
-    """Return index of the n-th pointer_pad token."""
-    if isinstance(pointer_pad_id, list):
-        pad_set = set(pointer_pad_id)
-    else:
-        pad_set = {pointer_pad_id}
-    count = 0
-    for i, tid in enumerate(input_ids.tolist()):
-        if tid in pad_set:
-            if count == n:
-                return i
-            count += 1
-    return None
-
-
-def get_round_attention(model, input_ids, pixel_values, image_grid_thw,
-                        attention_mask, round_idx):
-    """
-    Forward-pass the full multi-round sequence and extract attention
-    for a specific round's pointer_pad over that round's visual tokens.
-    (Identical to training code)
-    """
-    device = input_ids.device
-    img_tok = model.config.image_token_id
-    pp_id = model.config.pointer_pad_token_id
-    ps_id = model.config.pointer_start_token_id
-
-    vis_range = _find_nth_image_visual_range(input_ids[0], img_tok, round_idx)
-    if vis_range is None:
-        return None
-    vis_start, vis_end = vis_range
-    visual_indices = torch.arange(vis_start, vis_end, device=device)
-
-    target_pos = _find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
-    if target_pos is None:
-        return None
-    target_indices = torch.tensor([target_pos], device=device)
-
-    ps_positions = (input_ids[0] == ps_id).nonzero(as_tuple=False).squeeze(-1)
-    ps_before = ps_positions[ps_positions < target_pos]
-    query_end = ps_before[-1].item() if len(ps_before) > 0 else target_pos
-    query_start = vis_end
-
-    query_indices = torch.arange(query_start, query_end, device=device)
-    if getattr(model.config, 'part_query_weighting', False) and len(query_indices) > 12:
-        query_indices = query_indices[:-12]
-    if query_indices.numel() == 0:
-        query_indices = torch.arange(max(0, target_pos - 10), target_pos, device=device)
-
-    merged_indices = torch.cat([query_indices, target_indices], dim=0)
-
-    position_ids, _ = model.get_rope_index(
-        input_ids=input_ids,
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=None,
-        attention_mask=attention_mask,
-    )
-
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        pixel_values=pixel_values,
-        image_grid_thw=image_grid_thw,
-        output_hidden_states=True,
-    )
-
-    hs_per_layer = list(outputs.hidden_states)
-    calculated_attention = calculate_attention_from_qk(
-        model=model,
-        all_hidden_states=[hs_per_layer],
-        all_position_ids=position_ids,
-        query_indices=merged_indices,
-        all_attention_mask=attention_mask,
-    )
-
-    all_layer_hs = torch.stack(hs_per_layer[1:], dim=0)
-    sample_hs = all_layer_hs[:, 0, :, :]
-    q_hs = F.normalize(sample_hs[:, query_indices, :], dim=-1)
-    v_hs = F.normalize(sample_hs[:, visual_indices, :], dim=-1)
-    sim = torch.einsum('lqd,lvd->lqv', q_hs, v_hs)
-
-    topk_query_indices = None
-    global_pattern = None
-    if not getattr(model.config, 'kl_query_weighting', False):
-        k = getattr(model.config, 'query_topk', 1)
-        agg = sim.sum(dim=-1).sum(dim=0)
-        _, topk_query_indices = torch.topk(agg, min(k, len(query_indices)), largest=True)
-    else:
-        global_pattern = sim.sum(dim=-1).sum(dim=0).softmax(dim=-1)
-
-    attn_weights, _ = model.multi_patch_pointer_head_attention(
-        query_indices, visual_indices, target_indices,
-        calculated_attention[0],
-        topk_query_indices, global_pattern,
-        batch_idx=0,
-    )
-
-    merge = model.visual.spatial_merge_size
-    if round_idx < image_grid_thw.shape[0]:
-        _, nh, nw = (image_grid_thw[round_idx] // merge).tolist()
-    else:
-        n_vis = visual_indices.numel()
-        nw = nh = int(math.sqrt(n_vis))
-
-    return {"attn_weights": attn_weights, "n_width": int(nw), "n_height": int(nh)}
-
-
-def argmax_from_attention(attn_weights, n_w, n_h):
-    """Deterministic prediction: argmax of attention distribution."""
-    p = attn_weights.squeeze(0).float()
-    idx = p.argmax().item()
-    px = idx % n_w
-    py = idx // n_w
-    return (px + 0.5) / n_w, (py + 0.5) / n_h
-
-
-# ---------------------------------------------------------------------------
-# MultiRoundInputBuilder (from training code, adapted for eval)
-# ---------------------------------------------------------------------------
-
-class MultiRoundInputBuilder:
-    """Incrementally builds the multi-round conversation and tokenises it.
-    Identical to training code's builder."""
-
-    def __init__(self, model_path, tokenizer, min_pixels):
-        self.model_path = model_path
-        self.tokenizer = tokenizer
-        self.min_pixels = min_pixels
-        self._processor_cache = {}
-
-    def _get_processor(self, max_pixels):
-        if max_pixels not in self._processor_cache:
-            p = AutoProcessor.from_pretrained(
-                self.model_path, min_pixels=self.min_pixels, max_pixels=max_pixels,
-            )
-            p.tokenizer = self.tokenizer
-            self._processor_cache[max_pixels] = p
-        return self._processor_cache[max_pixels]
-
-    def build_round0(self, image_path, instruction, max_pixels):
-        """Build round-0 inputs (full image)."""
-        conv = [
-            {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
-            {"role": "user", "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": instruction},
-            ]},
-        ]
-        text = self._get_processor(max_pixels).apply_chat_template(
-            conv, tokenize=False, add_generation_prompt=False, chat_template=chat_template,
-        )
-        text += PLACEHOLDER_SUFFIX
-        images, _ = process_vision_info(conv)
-        inputs = self._get_processor(max_pixels)(text=[text], images=images, return_tensors="pt", padding=True)
-        return inputs, text, images
-
-    def extend_with_crop(self, prev_text, prev_images, crop_pil, crop_bbox, round_idx):
-        """Append a crop round (identical to training)."""
-        max_px = precision_for_round(round_idx)
-        zoom_text = (
-            f"\n<|im_start|>user\n<image>"
-            f"[Zoomed region round {round_idx + 1} around "
-            f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
-            f"<|im_end|>\n"
-            + PLACEHOLDER_SUFFIX
-        )
-        new_text = prev_text + zoom_text
-        new_images = prev_images + [crop_pil]
-        proc = self._get_processor(max_px)
-        inputs = proc(text=[new_text], images=new_images, return_tensors="pt", padding=True)
-        return inputs, new_text, new_images
-
-
-# ---------------------------------------------------------------------------
-# Normalize bbox helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
@@ -414,7 +157,7 @@ def run_single_round_standard(image, instruction, model, tokenizer, processor,
             image = image.resize((int(w * ratio), int(h * ratio)))
 
     conversation = [
-        {"role": "system", "content": [{"type": "text", "text": GROUNDING_SYSTEM_MESSAGE}]},
+        {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
         {"role": "user", "content": [
             {"type": "image", "image": image},
             {"type": "text", "text": instruction},
@@ -430,16 +173,18 @@ def run_single_round_standard(image, instruction, model, tokenizer, processor,
 # ---------------------------------------------------------------------------
 
 def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
-                            builder, max_rounds=5, crop_ratio=0.3, device="cuda:0"):
+                            builder, max_rounds=5, crop_ratio=0.3, device="cuda:0",
+                            prediction_method="region"):
     """
-    Multi-round inference using attention argmax, fully aligned with training.
-    
+    Multi-round inference using attention-based prediction, aligned with training.
+
     Key differences from training:
-    - Uses argmax instead of sampling (deterministic eval)
+    - Uses deterministic prediction instead of sampling
     - Same input construction (MultiRoundInputBuilder)
     - Same convergence criterion (point_in_bbox, ri >= 2)
     - Same precision levels
     """
+    predict_fn = region_from_attention if prediction_method == "region" else argmax_from_attention
     # Round 0: full image, low resolution
     r0_inputs, r0_text, r0_images = builder.build_round0(
         image_path, instruction, precision_for_round(0)
@@ -455,8 +200,8 @@ def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
     if attn0 is None:
         return {"topk_points": [(0.5, 0.5)], "n_width": 1, "n_height": 1, "num_rounds": 0}
 
-    # Argmax prediction (deterministic, vs sampling in training)
-    px, py = argmax_from_attention(attn0["attn_weights"], attn0["n_width"], attn0["n_height"])
+    # Deterministic prediction (vs sampling in training)
+    px, py = predict_fn(attn0["attn_weights"], attn0["n_width"], attn0["n_height"])
 
     round_coords = [(px, py)]
     round_local_coords = [(px, py)]
@@ -494,8 +239,8 @@ def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
         if attn_ri is None:
             break
 
-        # Argmax prediction for this round
-        cx, cy = argmax_from_attention(attn_ri["attn_weights"], attn_ri["n_width"], attn_ri["n_height"])
+        # Deterministic prediction for this round
+        cx, cy = predict_fn(attn_ri["attn_weights"], attn_ri["n_width"], attn_ri["n_height"])
 
         # Map back to original coords
         bx1, by1, bx2, by2 = cbbox
@@ -583,6 +328,7 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args, builder):
                 model, tokenizer, builder,
                 max_rounds=args.rounds, crop_ratio=args.crop_ratio,
                 device=str(device),
+                prediction_method=args.prediction_method,
             )
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
@@ -645,6 +391,11 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--crop_ratio", type=float, default=0.3)
 
+    # Prediction method
+    parser.add_argument("--prediction_method", type=str, default="region",
+                        choices=["argmax", "region"],
+                        help="'argmax' = naive argmax, 'region' = GUI-AIMA region-based (recommended)")
+
     # Misc
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--max_samples", type=int, default=None)
@@ -669,13 +420,14 @@ def main():
     if args.save_path is None:
         model_name = Path(args.model_name_or_path).name
         if args.mode == "aligned":
-            tag = f"aligned_r{args.rounds}_crop{args.crop_ratio}"
+            tag = f"aligned_r{args.rounds}_crop{args.crop_ratio}_{args.prediction_method}"
         else:
             tag = f"standard_{args.resolution}"
         args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{model_name}/{tag}"
 
     print(f"=== Config ===")
     print(f"  mode:             {args.mode}")
+    print(f"  prediction:       {args.prediction_method}")
     print(f"  rounds:           {args.rounds}")
     print(f"  crop_ratio:       {args.crop_ratio}")
     print(f"  max_pixels:       {args.max_pixels}")
@@ -715,7 +467,7 @@ def main():
         model.resize_token_embeddings(len(tokenizer))
 
     for attr, default in [
-        ('query_topk', None), ('kl_query_weighting', False),
+        ('query_topk', 1), ('kl_query_weighting', False),
         ('part_query_weighting', False), ('layer_wise_query_weighting', False),
     ]:
         if not hasattr(model.config, attr):

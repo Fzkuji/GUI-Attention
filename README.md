@@ -27,45 +27,75 @@ conda activate gui-attention
 pip install -e .
 ```
 
-### Inference
-
-```bash
-python eval/example_inference.py \
-    --model_path <path_to_checkpoint> \
-    --image_path <screenshot.png> \
-    --instruction "Click the search button"
-```
+Requires [GUI-AIMA](https://github.com/HeimingX/GUI-AIMA) source on `PYTHONPATH` (the scripts handle this automatically).
 
 ### Training
 
+Two-stage pipeline: SFT warm-up → GRPO reinforcement.
+
+**Stage 1 — SFT** (teacher-forcing with GT coordinates):
+
 ```bash
-bash scripts/train.sh
+bash scripts/train_sft.sh          # default: 2 rounds
+bash scripts/train_sft.sh 3        # override max_rounds
 ```
+
+**Stage 2 — GRPO** (policy gradient with sampled trajectories):
+
+```bash
+bash scripts/train_grpo.sh                           # from base model
+bash scripts/train_grpo.sh /path/to/sft/checkpoint   # from SFT checkpoint
+```
+
+All scripts use `BASE_DIR` at the top for path configuration. Modify it for your environment.
 
 ### Evaluation
 
-```bash
-# ScreenSpot-Pro
-bash eval/eval_screenspot_pro.sh
+**Single configuration:**
 
-# OSWorld
-bash eval/eval_osworld.sh
+```bash
+# Standard eval (GUI-AIMA inference pipeline)
+bash scripts/eval_standard.sh /path/to/model
+
+# Aligned eval (matches training: attention extraction → crop → predict)
+bash scripts/eval_aligned.sh /path/to/model
+
+# Override parameters via environment variables
+ROUNDS=3 PRED=argmax bash scripts/eval_aligned.sh /path/to/model
+```
+
+**Full evaluation suite** (6 configs: baselines + ablations):
+
+```bash
+bash scripts/eval_all.sh /path/to/model
+MAX_SAMPLES=50 bash scripts/eval_all.sh /path/to/model   # quick test
+```
+
+### Tests
+
+```bash
+python -m pytest tests/ -v
 ```
 
 ## 📁 Project Structure
 
 ```
 GUI-Attention/
-├── src/gui_attention/      # Core library
-│   ├── model/              # Model architecture
-│   ├── data/               # Dataset & preprocessing
-│   ├── foveation/          # Foveated vision module
-│   └── utils/              # Utilities
-├── configs/                # Training & eval configs
-├── eval/                   # Evaluation scripts
-├── scripts/                # Shell scripts (train/eval)
-├── tests/                  # Unit tests
-└── docs/                   # Documentation
+├── train_grpo_multi_round.py       # Training entry point (SFT + GRPO)
+├── src/gui_attention/              # Shared library
+│   ├── constants.py                # Precision levels, placeholder tokens
+│   ├── attention.py                # Attention extraction (QK-recompute)
+│   ├── sampling.py                 # Sample / argmax / region prediction
+│   ├── crop.py                     # Image crop & coordinate helpers
+│   └── builder.py                  # Multi-round conversation tokenizer
+├── eval/                           # Evaluation scripts
+│   ├── eval_screenspot_pro.py      # Standard eval (GUI-AIMA pipeline)
+│   └── eval_screenspot_pro_aligned.py  # Aligned eval (our pipeline)
+├── scripts/                        # Shell scripts
+│   ├── train_sft.sh / train_grpo.sh
+│   ├── eval_standard.sh / eval_aligned.sh / eval_all.sh
+│   └── convert_screenspot_to_gta.py
+└── tests/                          # Unit tests (28 tests)
 ```
 
 ## 📊 Results

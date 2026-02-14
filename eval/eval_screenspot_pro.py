@@ -45,20 +45,9 @@ from gui_aima.constants import (
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
+    grounding_system_message,
 )
 from transformers import AutoProcessor, AutoTokenizer
-
-# ---------------------------------------------------------------------------
-# GUI-AIMA original system prompt (must match exactly)
-# ---------------------------------------------------------------------------
-GROUNDING_SYSTEM_MESSAGE = (
-    "You are a GUI agent. Given a screenshot of the current GUI and a human "
-    "instruction, your task is to locate the screen element that corresponds "
-    "to the instruction. You should output a PyAutoGUI action that performs a "
-    "click on the correct position. To indicate the click location, we will "
-    "use some special tokens, which is used to refer to a visual patch later. "
-    "For example, you can output: pyautogui.click(<your_special_token_here>)."
-)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +195,7 @@ def load_model(model_name_or_path, max_pixels, device="cuda:0"):
 
     # Ensure config attributes exist
     for attr, default in [
-        ('query_topk', None), ('kl_query_weighting', False),
+        ('query_topk', 1), ('kl_query_weighting', False),
         ('part_query_weighting', False), ('layer_wise_query_weighting', False),
     ]:
         if not hasattr(model.config, attr):
@@ -226,7 +215,7 @@ def load_model(model_name_or_path, max_pixels, device="cuda:0"):
 # Inference functions
 # ---------------------------------------------------------------------------
 
-def make_conversation(image, instruction, system_message=GROUNDING_SYSTEM_MESSAGE):
+def make_conversation(image, instruction, system_message=grounding_system_message):
     """Build single-image conversation for GUI-AIMA inference."""
     return [
         {"role": "system", "content": [{"type": "text", "text": system_message}]},
@@ -331,7 +320,7 @@ def run_multi_token_concat(image, instruction, model, tokenizer, processor,
             )},
         ]
         conversation = [
-            {"role": "system", "content": [{"type": "text", "text": GROUNDING_SYSTEM_MESSAGE}]},
+            {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
             {"role": "user", "content": content_items},
         ]
 
