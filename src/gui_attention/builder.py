@@ -94,8 +94,10 @@ class MultiRoundInputBuilder:
         processor with a very large max_pixels so no further resizing occurs.
         """
         max_px = precision_for_round(round_idx)
+        # Use <|vision_start|><|image_pad|><|vision_end|> instead of raw <image>
+        # so the processor correctly expands the placeholder to match features.
         zoom_text = (
-            f"\n<|im_start|>user\n<image>"
+            f"\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
             f"[Zoomed region round {round_idx + 1} around "
             f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
             f"<|im_end|>\n"
