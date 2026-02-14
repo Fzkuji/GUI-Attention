@@ -6,20 +6,15 @@ Run with: python -m pytest tests/test_utils.py -v
 """
 
 import math
-import sys
-import os
 import torch
 import torch.nn.functional as F
 from PIL import Image
-
-# Add project root to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ── Test crop_image ──────────────────────────────────────────────────────────
 
 def _crop_image(image, cx_norm, cy_norm, crop_ratio):
-    """Copy of crop_image from train_grpo_multi_round.py for testing."""
+    """Copy of crop_image from gui_attention.crop for testing."""
     W, H = image.size
     cw, ch = int(W * crop_ratio), int(H * crop_ratio)
     cx, cy = int(cx_norm * W), int(cy_norm * H)

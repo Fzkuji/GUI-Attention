@@ -1,7 +1,7 @@
 """
 ScreenSpot-Pro evaluation script ALIGNED with multi-round GRPO training.
 
-Key alignment with train_grpo_multi_round.py:
+Key alignment with gui_attention.train:
   1. Uses attention-based prediction (argmax instead of sampling)
   2. Uses MultiRoundInputBuilder for identical input construction
   3. Uses same convergence criterion (point_in_bbox, ri >= 2)

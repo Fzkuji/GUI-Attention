@@ -19,7 +19,7 @@ tokens up to (and including) itself, so a single forward pass on the full
 sequence gives the same per-round attention as incremental passes.
 
 Usage:
-    python train_grpo_multi_round.py \
+    python -m gui_attention.train \
         --model_name_or_path /root/autodl-tmp/models/GUI-AIMA-3B \
         --data_path /root/autodl-tmp/data/GUI-Actor/guiact_bbox.json \
         --image_folder /root/autodl-tmp/data/GUI-Actor/images/GUIAct/web_imgs \

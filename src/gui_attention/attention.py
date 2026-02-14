@@ -1,6 +1,6 @@
 """Attention extraction helpers for multi-round foveated inference.
 
-Shared by training (train_grpo_multi_round.py) and evaluation
+Shared by training (gui_attention.train) and evaluation
 (eval/eval_screenspot_pro_aligned.py).
 """
 

@@ -8,12 +8,8 @@ Run with: python tests/test_train_logic.py
 """
 
 import math
-import sys
-import os
 import torch
 import torch.nn.functional as F
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_advantage_computation():

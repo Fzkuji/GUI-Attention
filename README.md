@@ -81,8 +81,8 @@ python -m pytest tests/ -v
 
 ```
 GUI-Attention/
-├── train_grpo_multi_round.py       # Training entry point (SFT + GRPO)
-├── src/gui_attention/              # Shared library
+├── src/gui_attention/              # Core package (pip install -e .)
+│   ├── train.py                    # Training entry point (SFT + GRPO)
 │   ├── constants.py                # Precision levels, placeholder tokens
 │   ├── attention.py                # Attention extraction (QK-recompute)
 │   ├── sampling.py                 # Sample / argmax / region prediction

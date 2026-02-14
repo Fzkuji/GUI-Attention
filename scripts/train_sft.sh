@@ -44,7 +44,7 @@ echo "  max_rounds: ${MAX_ROUNDS}"
 echo "  lr:         ${LR}"
 echo ""
 
-python train_grpo_multi_round.py \
+python -m gui_attention.train \
     --training_mode sft \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA}" \
