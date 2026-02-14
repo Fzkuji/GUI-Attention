@@ -28,7 +28,6 @@ Usage:
 """
 
 import os
-import sys
 import json
 import math
 import random
@@ -52,10 +51,6 @@ except ImportError:
     HAS_DEEPSPEED = False
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-# Path setup
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../Experiments/GUI-AIMA/src"))
 
 from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_aima.constants import (

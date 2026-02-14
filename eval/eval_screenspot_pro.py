@@ -26,16 +26,11 @@ import argparse
 import json
 import math
 import os
-import sys
 import time
-from pathlib import Path
 
 import torch
 from PIL import Image
 from tqdm import tqdm
-
-# Add project src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_aima.inference import inference
