@@ -218,7 +218,7 @@ class MultiRoundGRPOTrainer:
             return []
 
         # Round 0 inputs (shared across generations)
-        r0_inputs, r0_text, r0_images = self.builder.build_round0(sample, precision_for_round(0))
+        r0_inputs, r0_text, r0_images = self.builder.build_round0(sample, sample["instruction"], precision_for_round(0))
         r0_dev = {k: v.to(device) for k, v in r0_inputs.items()}
 
         self.model.eval()
@@ -433,7 +433,7 @@ class MultiRoundGRPOTrainer:
 
         # Build all rounds upfront (teacher forcing: crop around GT)
         r0_inputs, cur_text, cur_images = self.builder.build_round0(
-            sample, precision_for_round(0),
+            sample, sample["instruction"], precision_for_round(0),
         )
         round_local_gts = [(gt_x, gt_y)]  # round 0: GT in full image coords
         round_crop_bboxes = [None]

@@ -1,7 +1,12 @@
-"""MultiRoundInputBuilder: incrementally builds multi-round conversation tokens."""
+"""MultiRoundInputBuilder: incrementally builds multi-round conversation tokens.
 
-from typing import Dict
+Each round's image is pre-processed at its own resolution so the processor
+never re-sizes an image intended for a different precision level.
+"""
 
+from typing import Dict, List, Optional
+
+import torch
 from PIL import Image
 from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -9,6 +14,36 @@ from qwen_vl_utils import process_vision_info
 from gui_aima.constants import chat_template, grounding_system_message
 
 from gui_attention.constants import PLACEHOLDER_SUFFIX, precision_for_round
+
+
+def _smart_resize(image: Image.Image, max_pixels: int, min_pixels: int = 3136,
+                  factor: int = 28) -> Image.Image:
+    """Resize image the same way Qwen2.5-VL's image_processor does.
+
+    Ensures (h * w) is between min_pixels and max_pixels and both dimensions
+    are divisible by ``factor``.  Returns a new PIL Image.
+    """
+    w, h = image.size
+    current = h * w
+
+    if current > max_pixels:
+        scale = (max_pixels / current) ** 0.5
+        h, w = int(h * scale), int(w * scale)
+    elif current < min_pixels:
+        scale = (min_pixels / current) ** 0.5
+        h, w = int(h * scale), int(w * scale)
+
+    # Round to nearest multiple of factor
+    h = max(factor, round(h / factor) * factor)
+    w = max(factor, round(w / factor) * factor)
+
+    # Clamp again after rounding
+    if h * w > max_pixels:
+        scale = (max_pixels / (h * w)) ** 0.5
+        h = max(factor, round(h * scale / factor) * factor)
+        w = max(factor, round(w * scale / factor) * factor)
+
+    return image.resize((w, h), Image.LANCZOS)
 
 
 class MultiRoundInputBuilder:
@@ -26,6 +61,9 @@ class MultiRoundInputBuilder:
         self.tokenizer = tokenizer
         self.min_pixels = min_pixels
         self._processor_cache: Dict[int, AutoProcessor] = {}
+        # Pre-resized images (one per round) – kept so they can be passed
+        # together to a single processor call without further resizing.
+        self._resized_images: List[Image.Image] = []
 
     def _get_processor(self, max_pixels: int):
         if max_pixels not in self._processor_cache:
@@ -36,11 +74,11 @@ class MultiRoundInputBuilder:
             self._processor_cache[max_pixels] = p
         return self._processor_cache[max_pixels]
 
-    def build_round0(self, image_or_path, instruction: str, max_pixels: int):
-        """Build round-0 inputs (full image).
+    # Large enough that the processor won't resize our pre-resized images.
+    _PASSTHROUGH_MAX = 20_000_000
 
-        image_or_path: either an image file path (str) or a dict with 'image_path' key.
-        """
+    def build_round0(self, image_or_path, instruction: str, max_pixels: int):
+        """Build round-0 inputs (full image)."""
         if isinstance(image_or_path, dict):
             image_or_path = image_or_path["image_path"]
         conv = [
@@ -55,15 +93,25 @@ class MultiRoundInputBuilder:
         )
         text += PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)
+
+        # Pre-resize the round-0 image so its token count is locked in.
+        resized_r0 = _smart_resize(images[0], max_pixels, self.min_pixels)
+        self._resized_images = [resized_r0]
+
         inputs = self._get_processor(max_pixels)(
-            text=[text], images=images, return_tensors="pt", padding=True,
+            text=[text], images=[resized_r0], return_tensors="pt", padding=True,
         )
-        return inputs, text, images
+        return inputs, text, images  # return original images list for extend
 
     def extend_with_crop(self, prev_text: str, prev_images: list,
                          crop_pil: Image.Image, crop_bbox: tuple,
                          round_idx: int):
-        """Append a crop round to the existing conversation."""
+        """Append a crop round to the existing conversation.
+
+        The crop is pre-resized at this round's resolution, then ALL images
+        (each already at its own target resolution) are passed to a single
+        processor with a very large max_pixels so no further resizing occurs.
+        """
         max_px = precision_for_round(round_idx)
         zoom_text = (
             f"\n<|im_start|>user\n<image>"
@@ -74,6 +122,16 @@ class MultiRoundInputBuilder:
         )
         new_text = prev_text + zoom_text
         new_images = prev_images + [crop_pil]
-        proc = self._get_processor(max_px)
-        inputs = proc(text=[new_text], images=new_images, return_tensors="pt", padding=True)
+
+        # Pre-resize the crop at this round's resolution
+        resized_crop = _smart_resize(crop_pil, max_px, self.min_pixels)
+        self._resized_images.append(resized_crop)
+
+        # Process with a large max_pixels so the processor doesn't resize
+        # any of our pre-resized images.
+        proc = self._get_processor(self._PASSTHROUGH_MAX)
+        inputs = proc(
+            text=[new_text], images=self._resized_images,
+            return_tensors="pt", padding=True,
+        )
         return inputs, new_text, new_images
