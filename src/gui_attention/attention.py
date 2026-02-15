@@ -185,7 +185,7 @@ def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
         return None
 
     # Position IDs
-    position_ids, _ = model.model.get_rope_index(
+    position_ids, _ = model.get_rope_index(
         input_ids=input_ids, image_grid_thw=image_grid_thw,
         video_grid_thw=None, attention_mask=attention_mask,
     )
@@ -222,7 +222,7 @@ def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
 
 def forward_for_cache(model, input_ids, pixel_values, image_grid_thw, attention_mask):
     """Run model forward and cache outputs for multi-round extraction."""
-    position_ids, _ = model.model.get_rope_index(
+    position_ids, _ = model.get_rope_index(
         input_ids=input_ids, image_grid_thw=image_grid_thw,
         video_grid_thw=None, attention_mask=attention_mask,
     )
