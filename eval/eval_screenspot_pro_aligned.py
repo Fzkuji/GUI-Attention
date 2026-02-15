@@ -427,6 +427,9 @@ def main():
     print(f"  rounds:           {args.rounds}")
     print(f"  crop_ratio:       {args.crop_ratio}")
     print(f"  max_pixels:       {args.max_pixels}")
+    # Force cuda:0 for aligned mode — device_map="auto" breaks output_hidden_states
+    if args.mode == "aligned" and args.device == "auto":
+        args.device = "cuda:0"
     print(f"  device:           {args.device}")
     print()
 
