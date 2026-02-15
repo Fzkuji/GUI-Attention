@@ -1,19 +1,46 @@
-"""Attention extraction helpers for multi-round foveated inference.
+"""Simplified attention extraction: last-layer Q*K with max-peak head selection.
 
-Shared by training (gui_attention.train) and evaluation
-(eval/eval_screenspot_pro_aligned.py).
+No dependency on gui_aima's grounding head. Works directly with Qwen2.5-VL's
+transformer layers, handling GQA and M-RoPE.
 """
 
 import math
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from gui_aima.inference import calculate_attention_from_qk
+
+# ---------------------------------------------------------------------------
+# M-RoPE helpers (extracted from transformers to avoid version coupling)
+# ---------------------------------------------------------------------------
+
+def _rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def _find_nth_image_visual_range(input_ids, image_token_id, n):
-    """Return (start, end) indices of the n-th (0-based) contiguous block of image tokens."""
+def _apply_mrope(x, cos, sin, mrope_section):
+    """Apply M-RoPE to a single tensor (Q or K independently)."""
+    sec2 = [s * 2 for s in mrope_section]
+    # cos/sin shape: (3, batch, seq_len, head_dim)
+    # Split head_dim into mrope sections, pick temporal/height/width dims
+    cos_c = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(sec2, dim=-1))], dim=-1
+    ).unsqueeze(1)  # (batch, 1, seq_len, head_dim) — broadcast over heads
+    sin_c = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(sec2, dim=-1))], dim=-1
+    ).unsqueeze(1)
+    return (x * cos_c) + (_rotate_half(x) * sin_c)
+
+
+# ---------------------------------------------------------------------------
+# Token-range helpers
+# ---------------------------------------------------------------------------
+
+def find_image_visual_ranges(input_ids, image_token_id):
+    """Return list of (start, end) for each contiguous block of image tokens."""
     ids = input_ids.tolist()
     blocks = []
     in_block = False
@@ -29,10 +56,10 @@ def _find_nth_image_visual_range(input_ids, image_token_id, n):
                 in_block = False
     if in_block:
         blocks.append((start, len(ids)))
-    return blocks[n] if n < len(blocks) else None
+    return blocks
 
 
-def _find_nth_pointer_pad(input_ids, pointer_pad_id, n):
+def find_nth_pointer_pad(input_ids, pointer_pad_id, n):
     """Return index of the n-th pointer_pad token (0-based)."""
     pad_set = set(pointer_pad_id) if isinstance(pointer_pad_id, list) else {pointer_pad_id}
     count = 0
@@ -44,81 +71,137 @@ def _find_nth_pointer_pad(input_ids, pointer_pad_id, n):
     return None
 
 
-def get_round_attention(model, input_ids, pixel_values, image_grid_thw,
-                        attention_mask, round_idx):
-    """Forward the full multi-round sequence and extract attention for a specific
-    round's pointer_pad over that round's visual tokens.
+# ---------------------------------------------------------------------------
+# Core: last-layer attention extraction
+# ---------------------------------------------------------------------------
 
-    Returns dict with attn_weights (1, n_vis), n_width, n_height  --  or None.
+def extract_last_layer_attention(
+    model,
+    hidden_states: list,
+    position_ids: torch.Tensor,
+    pointer_pos: int,
+    visual_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Extract the last transformer layer's attention from pointer_pad to visual tokens.
+
+    Args:
+        model: Qwen2.5-VL model (or AIMA variant).
+        hidden_states: list from model(..., output_hidden_states=True).hidden_states.
+            hidden_states[0] = embedding output, hidden_states[i] = output of layer i-1.
+        position_ids: (3, batch, seq_len) M-RoPE position IDs.
+        pointer_pos: scalar index of pointer_pad in the sequence.
+        visual_indices: 1-D LongTensor of visual token positions.
+
+    Returns:
+        per_head_attn: (num_heads, n_vis) — attention distribution per Q-head.
+        selected_attn: (n_vis,) — attention from the max-peak head.
+        best_head_idx: int — index of the selected head.
+    """
+    last_layer = model.model.layers[-1]
+    attn = last_layer.self_attn
+
+    # Input to last layer = output of previous layer, then apply input_layernorm
+    h = hidden_states[-2]  # (batch, seq_len, hidden_dim)
+    h = last_layer.input_layernorm(h)
+
+    # Project Q (pointer only) and K (visual tokens only)
+    ptr_h = h[:, pointer_pos : pointer_pos + 1, :]     # (1, 1, D)
+    vis_h = h[:, visual_indices, :]                      # (1, n_vis, D)
+
+    q = attn.q_proj(ptr_h)    # (1, 1, num_heads * head_dim)
+    k = attn.k_proj(vis_h)    # (1, n_vis, num_kv_heads * head_dim)
+
+    num_heads = attn.num_heads
+    num_kv_heads = attn.num_key_value_heads
+    head_dim = attn.head_dim
+    num_kv_groups = num_heads // num_kv_heads
+
+    q = q.view(1, 1, num_heads, head_dim).transpose(1, 2)         # (1, H, 1, d)
+    k = k.view(1, -1, num_kv_heads, head_dim).transpose(1, 2)     # (1, Hkv, n_vis, d)
+
+    # Compute M-RoPE cos/sin for the subset of positions we need
+    device = visual_indices.device
+    all_idx = torch.cat([torch.tensor([pointer_pos], device=device), visual_indices])
+    subset_pos = position_ids[:, :, all_idx]   # (3, batch, 1+n_vis)
+
+    cos, sin = attn.rotary_emb(k, subset_pos)
+    # cos, sin: (3, batch, 1+n_vis, head_dim)
+
+    mrope_section = attn.rope_scaling["mrope_section"]
+
+    # Apply RoPE separately to Q (pos 0) and K (pos 1:)
+    q = _apply_mrope(q, cos[:, :, :1, :], sin[:, :, :1, :], mrope_section)
+    k = _apply_mrope(k, cos[:, :, 1:, :], sin[:, :, 1:, :], mrope_section)
+
+    # GQA: expand K heads to match Q heads
+    if num_kv_groups > 1:
+        k = k.repeat_interleave(num_kv_groups, dim=1)   # (1, H, n_vis, d)
+
+    # Scaled dot-product attention
+    scores = torch.matmul(q, k.transpose(-2, -1)) * attn.scaling  # (1, H, 1, n_vis)
+    attn_weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+
+    per_head = attn_weights[0, :, 0, :]   # (H, n_vis)
+
+    # Select head with the highest peak attention value
+    best_head_idx = per_head.max(dim=-1).values.argmax().item()
+    selected = per_head[best_head_idx]     # (n_vis,)
+
+    return per_head, selected, best_head_idx
+
+
+# ---------------------------------------------------------------------------
+# High-level: forward + extract for a specific round
+# ---------------------------------------------------------------------------
+
+def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
+                        attention_mask, round_idx):
+    """Run model forward and extract attention for one round's pointer_pad.
+
+    Convenience wrapper combining forward pass + last-layer extraction.
+
+    Returns:
+        dict with keys:
+            attn_weights  — (1, n_vis) selected-head attention (for compat)
+            per_head_attn — (H, n_vis) all heads
+            best_head     — int
+            n_width, n_height — spatial grid dims of the attended image
+            visual_range  — (start, end) of this round's visual tokens
+        or None if the round's tokens are not found.
     """
     device = input_ids.device
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
-    ps_id = model.config.pointer_start_token_id
 
-    vis_range = _find_nth_image_visual_range(input_ids[0], img_tok, round_idx)
-    if vis_range is None:
+    vis_ranges = find_image_visual_ranges(input_ids[0], img_tok)
+    if round_idx >= len(vis_ranges):
         return None
-    vis_start, vis_end = vis_range
+    vis_start, vis_end = vis_ranges[round_idx]
     visual_indices = torch.arange(vis_start, vis_end, device=device)
 
-    target_pos = _find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
+    target_pos = find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
     if target_pos is None:
         return None
-    target_indices = torch.tensor([target_pos], device=device)
 
-    ps_positions = (input_ids[0] == ps_id).nonzero(as_tuple=False).squeeze(-1)
-    ps_before = ps_positions[ps_positions < target_pos]
-    query_end = ps_before[-1].item() if len(ps_before) > 0 else target_pos
-    query_start = vis_end
-
-    query_indices = torch.arange(query_start, query_end, device=device)
-    if getattr(model.config, 'part_query_weighting', False) and len(query_indices) > 12:
-        query_indices = query_indices[:-12]
-    if query_indices.numel() == 0:
-        query_indices = torch.arange(max(0, target_pos - 10), target_pos, device=device)
-
-    merged_indices = torch.cat([query_indices, target_indices], dim=0)
-
+    # Position IDs
     position_ids, _ = model.get_rope_index(
         input_ids=input_ids, image_grid_thw=image_grid_thw,
         video_grid_thw=None, attention_mask=attention_mask,
     )
+
+    # Forward
     outputs = model(
         input_ids=input_ids, attention_mask=attention_mask,
         pixel_values=pixel_values, image_grid_thw=image_grid_thw,
         output_hidden_states=True,
     )
 
-    hs_per_layer = list(outputs.hidden_states)
-    calculated_attention = calculate_attention_from_qk(
-        model=model, all_hidden_states=[hs_per_layer],
-        all_position_ids=position_ids, query_indices=merged_indices,
-        all_attention_mask=attention_mask,
+    per_head, selected, best_head = extract_last_layer_attention(
+        model, list(outputs.hidden_states), position_ids,
+        target_pos, visual_indices,
     )
 
-    all_layer_hs = torch.stack(hs_per_layer[1:], dim=0)
-    sample_hs = all_layer_hs[:, 0, :, :]
-    q_hs = F.normalize(sample_hs[:, query_indices, :], dim=-1)
-    v_hs = F.normalize(sample_hs[:, visual_indices, :], dim=-1)
-    sim = torch.einsum('lqd,lvd->lqv', q_hs, v_hs)
-    attn_per_query = sim.sum(dim=-1)
-
-    topk_query_indices = None
-    global_pattern = None
-    if not getattr(model.config, 'kl_query_weighting', False):
-        k = getattr(model.config, 'query_topk', 1)
-        agg = attn_per_query.sum(dim=0)
-        _, topk_query_indices = torch.topk(agg, min(k, len(query_indices)), largest=True)
-    else:
-        global_pattern = attn_per_query.sum(dim=0).softmax(dim=-1)
-
-    attn_weights, _ = model.multi_patch_pointer_head_attention(
-        query_indices, visual_indices, target_indices,
-        calculated_attention[0], topk_query_indices, global_pattern,
-        batch_idx=0,
-    )
-
+    # Spatial grid dimensions
     merge = model.visual.spatial_merge_size
     if round_idx < image_grid_thw.shape[0]:
         _, nh, nw = (image_grid_thw[round_idx] // merge).tolist()
@@ -126,93 +209,55 @@ def get_round_attention(model, input_ids, pixel_values, image_grid_thw,
         n_vis = visual_indices.numel()
         nw = nh = int(math.sqrt(n_vis))
 
-    return {"attn_weights": attn_weights, "n_width": int(nw), "n_height": int(nh)}
-
-
-def forward_for_attention(model, input_ids, pixel_values, image_grid_thw, attention_mask):
-    """Run model forward and cache outputs for multi-round attention extraction.
-
-    Use with extract_attention_for_round to avoid redundant forward passes.
-    """
-    position_ids, _ = model.get_rope_index(
-        input_ids=input_ids, image_grid_thw=image_grid_thw,
-        video_grid_thw=None, attention_mask=attention_mask,
-    )
-    outputs = model(
-        input_ids=input_ids, attention_mask=attention_mask,
-        pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-        output_hidden_states=True,
-    )
-    hs_per_layer = list(outputs.hidden_states)
-    all_layer_hs = torch.stack(hs_per_layer[1:], dim=0)
     return {
-        "position_ids": position_ids,
-        "hs_per_layer": hs_per_layer,
-        "all_layer_hs": all_layer_hs,
+        "attn_weights": selected.unsqueeze(0),   # (1, n_vis)
+        "per_head_attn": per_head,                # (H, n_vis)
+        "best_head": best_head,
+        "n_width": int(nw),
+        "n_height": int(nh),
+        "visual_range": (vis_start, vis_end),
     }
 
 
-def extract_attention_for_round(model, input_ids, image_grid_thw, attention_mask,
-                                cache, round_idx):
-    """Extract attention for a specific round from pre-computed forward outputs."""
+def forward_for_cache(model, input_ids, pixel_values, image_grid_thw, attention_mask):
+    """Run model forward and cache outputs for multi-round extraction."""
+    position_ids, _ = model.get_rope_index(
+        input_ids=input_ids, image_grid_thw=image_grid_thw,
+        video_grid_thw=None, attention_mask=attention_mask,
+    )
+    outputs = model(
+        input_ids=input_ids, attention_mask=attention_mask,
+        pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+        output_hidden_states=True,
+    )
+    return {
+        "position_ids": position_ids,
+        "hidden_states": list(outputs.hidden_states),
+    }
+
+
+def extract_round_from_cache(model, input_ids, image_grid_thw, cache, round_idx):
+    """Extract attention for a specific round from pre-computed forward outputs.
+
+    Returns dict like forward_and_extract, or None.
+    """
     device = input_ids.device
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
-    ps_id = model.config.pointer_start_token_id
 
-    vis_range = _find_nth_image_visual_range(input_ids[0], img_tok, round_idx)
-    if vis_range is None:
+    vis_ranges = find_image_visual_ranges(input_ids[0], img_tok)
+    if round_idx >= len(vis_ranges):
         return None
-    vis_start, vis_end = vis_range
+    vis_start, vis_end = vis_ranges[round_idx]
     visual_indices = torch.arange(vis_start, vis_end, device=device)
 
-    target_pos = _find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
+    target_pos = find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
     if target_pos is None:
         return None
-    target_indices = torch.tensor([target_pos], device=device)
 
-    ps_positions = (input_ids[0] == ps_id).nonzero(as_tuple=False).squeeze(-1)
-    ps_before = ps_positions[ps_positions < target_pos]
-    query_end = ps_before[-1].item() if len(ps_before) > 0 else target_pos
-    query_start = vis_end
-
-    query_indices = torch.arange(query_start, query_end, device=device)
-    if getattr(model.config, 'part_query_weighting', False) and len(query_indices) > 12:
-        query_indices = query_indices[:-12]
-    if query_indices.numel() == 0:
-        query_indices = torch.arange(max(0, target_pos - 10), target_pos, device=device)
-
-    merged_indices = torch.cat([query_indices, target_indices], dim=0)
-
-    position_ids = cache["position_ids"]
-    hs_per_layer = cache["hs_per_layer"]
-    all_layer_hs = cache["all_layer_hs"]
-
-    calculated_attention = calculate_attention_from_qk(
-        model=model, all_hidden_states=[hs_per_layer],
-        all_position_ids=position_ids, query_indices=merged_indices,
-        all_attention_mask=attention_mask,
-    )
-
-    sample_hs = all_layer_hs[:, 0, :, :]
-    q_hs = F.normalize(sample_hs[:, query_indices, :], dim=-1)
-    v_hs = F.normalize(sample_hs[:, visual_indices, :], dim=-1)
-    sim = torch.einsum('lqd,lvd->lqv', q_hs, v_hs)
-    attn_per_query = sim.sum(dim=-1)
-
-    topk_query_indices = None
-    global_pattern = None
-    if not getattr(model.config, 'kl_query_weighting', False):
-        k = getattr(model.config, 'query_topk', 1)
-        agg = attn_per_query.sum(dim=0)
-        _, topk_query_indices = torch.topk(agg, min(k, len(query_indices)), largest=True)
-    else:
-        global_pattern = attn_per_query.sum(dim=0).softmax(dim=-1)
-
-    attn_weights, _ = model.multi_patch_pointer_head_attention(
-        query_indices, visual_indices, target_indices,
-        calculated_attention[0], topk_query_indices, global_pattern,
-        batch_idx=0,
+    per_head, selected, best_head = extract_last_layer_attention(
+        model, cache["hidden_states"], cache["position_ids"],
+        target_pos, visual_indices,
     )
 
     merge = model.visual.spatial_merge_size
@@ -222,4 +267,50 @@ def extract_attention_for_round(model, input_ids, image_grid_thw, attention_mask
         n_vis = visual_indices.numel()
         nw = nh = int(math.sqrt(n_vis))
 
-    return {"attn_weights": attn_weights, "n_width": int(nw), "n_height": int(nh)}
+    return {
+        "attn_weights": selected.unsqueeze(0),
+        "per_head_attn": per_head,
+        "best_head": best_head,
+        "n_width": int(nw),
+        "n_height": int(nh),
+        "visual_range": (vis_start, vis_end),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-image helpers: identify which image an attended token belongs to
+# ---------------------------------------------------------------------------
+
+def identify_attended_image(
+    attn: torch.Tensor,
+    visual_ranges: List[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Given attention over ALL visual tokens, find which image has the max-attended token.
+
+    Args:
+        attn: (n_total_vis,) attention weights over concatenated visual tokens.
+        visual_ranges: list of (start, end) per image in the input_ids sequence.
+
+    Returns:
+        image_idx: which image (0-based) the max token belongs to.
+        local_token_idx: offset within that image's visual tokens.
+    """
+    global_argmax = attn.argmax().item()
+
+    # Map global offset into image-specific offset
+    cumulative = 0
+    for img_idx, (vs, ve) in enumerate(visual_ranges):
+        n_tokens = ve - vs
+        if cumulative + n_tokens > global_argmax:
+            return img_idx, global_argmax - cumulative
+        cumulative += n_tokens
+
+    # Fallback: last image
+    return len(visual_ranges) - 1, global_argmax - cumulative
+
+
+def token_to_spatial(local_token_idx: int, n_width: int, n_height: int):
+    """Convert a flat visual token index to normalised (x, y) coordinates."""
+    col = local_token_idx % n_width
+    row = local_token_idx // n_width
+    return (col + 0.5) / n_width, (row + 0.5) / n_height

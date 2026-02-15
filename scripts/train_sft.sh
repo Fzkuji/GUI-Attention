@@ -1,13 +1,13 @@
 #!/bin/bash
 # ============================================================================
-# Multi-Round Foveated SFT Training
+# Multi-Precision Foveated SFT Training
 # ============================================================================
-# Teacher-forcing: crop around GT each round, supervise attention with NLL.
+# Teacher-forcing: crop around GT at increasing precision levels.
 # Recommended as the first training stage before GRPO.
 #
 # Usage:
 #   bash scripts/train_sft.sh
-#   bash scripts/train_sft.sh 2   # override max_rounds
+#   bash scripts/train_sft.sh 3   # override max_rounds
 # ============================================================================
 
 set -e
@@ -20,10 +20,11 @@ GUI_AIMA_SRC="${BASE_DIR}/Experiments/GUI-AIMA/src"
 MODEL="${BASE_DIR}/models/GUI-AIMA-3B"
 DATA="${BASE_DIR}/data/GUI-Actor/guiact_bbox.json"
 IMAGE_FOLDER="${BASE_DIR}/data/GUI-Actor/images/GUIAct/web_imgs"
-OUTPUT_DIR="${BASE_DIR}/checkpoints/sft_multi_round"
+OUTPUT_DIR="${BASE_DIR}/checkpoints/sft_foveated"
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
-MAX_ROUNDS=${1:-2}          # SFT only needs 2 rounds (round 0 low-res + round 1 high-res)
+MAX_ROUNDS=${1:-3}          # L0 → L1 → L2 (3 rounds covers low → high)
+INITIAL_LEVEL=0             # Start at low precision
 CROP_RATIO=0.3
 EPOCHS=3
 BATCH_SIZE=1
@@ -36,12 +37,13 @@ SAVE_STEPS=500
 export PYTHONPATH="${GUI_AIMA_SRC}:${PYTHONPATH}"
 cd "${PROJECT_DIR}"
 
-echo "=== SFT Training ==="
-echo "  model:      ${MODEL}"
-echo "  data:       ${DATA}"
-echo "  output:     ${OUTPUT_DIR}"
-echo "  max_rounds: ${MAX_ROUNDS}"
-echo "  lr:         ${LR}"
+echo "=== Multi-Precision SFT Training ==="
+echo "  model:         ${MODEL}"
+echo "  data:          ${DATA}"
+echo "  output:        ${OUTPUT_DIR}"
+echo "  max_rounds:    ${MAX_ROUNDS}"
+echo "  initial_level: ${INITIAL_LEVEL}"
+echo "  lr:            ${LR}"
 echo ""
 
 python -m gui_attention.train \
@@ -51,8 +53,9 @@ python -m gui_attention.train \
     --image_folder "${IMAGE_FOLDER}" \
     --output_dir "${OUTPUT_DIR}" \
     --min_pixels 3136 \
-    --max_pixels 1003520 \
+    --max_pixels 250000 \
     --max_rounds "${MAX_ROUNDS}" \
+    --initial_level "${INITIAL_LEVEL}" \
     --crop_ratio "${CROP_RATIO}" \
     --num_train_epochs "${EPOCHS}" \
     --per_device_train_batch_size "${BATCH_SIZE}" \

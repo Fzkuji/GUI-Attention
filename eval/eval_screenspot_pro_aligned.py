@@ -1,27 +1,24 @@
 """
-ScreenSpot-Pro evaluation script ALIGNED with multi-round GRPO training.
+ScreenSpot-Pro evaluation using multi-precision foveation (v2).
 
-Key alignment with gui_attention.train:
-  1. Uses attention-based prediction (argmax instead of sampling)
-  2. Uses MultiRoundInputBuilder for identical input construction
-  3. Uses same convergence criterion (point_in_bbox, ri >= 2)
-  4. Uses same precision levels (low → high)
-  5. Uses get_round_attention() for attention extraction
+Uses simplified last-layer Q*K attention extraction with max-peak head
+selection and FoveationLoop for progressive zoom.
 
 Usage:
-  # Multi-round attention-based eval (aligned with training)
+  # Multi-round foveation eval
   python eval/eval_screenspot_pro_aligned.py \
       --model_name_or_path /path/to/checkpoint \
       --rounds 5 --crop_ratio 0.3
 
-  # Single-round eval
+  # Single-round eval at specific precision level
   python eval/eval_screenspot_pro_aligned.py \
       --model_name_or_path /path/to/checkpoint \
-      --rounds 1 --resolution high
+      --rounds 1 --initial_level 1
 """
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -31,22 +28,27 @@ from PIL import Image
 from tqdm import tqdm
 
 from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_aima.inference import inference
 from gui_aima.utils import do_boxes_overlap
 from gui_aima.constants import (
     ADDITIONAL_SPECIAL_TOKENS,
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
-    grounding_system_message,
 )
 from transformers import AutoProcessor, AutoTokenizer
 
-from gui_attention.constants import precision_for_round
-from gui_attention.crop import crop_image, get_patch_bbox, point_in_bbox
-from gui_attention.attention import get_round_attention
-from gui_attention.sampling import argmax_from_attention, region_from_attention
+from gui_attention.constants import precision_for_level
+from gui_attention.crop import crop_image
+from gui_attention.attention import (
+    find_image_visual_ranges,
+    find_nth_pointer_pad,
+    extract_last_layer_attention,
+    forward_for_cache,
+    identify_attended_image,
+    token_to_spatial,
+)
 from gui_attention.builder import MultiRoundInputBuilder
+from gui_attention.foveation import FoveationLoop
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +62,25 @@ def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
     return (x1 / img_width, y1 / img_height, x2 / img_width, y2 / img_height)
 
 
+def _get_all_visual_indices(input_ids, image_token_id, up_to_pos=None):
+    """Get indices of ALL visual tokens, optionally only those before a given position."""
+    ranges = find_image_visual_ranges(input_ids, image_token_id)
+    indices = []
+    range_offsets = []
+    offset = 0
+    for vs, ve in ranges:
+        if up_to_pos is not None and vs >= up_to_pos:
+            break
+        indices.append(torch.arange(vs, ve, device=input_ids.device))
+        range_offsets.append((offset, ve - vs))
+        offset += ve - vs
+    if not indices:
+        return None, []
+    return torch.cat(indices), range_offsets
+
+
 # ---------------------------------------------------------------------------
-# Metrics (from original eval)
+# Metrics
 # ---------------------------------------------------------------------------
 
 def get_metric(list_of_examples,
@@ -140,145 +159,126 @@ def get_metric(list_of_examples,
 
 
 # ---------------------------------------------------------------------------
-# Single-round inference (GUI-AIMA standard, for comparison)
+# Multi-round foveation inference (v2)
 # ---------------------------------------------------------------------------
 
-def run_single_round_standard(image, instruction, model, tokenizer, processor,
-                              use_placeholder=True, topk=3, resize_to_pixels=None):
-    """Single-round using GUI-AIMA's inference() function."""
-    if resize_to_pixels is not None and resize_to_pixels > 0:
-        w, h = image.size
-        if w * h != resize_to_pixels:
-            ratio = (resize_to_pixels / (w * h)) ** 0.5
-            image = image.resize((int(w * ratio), int(h * ratio)))
-
-    conversation = [
-        {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": instruction},
-        ]},
-    ]
-    pred = inference(conversation, model, tokenizer, processor,
-                     logits_processor=None, use_placeholder=use_placeholder, topk=topk)
-    return pred
-
-
-# ---------------------------------------------------------------------------
-# Multi-round attention-based inference (ALIGNED with training)
-# ---------------------------------------------------------------------------
-
-def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
-                            builder, max_rounds=5, crop_ratio=0.3, device="cuda:0",
-                            prediction_method="region", r0_precision=None):
+def run_multi_round_foveation(image, image_path, instruction, model, tokenizer,
+                               builder, max_rounds=5, crop_ratio=0.3,
+                               device="cuda:0", initial_level=0):
     """
-    Multi-round inference using attention-based prediction, aligned with training.
+    Multi-round inference using multi-precision foveation.
 
-    Key differences from training:
-    - Uses deterministic prediction instead of sampling
-    - Same input construction (MultiRoundInputBuilder)
-    - Same convergence criterion (point_in_bbox, ri >= 2)
-    - Same precision levels
+    Uses FoveationLoop for progressive zoom decisions:
+    - Attention from pointer_pad to ALL visual tokens across all images
+    - Identify which image (precision level) is attended
+    - Level 2+ attended → stop (final prediction)
+    - Otherwise crop and add higher-precision image
     """
-    predict_fn = region_from_attention if prediction_method == "region" else argmax_from_attention
-    # Round 0: full image
-    r0_max_pixels = r0_precision if r0_precision is not None else precision_for_round(0)
-    r0_inputs, r0_text, r0_images = builder.build_round0(
-        image_path, instruction, r0_max_pixels
+    fov_loop = FoveationLoop(max_rounds=max_rounds, crop_ratio=crop_ratio)
+    state = fov_loop.new_state()
+
+    builder.reset()
+    level = initial_level
+
+    # Round 0: full image at initial level
+    r0_inputs, cur_text, cur_images = builder.build_round0(
+        image_path, instruction, level=level,
     )
-    r0_dev = {k: v.to(device) for k, v in r0_inputs.items()}
+    last_inputs = r0_inputs
 
-    attn0 = get_round_attention(
-        model, r0_dev["input_ids"], r0_dev.get("pixel_values"),
-        r0_dev.get("image_grid_thw"),
-        r0_dev.get("attention_mask", torch.ones_like(r0_dev["input_ids"])),
-        round_idx=0,
-    )
-    if attn0 is None:
-        return {"topk_points": [(0.5, 0.5)], "n_width": 1, "n_height": 1, "num_rounds": 0}
+    img_tok = model.config.image_token_id
+    pp_id = model.config.pointer_pad_token_id
+    merge = model.visual.spatial_merge_size
 
-    # Deterministic prediction (vs sampling in training)
-    px, py = predict_fn(attn0["attn_weights"], attn0["n_width"], attn0["n_height"])
+    round_coords = []
 
-    round_coords = [(px, py)]
-    round_local_coords = [(px, py)]
-    round_crop_bboxes = [None]  # round 0 = full image
+    for ri in range(max_rounds):
+        inp = {k: v.to(device) for k, v in last_inputs.items()}
+        input_ids = inp["input_ids"]
+        attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
 
-    prev_x, prev_y = px, py
-    prev_nw, prev_nh = attn0["n_width"], attn0["n_height"]
-    cur_text, cur_images = r0_text, list(r0_images)
+        # Forward pass
+        cache = forward_for_cache(
+            model, input_ids, inp.get("pixel_values"),
+            inp.get("image_grid_thw"), attention_mask,
+        )
 
-    if max_rounds <= 1:
-        return {
-            "topk_points": [(px, py)],
-            "n_width": attn0["n_width"],
-            "n_height": attn0["n_height"],
-            "num_rounds": 1,
-        }
-
-    for ri in range(1, max_rounds):
-        cropped, cbbox = crop_image(image, prev_x, prev_y, crop_ratio)
-        try:
-            ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                cur_text, cur_images, cropped, cbbox, ri,
-            )
-        except Exception as e:
-            print(f"  Round {ri + 1} input build error: {e}")
+        # Find pointer_pad for this round
+        ptr_pos = find_nth_pointer_pad(input_ids[0], pp_id, ri)
+        if ptr_pos is None:
             break
 
-        ri_dev = {k: v.to(device) for k, v in ri_inputs.items()}
-        attn_ri = get_round_attention(
-            model, ri_dev["input_ids"], ri_dev.get("pixel_values"),
-            ri_dev.get("image_grid_thw"),
-            ri_dev.get("attention_mask", torch.ones_like(ri_dev["input_ids"])),
-            round_idx=ri,
+        # Get all visual tokens before this pointer
+        visual_indices, range_offsets = _get_all_visual_indices(
+            input_ids[0], img_tok, up_to_pos=ptr_pos,
         )
-        if attn_ri is None:
+        if visual_indices is None:
             break
 
-        # Deterministic prediction for this round
-        cx, cy = predict_fn(attn_ri["attn_weights"], attn_ri["n_width"], attn_ri["n_height"])
-
-        # Map back to original coords
-        bx1, by1, bx2, by2 = cbbox
-        ox = bx1 + cx * (bx2 - bx1)
-        oy = by1 + cy * (by2 - by1)
-
-        round_coords.append((ox, oy))
-        round_local_coords.append((cx, cy))
-        round_crop_bboxes.append(cbbox)
-
-        # Convergence check (IDENTICAL to training):
-        # Does the new prediction fall within the previous round's predicted patch?
-        prev_patch_local = get_patch_bbox(
-            round_local_coords[-2][0], round_local_coords[-2][1],
-            prev_nw, prev_nh,
+        # Extract attention
+        per_head, selected, best_head = extract_last_layer_attention(
+            model, cache["hidden_states"], cache["position_ids"],
+            ptr_pos, visual_indices,
         )
-        if round_crop_bboxes[-2] is not None:
-            pb = round_crop_bboxes[-2]
-            pw = pb[2] - pb[0]
-            ph = pb[3] - pb[1]
-            prev_patch_orig = (
-                pb[0] + prev_patch_local[0] * pw,
-                pb[1] + prev_patch_local[1] * ph,
-                pb[0] + prev_patch_local[2] * pw,
-                pb[1] + prev_patch_local[3] * ph,
-            )
+
+        # Identify which image has the max-attended token
+        img_idx, local_idx = identify_attended_image(
+            selected, [(0, ro[1]) for ro in range_offsets],
+        )
+
+        # Get spatial coordinates
+        grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
+        if img_idx < len(grid_dims):
+            nh, nw = grid_dims[img_idx]
         else:
-            prev_patch_orig = prev_patch_local
+            n_vis = range_offsets[img_idx][1] if img_idx < len(range_offsets) else 1
+            nw = nh = int(math.sqrt(n_vis))
 
-        # Only allow convergence from round 2+ (same as training)
-        if ri >= 2 and point_in_bbox(ox, oy, prev_patch_orig):
+        lx, ly = token_to_spatial(local_idx, nw, nh)
+
+        # Map to global coordinates
+        info = builder.image_infos[img_idx]
+        bx1, by1, bx2, by2 = info.global_bbox
+        ox = bx1 + lx * (bx2 - bx1)
+        oy = by1 + ly * (by2 - by1)
+
+        attended_level = info.level
+        round_coords.append((ox, oy))
+
+        # Foveation decision
+        decision = fov_loop.decide(state, attended_level, ox, oy)
+
+        if decision["action"] == "stop":
             break
 
-        prev_x, prev_y = ox, oy
-        prev_nw, prev_nh = attn_ri["n_width"], attn_ri["n_height"]
+        if decision["action"] == "crop":
+            next_level = decision["level"]
+            cropped, cbbox = crop_image(image, ox, oy, crop_ratio)
+            try:
+                ri_inputs, cur_text, cur_images = builder.extend_with_crop(
+                    cur_text, cur_images, cropped, cbbox, level=next_level,
+                )
+            except Exception as e:
+                print(f"  Round {ri + 1} build error: {e}")
+                break
+            last_inputs = ri_inputs
+
+        if not fov_loop.should_continue(state, ri + 1):
+            break
+
+    if not round_coords:
+        return {
+            "topk_points": [(0.5, 0.5)],
+            "n_width": 1,
+            "n_height": 1,
+            "num_rounds": 0,
+        }
 
     final_x, final_y = round_coords[-1]
     return {
         "topk_points": [(final_x, final_y)],
-        "n_width": prev_nw,
-        "n_height": prev_nh,
+        "n_width": nw,
+        "n_height": nh,
         "num_rounds": len(round_coords),
     }
 
@@ -287,7 +287,7 @@ def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
 # Main evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate_all(model, tokenizer, processor, data, image_dir, args, builder):
+def evaluate_all(model, tokenizer, data, image_dir, args, builder):
     """Run evaluation over all examples."""
     device = next(model.parameters()).device
     results = []
@@ -311,25 +311,12 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args, builder):
         image = Image.open(image_path).convert("RGB")
         gt_bbox = ele["bbox_x1y1x2y2"]
 
-        if args.mode == "standard":
-            # Standard GUI-AIMA single-round (for baseline comparison)
-            pred = run_single_round_standard(
-                image, example["instruction"], model, tokenizer, processor,
-                use_placeholder=True, topk=args.topk,
-                resize_to_pixels=args.resize_to_pixels if args.resize_to_pixels > 0 else None,
-            )
-        elif args.mode == "aligned":
-            # Multi-round attention-based (aligned with training)
-            pred = run_multi_round_aligned(
-                image, image_path, example["instruction"],
-                model, tokenizer, builder,
-                max_rounds=args.rounds, crop_ratio=args.crop_ratio,
-                device=str(device),
-                prediction_method=args.prediction_method,
-                r0_precision=getattr(args, 'r0_precision', None),
-            )
-        else:
-            raise ValueError(f"Unknown mode: {args.mode}")
+        pred = run_multi_round_foveation(
+            image, image_path, example["instruction"],
+            model, tokenizer, builder,
+            max_rounds=args.rounds, crop_ratio=args.crop_ratio,
+            device=str(device), initial_level=args.initial_level,
+        )
 
         topk_points = pred["topk_points"]
         if not topk_points:
@@ -366,7 +353,7 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args, builder):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ScreenSpot-Pro eval (aligned with training)")
+    parser = argparse.ArgumentParser(description="ScreenSpot-Pro eval (multi-precision foveation)")
 
     # Model
     parser.add_argument("--model_name_or_path", type=str, default="smz8599/GUI-AIMA-3B")
@@ -375,66 +362,29 @@ def main():
     parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data/ScreenSpot-Pro")
     parser.add_argument("--save_path", type=str, default=None)
 
-    # Mode
-    parser.add_argument("--mode", type=str, default="aligned",
-                        choices=["standard", "aligned"],
-                        help="'standard' = GUI-AIMA single-round, 'aligned' = multi-round attention-based")
-
-    # Resolution (for standard mode)
-    parser.add_argument("--resolution", type=str, default="high", choices=["high", "low"])
-    parser.add_argument("--resize_to_pixels", type=int, default=None)
-    parser.add_argument("--max_pixels", type=int, default=None)
-
-    # Multi-round (for aligned mode)
+    # Multi-round foveation
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--crop_ratio", type=float, default=0.3)
-
-    # Prediction method
-    parser.add_argument("--prediction_method", type=str, default="region",
-                        choices=["argmax", "region"],
-                        help="'argmax' = naive argmax, 'region' = GUI-AIMA region-based (recommended)")
+    parser.add_argument("--initial_level", type=int, default=0,
+                        help="Precision level for round 0 (0=low, 1=original, 2=high, 3=ultra)")
 
     # Misc
-    parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--r0_precision", type=int, default=None,
-                        help="Override round-0 max_pixels (e.g. 5760000 for high-res first round)")
+    parser.add_argument("--device", type=str, default="cuda:0")
 
     args = parser.parse_args()
-
-    # Resolve resolution
-    if args.mode == "standard":
-        if args.resolution == "high":
-            args.resize_to_pixels = args.resize_to_pixels or 5760000
-            args.max_pixels = args.max_pixels or 14777616
-        else:
-            args.resize_to_pixels = args.resize_to_pixels or -1
-            args.max_pixels = args.max_pixels or 1003520
-    else:
-        # For aligned mode, we use PRECISION_HIGH as max_pixels for processor
-        args.max_pixels = args.max_pixels or 14777616
-        args.resize_to_pixels = args.resize_to_pixels or -1
 
     # Auto save path
     if args.save_path is None:
         model_name = Path(args.model_name_or_path).name
-        if args.mode == "aligned":
-            tag = f"aligned_r{args.rounds}_crop{args.crop_ratio}_{args.prediction_method}"
-        else:
-            tag = f"standard_{args.resolution}"
+        tag = f"fov_r{args.rounds}_L{args.initial_level}_crop{args.crop_ratio}"
         args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{model_name}/{tag}"
 
     print(f"=== Config ===")
-    print(f"  mode:             {args.mode}")
-    print(f"  prediction:       {args.prediction_method}")
-    print(f"  rounds:           {args.rounds}")
-    print(f"  crop_ratio:       {args.crop_ratio}")
-    print(f"  max_pixels:       {args.max_pixels}")
-    # Force cuda:0 for aligned mode — device_map="auto" breaks output_hidden_states
-    if args.mode == "aligned" and args.device == "auto":
-        args.device = "cuda:0"
-    print(f"  device:           {args.device}")
+    print(f"  rounds:         {args.rounds}")
+    print(f"  initial_level:  {args.initial_level}")
+    print(f"  crop_ratio:     {args.crop_ratio}")
+    print(f"  device:         {args.device}")
     print()
 
     # Load data
@@ -450,11 +400,13 @@ def main():
     image_dir = os.path.join(args.data_path, "images")
 
     # Load model
-    print(f"Loading model: {args.model_name_or_path} (max_pixels={args.max_pixels})")
-    processor = AutoProcessor.from_pretrained(args.model_name_or_path, max_pixels=args.max_pixels)
+    max_pixels = precision_for_level(args.initial_level)
+    print(f"Loading model: {args.model_name_or_path} (max_pixels={max_pixels})")
+    processor = AutoProcessor.from_pretrained(
+        args.model_name_or_path, max_pixels=max_pixels,
+    )
     tokenizer = processor.tokenizer
 
-    # Add special tokens if not present
     num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
     if num_new > 0:
         print(f"Added {num_new} special tokens to tokenizer")
@@ -469,14 +421,7 @@ def main():
     if num_new > 0:
         model.resize_token_embeddings(len(tokenizer))
 
-    for attr, default in [
-        ('query_topk', 1), ('kl_query_weighting', False),
-        ('part_query_weighting', False), ('layer_wise_query_weighting', False),
-    ]:
-        if not hasattr(model.config, attr):
-            setattr(model.config, attr, default)
-
-    # Ensure pointer token IDs are set (needed for attention extraction)
+    # Set pointer token IDs
     if not hasattr(model.config, 'pointer_pad_token_id') or model.config.pointer_pad_token_id is None:
         model.config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
         model.config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
@@ -484,10 +429,8 @@ def main():
         print(f"Set pointer token IDs: start={model.config.pointer_start_token_id}, "
               f"pad={model.config.pointer_pad_token_id}, end={model.config.pointer_end_token_id}")
 
-    # Builder for aligned mode
-    builder = None
-    if args.mode == "aligned":
-        builder = MultiRoundInputBuilder(args.model_name_or_path, tokenizer, min_pixels=3136)
+    # Builder
+    builder = MultiRoundInputBuilder(args.model_name_or_path, tokenizer, min_pixels=3136)
 
     # Check cache
     os.makedirs(args.save_path, exist_ok=True)
@@ -502,7 +445,7 @@ def main():
     else:
         t0 = time.time()
         with torch.no_grad():
-            results = evaluate_all(model, tokenizer, processor, data, image_dir, args, builder)
+            results = evaluate_all(model, tokenizer, data, image_dir, args, builder)
         elapsed = time.time() - t0
         print(f"Evaluation took {elapsed:.1f}s ({elapsed / len(results):.2f}s/sample)")
 
@@ -511,12 +454,11 @@ def main():
         print(f"Saved {len(results)} predictions to {pred_path}")
 
         # Round statistics
-        if args.mode == "aligned":
-            round_counts = {}
-            for r in results:
-                nr = r.get("num_rounds", 1)
-                round_counts[nr] = round_counts.get(nr, 0) + 1
-            print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+        round_counts = {}
+        for r in results:
+            nr = r.get("num_rounds", 1)
+            round_counts[nr] = round_counts.get(nr, 0) + 1
+        print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
 
     # Compute metrics
     if not os.path.exists(metric_path):

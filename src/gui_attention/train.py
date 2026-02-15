@@ -1,29 +1,23 @@
 """
-Multi-Round Progressive GRPO Training with Attention Sampling.
+Multi-Precision Foveated Training (SFT + GRPO).
 
-Coarse-to-fine foveation: each round crops around the previous prediction
-at increasing resolution, appending the crop as a new temporal image in the
-Qwen2.5-VL mrope framework.  Log-probs accumulate across rounds; reward is
-computed from the final-round prediction only.
+Progressive zoom: each round the model's pointer_pad attention selects a
+visual token across ALL images in context.  We identify which image (precision
+level) it belongs to, crop around that location, and add a higher-resolution
+version.  Terminates when attention lands on a high/ultra-high level image.
 
-Precision levels (two-stage):
-    Round 1  – low   (max_pixels ≈ 1 003 520)
-    Round 2+ – high  (max_pixels ≈ 5 760 000)
-
-Token layout per round (appended to the running sequence):
-    <crop_image_tokens> [Zoomed …] <|im_start|>assistant<|recipient|>os
-    pyautogui.click(<pointer_start><pointer_pad><pointer_end>)
-
-The causal mask guarantees that each round's pointer_pad only attends to
-tokens up to (and including) itself, so a single forward pass on the full
-sequence gives the same per-round attention as incremental passes.
+Precision levels:
+    Level 0 – low    (250 000 px)
+    Level 1 – original (1 003 520 px)
+    Level 2 – high   (4 000 000 px)
+    Level 3 – ultra  (14 000 000 px)
 
 Usage:
     python -m gui_attention.train \
-        --model_name_or_path /root/autodl-tmp/models/GUI-AIMA-3B \
-        --data_path /root/autodl-tmp/data/GUI-Actor/guiact_bbox.json \
-        --image_folder /root/autodl-tmp/data/GUI-Actor/images/GUIAct/web_imgs \
-        --output_dir /root/autodl-tmp/checkpoints/grpo_multi_round \
+        --model_name_or_path /path/to/GUI-AIMA-3B \
+        --data_path /path/to/guiact_bbox.json \
+        --image_folder /path/to/images \
+        --output_dir /path/to/checkpoints \
         ...
 """
 
@@ -37,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from PIL import Image, ImageFile
 from tqdm import tqdm
@@ -60,16 +55,25 @@ from gui_aima.constants import (
     ADDITIONAL_SPECIAL_TOKENS,
 )
 
-from gui_attention.constants import PRECISION_LOW, precision_for_round
-from gui_attention.crop import crop_image, get_patch_bbox, point_in_bbox
-from gui_attention.attention import (
-    get_round_attention, forward_for_attention, extract_attention_for_round,
+from gui_attention.constants import (
+    PRECISION_LEVELS, STOP_LEVELS, precision_for_level,
 )
-from gui_attention.sampling import sample_from_attention, compute_round_log_prob
+from gui_attention.crop import crop_image
+from gui_attention.attention import (
+    find_image_visual_ranges,
+    find_nth_pointer_pad,
+    extract_last_layer_attention,
+    forward_for_cache,
+    identify_attended_image,
+    token_to_spatial,
+)
+from gui_attention.sampling import sample_from_attention
 from gui_attention.builder import MultiRoundInputBuilder
+from gui_attention.foveation import FoveationLoop
 
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
+
 @dataclass
 class ScriptArgs:
     model_name_or_path: str = field(default="/root/autodl-tmp/models/GUI-AIMA-3B")
@@ -77,15 +81,15 @@ class ScriptArgs:
     image_folder: str = field(default=None)
     max_samples: Optional[int] = field(default=None)
     min_pixels: int = field(default=3136)
-    # Round-1 max_pixels; later rounds use precision_for_round()
-    max_pixels: int = field(default=PRECISION_LOW)
+    max_pixels: int = field(default=PRECISION_LEVELS[0])
     max_rounds: int = field(default=5)
     crop_ratio: float = field(default=0.3)
+    initial_level: int = field(default=0, metadata={"help": "Precision level for round 0 (0-3)"})
 
 
 @dataclass
 class TrainArgs(transformers.TrainingArguments):
-    training_mode: str = field(default="grpo", metadata={"help": "Training mode: 'grpo' or 'sft'"})
+    training_mode: str = field(default="grpo", metadata={"help": "'grpo' or 'sft'"})
     num_generations: int = field(default=8)
     max_completion_length: int = field(default=256)
     temperature: float = field(default=0.9)
@@ -110,10 +114,6 @@ def position_reward(pred_x, pred_y, bbox_gt, img_w, img_h):
     bbox_diag = max(math.sqrt(((bbox_gt[2] - bbox_gt[0]) * img_w) ** 2 +
                               ((bbox_gt[3] - bbox_gt[1]) * img_h) ** 2), 1.0)
     return 1.0 / (dist_px / bbox_diag + 1.0)
-
-
-
-
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -146,13 +146,10 @@ def load_dataset(data_path, image_folder, max_samples=None):
     return samples
 
 
-
-# ── Trainer ───────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_model_device(model):
-    """Get the input device for a model (works with device_map='auto')."""
     if hasattr(model, 'hf_device_map'):
-        # device_map model: find the device of the first module
         first_device = next(iter(model.hf_device_map.values()))
         if isinstance(first_device, str):
             return torch.device(first_device)
@@ -160,8 +157,63 @@ def _get_model_device(model):
     return model.device
 
 
-class MultiRoundGRPOTrainer:
-    def __init__(self, model, processor, tokenizer, train_data, args: TrainArgs, script_args: ScriptArgs):
+def _get_all_visual_indices(input_ids, image_token_id, up_to_pos=None):
+    """Get indices of ALL visual tokens, optionally only those before a given position."""
+    ranges = find_image_visual_ranges(input_ids, image_token_id)
+    indices = []
+    range_offsets = []  # (offset_in_combined, n_tokens) per image
+    offset = 0
+    for vs, ve in ranges:
+        if up_to_pos is not None and vs >= up_to_pos:
+            break
+        indices.append(torch.arange(vs, ve, device=input_ids.device))
+        range_offsets.append((offset, ve - vs))
+        offset += ve - vs
+    if not indices:
+        return None, []
+    return torch.cat(indices), range_offsets
+
+
+def _nll_at_target(attn_1d, target_idx, temperature=1.0):
+    """Compute negative log probability of target_idx in the attention distribution."""
+    if temperature != 1.0:
+        logits = torch.log(attn_1d.clamp(min=1e-10)) / temperature
+        log_p = F.log_softmax(logits, dim=-1)
+    else:
+        log_p = torch.log(attn_1d.clamp(min=1e-10))
+    return -log_p[target_idx]
+
+
+def _gt_token_in_image(gt_x, gt_y, image_info, nw, nh):
+    """Find the visual token index (within this image) closest to GT.
+
+    Args:
+        gt_x, gt_y: GT coordinates in global image space [0,1].
+        image_info: ImageInfo with global_bbox.
+        nw, nh: grid dimensions of this image.
+
+    Returns:
+        flat token index within this image, or None if GT is outside bbox.
+    """
+    bx1, by1, bx2, by2 = image_info.global_bbox
+    bw = bx2 - bx1
+    bh = by2 - by1
+    if bw <= 0 or bh <= 0:
+        return None
+    local_x = (gt_x - bx1) / bw
+    local_y = (gt_y - by1) / bh
+    if not (0 <= local_x <= 1 and 0 <= local_y <= 1):
+        return None
+    px = max(0, min(round(local_x * nw - 0.5), nw - 1))
+    py = max(0, min(round(local_y * nh - 0.5), nh - 1))
+    return py * nw + px
+
+
+# ── Trainer ───────────────────────────────────────────────────────────────────
+
+class MultiRoundTrainer:
+    def __init__(self, model, processor, tokenizer, train_data,
+                 args: TrainArgs, script_args: ScriptArgs):
         self.processor = processor
         self.tokenizer = tokenizer
         self.train_data = train_data
@@ -169,7 +221,13 @@ class MultiRoundGRPOTrainer:
         self.sa = script_args
         self.use_deepspeed = HAS_DEEPSPEED and args.deepspeed is not None
 
-        self.builder = MultiRoundInputBuilder(script_args.model_name_or_path, tokenizer, script_args.min_pixels)
+        self.builder = MultiRoundInputBuilder(
+            script_args.model_name_or_path, tokenizer, script_args.min_pixels,
+        )
+        self.fov_loop = FoveationLoop(
+            max_rounds=script_args.max_rounds,
+            crop_ratio=script_args.crop_ratio,
+        )
 
         total_steps = (
             int(args.num_train_epochs) * len(train_data)
@@ -180,7 +238,6 @@ class MultiRoundGRPOTrainer:
             total_steps = min(total_steps, args.max_steps)
 
         if self.use_deepspeed:
-            # DeepSpeed handles optimizer, scheduler, gradient accumulation
             self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
                 model=model,
                 model_parameters=[p for p in model.parameters() if p.requires_grad],
@@ -189,7 +246,6 @@ class MultiRoundGRPOTrainer:
             self.model = self.model_engine.module
             self.rank = dist.get_rank() if dist.is_initialized() else 0
             self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-            print(f"  [Rank {self.rank}] DeepSpeed initialized, world_size={self.world_size}")
         else:
             self.model = model
             self.model_engine = None
@@ -206,220 +262,48 @@ class MultiRoundGRPOTrainer:
         self.metrics = defaultdict(list)
         self.global_step = 0
 
-    # ── sampling phase (no grad) ──────────────────────────────────────────
+    # ── extract attention over all visual tokens for a given pointer_pad ──
 
-    def _sample_generations(self, sample, num_gen):
-        """For each generation, run multi-round foveation and collect log_probs."""
-        device = _get_model_device(self.model)
-        try:
-            img = Image.open(sample["image_path"]).convert("RGB")
-            img_w, img_h = img.size
-        except Exception:
-            return []
+    def _extract_attention_for_pointer(self, model, hidden_states, position_ids,
+                                        input_ids, round_idx):
+        """Extract attention from round_idx's pointer_pad to ALL preceding visual tokens.
 
-        # Round 0 inputs (shared across generations)
-        r0_inputs, r0_text, r0_images = self.builder.build_round0(sample, sample["instruction"], precision_for_round(0))
-        r0_dev = {k: v.to(device) for k, v in r0_inputs.items()}
+        Returns (selected_attn_1d, per_head_attn, best_head, visual_indices,
+                 range_offsets, vis_ranges) or None.
+        """
+        img_tok = model.config.image_token_id
+        pp_id = model.config.pointer_pad_token_id
+        ptr_pos = find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
+        if ptr_pos is None:
+            return None
 
-        self.model.eval()
-        with torch.no_grad():
-            attn0 = get_round_attention(
-                self.model, r0_dev["input_ids"], r0_dev.get("pixel_values"),
-                r0_dev.get("image_grid_thw"),
-                r0_dev.get("attention_mask", torch.ones_like(r0_dev["input_ids"])),
-                round_idx=0,
-            )
-        if attn0 is None:
-            return []
-
-        generations = []
-        for _ in range(num_gen):
-            round_log_probs = []
-            round_coords = []        # original-image normalised coords
-            round_local_coords = []  # coords local to that round's image
-            round_inputs_list = []
-            round_crop_bboxes = [None]  # round 0 has no crop bbox
-
-            # Round 0 sample
-            px, py, lp, _ = sample_from_attention(
-                attn0["attn_weights"], attn0["n_width"], attn0["n_height"],
-                temperature=self.args.attn_temperature,
-            )
-            round_log_probs.append(lp)
-            round_coords.append((px, py))
-            round_local_coords.append((px, py))
-            round_inputs_list.append(r0_inputs)
-
-            prev_x, prev_y = px, py
-            prev_nw, prev_nh = attn0["n_width"], attn0["n_height"]
-            cur_text, cur_images = r0_text, list(r0_images)
-
-            for ri in range(1, self.sa.max_rounds):
-                cropped, cbbox = crop_image(img, prev_x, prev_y, self.sa.crop_ratio)
-                try:
-                    ri_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                        cur_text, cur_images, cropped, cbbox, ri,
-                    )
-                except Exception:
-                    break
-
-                ri_dev = {k: v.to(device) for k, v in ri_inputs.items()}
-                with torch.no_grad():
-                    attn_ri = get_round_attention(
-                        self.model, ri_dev["input_ids"], ri_dev.get("pixel_values"),
-                        ri_dev.get("image_grid_thw"),
-                        ri_dev.get("attention_mask", torch.ones_like(ri_dev["input_ids"])),
-                        round_idx=ri,
-                    )
-                if attn_ri is None:
-                    break
-
-                cx, cy, lp_r, _ = sample_from_attention(
-                    attn_ri["attn_weights"], attn_ri["n_width"], attn_ri["n_height"],
-                    temperature=self.args.attn_temperature,
-                )
-                # map back to original coords
-                bx1, by1, bx2, by2 = cbbox
-                ox = bx1 + cx * (bx2 - bx1)
-                oy = by1 + cy * (by2 - by1)
-
-                round_log_probs.append(lp_r)
-                round_coords.append((ox, oy))
-                round_local_coords.append((cx, cy))
-                round_inputs_list.append(ri_inputs)
-                round_crop_bboxes.append(cbbox)
-
-                # Convergence: does the new prediction fall within the
-                # previous round's predicted patch (in original-image coords)?
-                # The previous round's patch bbox in its own local coords:
-                prev_patch_local = get_patch_bbox(
-                    round_local_coords[-2][0], round_local_coords[-2][1],
-                    prev_nw, prev_nh,
-                )
-                # Map previous patch bbox to original image coords
-                if round_crop_bboxes[-2] is not None:
-                    # Previous round was a crop
-                    pb = round_crop_bboxes[-2]
-                    pw = pb[2] - pb[0]
-                    ph = pb[3] - pb[1]
-                    prev_patch_orig = (
-                        pb[0] + prev_patch_local[0] * pw,
-                        pb[1] + prev_patch_local[1] * ph,
-                        pb[0] + prev_patch_local[2] * pw,
-                        pb[1] + prev_patch_local[3] * ph,
-                    )
-                else:
-                    # Previous round was the full image (round 0)
-                    prev_patch_orig = prev_patch_local
-
-                # Only allow convergence from round 2+ (round 0=low, round 1+=high,
-                # so ri>=2 means we've seen high-res at least once before)
-                if ri >= 2 and point_in_bbox(ox, oy, prev_patch_orig):
-                    break
-
-                prev_x, prev_y = ox, oy
-                prev_nw, prev_nh = attn_ri["n_width"], attn_ri["n_height"]
-
-            final_x, final_y = round_coords[-1]
-            reward = position_reward(
-                final_x, final_y, sample["bbox_gt"], img_w, img_h,
-            )
-
-            generations.append({
-                "reward": reward,
-                "total_log_prob": sum(round_log_probs),
-                "round_log_probs": round_log_probs,
-                "round_coords": round_coords,
-                "round_local_coords": round_local_coords,
-                "round_inputs_list": round_inputs_list,
-                "round_crop_bboxes": round_crop_bboxes,
-                "pred_coord": (final_x, final_y),
-                "num_rounds": len(round_coords),
-            })
-
-        return generations
-
-    # ── loss phase (with grad) ────────────────────────────────────────────
-
-    def _compute_loss(self, generations):
-        device = _get_model_device(self.model)
-        rewards = torch.tensor([g["reward"] for g in generations], device=device)
-        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-
-        total_loss = torch.tensor(0.0, device=device)
-        n_valid = 0
-        self.model.train()
-        temp = self.args.attn_temperature
-
-        # Round 0: one forward pass shared across all generations
-        # (all generations use the same round-0 inputs)
-        r0_inputs = generations[0]["round_inputs_list"][0]
-        inp0 = {k: v.to(device) for k, v in r0_inputs.items()}
-        input_ids_r0 = inp0["input_ids"]
-        attention_mask_r0 = inp0.get("attention_mask", torch.ones_like(input_ids_r0))
-        r0_cache = forward_for_attention(
-            self.model, input_ids_r0, inp0.get("pixel_values"),
-            inp0.get("image_grid_thw"), attention_mask_r0,
+        visual_indices, range_offsets = _get_all_visual_indices(
+            input_ids[0], img_tok, up_to_pos=ptr_pos,
         )
-        r0_attn = extract_attention_for_round(
-            self.model, input_ids_r0, inp0.get("image_grid_thw"),
-            attention_mask_r0, r0_cache, round_idx=0,
+        if visual_indices is None:
+            return None
+
+        per_head, selected, best_head = extract_last_layer_attention(
+            model, hidden_states, position_ids, ptr_pos, visual_indices,
         )
 
-        for gen, adv in zip(generations, advantages):
-            if gen["pred_coord"] is None or abs(adv.item()) < 1e-8 or gen["num_rounds"] == 0:
-                continue
+        vis_ranges = find_image_visual_ranges(input_ids[0], img_tok)
+        # Only include ranges up to ptr_pos
+        vis_ranges = [(vs, ve) for vs, ve in vis_ranges if vs < ptr_pos]
 
-            diff_lp = torch.tensor(0.0, device=device)
-            num_rounds = gen["num_rounds"]
+        return selected, per_head, best_head, visual_indices, range_offsets, vis_ranges
 
-            # Round 0: reuse shared attention
-            if r0_attn is not None:
-                diff_lp = diff_lp + compute_round_log_prob(
-                    r0_attn["attn_weights"], gen["round_local_coords"][0],
-                    r0_attn["n_width"], r0_attn["n_height"], temp,
-                )
-
-            # Rounds 1+: single forward pass using last round's inputs.
-            # The causal mask guarantees each round's pointer_pad attention
-            # is identical to processing only up to that round's tokens,
-            # so we can extract all rounds from one forward pass.
-            if num_rounds > 1:
-                last_inputs = gen["round_inputs_list"][-1]
-                inp = {k: v.to(device) for k, v in last_inputs.items()}
-                input_ids = inp["input_ids"]
-                attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
-                cache = forward_for_attention(
-                    self.model, input_ids, inp.get("pixel_values"),
-                    inp.get("image_grid_thw"), attention_mask,
-                )
-                for ri in range(1, num_rounds):
-                    attn = extract_attention_for_round(
-                        self.model, input_ids, inp.get("image_grid_thw"),
-                        attention_mask, cache, ri,
-                    )
-                    if attn is None:
-                        continue
-                    diff_lp = diff_lp + compute_round_log_prob(
-                        attn["attn_weights"], gen["round_local_coords"][ri],
-                        attn["n_width"], attn["n_height"], temp,
-                    )
-
-            total_loss = total_loss + (-adv * diff_lp)
-            n_valid += 1
-
-        if n_valid > 0:
-            total_loss = total_loss / n_valid
-        return total_loss, n_valid
-
-    # ── SFT: supervised fine-tuning with GT attention ────────────────────
+    # ── SFT: teacher forcing through precision levels ─────────────────────
 
     def _sft_forward(self, sample):
-        """SFT forward: teacher-forcing with GT coordinates.
+        """SFT: teacher forcing with GT coordinates through precision levels.
 
-        Crops around GT each round, builds the full multi-round sequence,
-        then does a single forward pass and computes NLL loss for all rounds.
-        Returns (loss, num_rounds, per_round_predictions).
+        Builds rounds L0 → L1 → L2 with crops around GT. Single forward pass.
+        For each round's pointer_pad, attention goes over ALL visual tokens
+        (from all images in context), and loss targets the GT position in
+        the highest-level image at that round.
+
+        Returns (loss, num_rounds, round_preds).
         """
         device = _get_model_device(self.model)
         try:
@@ -431,84 +315,318 @@ class MultiRoundGRPOTrainer:
         gt_x = (bbox_gt[0] + bbox_gt[2]) / 2
         gt_y = (bbox_gt[1] + bbox_gt[3]) / 2
 
-        # Build all rounds upfront (teacher forcing: crop around GT)
+        # Build all rounds with teacher forcing
+        self.builder.reset()
+        level = self.sa.initial_level
         r0_inputs, cur_text, cur_images = self.builder.build_round0(
-            sample, sample["instruction"], precision_for_round(0),
+            sample, sample["instruction"], level=level,
         )
-        round_local_gts = [(gt_x, gt_y)]  # round 0: GT in full image coords
-        round_crop_bboxes = [None]
         last_inputs = r0_inputs
 
-        for ri in range(1, self.sa.max_rounds):
+        # Add crop rounds until we hit a stop level
+        num_sft_rounds = min(self.sa.max_rounds, len(PRECISION_LEVELS) - level)
+        for ri in range(1, num_sft_rounds):
+            next_level = level + ri
+            if next_level >= len(PRECISION_LEVELS):
+                break
             cropped, cbbox = crop_image(img, gt_x, gt_y, self.sa.crop_ratio)
             try:
                 ri_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                    cur_text, cur_images, cropped, cbbox, ri,
+                    cur_text, cur_images, cropped, cbbox, level=next_level,
                 )
             except Exception:
                 break
-            bx1, by1, bx2, by2 = cbbox
-            local_gt_x = (gt_x - bx1) / (bx2 - bx1)
-            local_gt_y = (gt_y - by1) / (by2 - by1)
-            round_local_gts.append((local_gt_x, local_gt_y))
-            round_crop_bboxes.append(cbbox)
             last_inputs = ri_inputs
+            # Stop building if we've reached a stop level
+            if next_level in STOP_LEVELS:
+                break
 
-        num_rounds = len(round_local_gts)
+        num_rounds = len(self.builder.image_infos)
 
-        # Single forward pass on the last round's inputs (causal mask
-        # ensures each round's attention is identical to incremental passes)
+        # Single forward pass on the full sequence
         self.model.train()
         inp = {k: v.to(device) for k, v in last_inputs.items()}
         input_ids = inp["input_ids"]
         attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
-        cache = forward_for_attention(
+        cache = forward_for_cache(
             self.model, input_ids, inp.get("pixel_values"),
             inp.get("image_grid_thw"), attention_mask,
         )
 
+        # Get spatial grid dims per image
+        merge = self.model.visual.spatial_merge_size
+        grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
+
         # Extract attention and compute NLL for each round
         total_loss = torch.tensor(0.0, device=device)
         n_valid = 0
-        round_preds = []  # (pred_x_orig, pred_y_orig) per round for metrics
+        round_preds = []
+
         for ri in range(num_rounds):
-            attn = extract_attention_for_round(
-                self.model, input_ids, inp.get("image_grid_thw"),
-                attention_mask, cache, round_idx=ri,
+            result = self._extract_attention_for_pointer(
+                self.model, cache["hidden_states"], cache["position_ids"],
+                input_ids, round_idx=ri,
             )
-            if attn is None:
+            if result is None:
                 round_preds.append(None)
                 continue
-            lp = compute_round_log_prob(
-                attn["attn_weights"], round_local_gts[ri],
-                attn["n_width"], attn["n_height"], temperature=1.0,
+
+            selected_attn, _, _, visual_indices, range_offsets, vis_ranges = result
+
+            # Target: GT position in the highest-level image at this round (image ri)
+            if ri < len(grid_dims):
+                nh, nw = grid_dims[ri]
+            else:
+                round_preds.append(None)
+                continue
+
+            target_local = _gt_token_in_image(
+                gt_x, gt_y, self.builder.image_infos[ri], nw, nh,
             )
-            total_loss = total_loss - lp  # NLL
+            if target_local is None:
+                round_preds.append(None)
+                continue
+
+            # Global index in the combined attention vector
+            img_offset = range_offsets[ri][0] if ri < len(range_offsets) else 0
+            target_global = img_offset + target_local
+
+            nll = _nll_at_target(selected_attn, target_global, temperature=1.0)
+            total_loss = total_loss + nll
             n_valid += 1
 
-            # Argmax prediction for metrics (no grad needed, detach)
+            # Argmax prediction for metrics
             with torch.no_grad():
-                p = attn["attn_weights"].squeeze(0).float()
-                idx = p.argmax().item()
-                nw, nh = attn["n_width"], attn["n_height"]
-                local_px = (idx % nw + 0.5) / nw
-                local_py = (idx // nw + 0.5) / nh
-                if round_crop_bboxes[ri] is not None:
-                    bx1, by1, bx2, by2 = round_crop_bboxes[ri]
-                    orig_px = bx1 + local_px * (bx2 - bx1)
-                    orig_py = by1 + local_py * (by2 - by1)
+                argmax_global = selected_attn.argmax().item()
+                # Find which image it's in
+                img_idx, local_idx = identify_attended_image(
+                    selected_attn, [(0, ro[1]) for ro in range_offsets],
+                )
+                if img_idx < len(grid_dims):
+                    nh_a, nw_a = grid_dims[img_idx]
+                    lx, ly = token_to_spatial(local_idx, nw_a, nh_a)
+                    info = self.builder.image_infos[img_idx]
+                    bx1, by1, bx2, by2 = info.global_bbox
+                    ox = bx1 + lx * (bx2 - bx1)
+                    oy = by1 + ly * (by2 - by1)
+                    round_preds.append((ox, oy))
                 else:
-                    orig_px, orig_py = local_px, local_py
-                round_preds.append((orig_px, orig_py))
+                    round_preds.append(None)
 
         if n_valid > 0:
             total_loss = total_loss / n_valid
         return total_loss, n_valid, round_preds
 
-    # ── train step / loop ─────────────────────────────────────────────────
+    # ── GRPO: sampling + policy gradient ──────────────────────────────────
+
+    def _sample_generations(self, sample, num_gen):
+        """Sample multi-round foveation trajectories for GRPO."""
+        device = _get_model_device(self.model)
+        try:
+            img = Image.open(sample["image_path"]).convert("RGB")
+            img_w, img_h = img.size
+        except Exception:
+            return []
+
+        self.model.eval()
+        generations = []
+
+        for _ in range(num_gen):
+            self.builder.reset()
+            state = self.fov_loop.new_state()
+            level = self.sa.initial_level
+
+            # Round 0: full image at initial level
+            r0_inputs, cur_text, cur_images = self.builder.build_round0(
+                sample, sample["instruction"], level=level,
+            )
+            last_inputs = r0_inputs
+
+            round_log_probs = []
+            round_coords = []  # global coords per round
+            round_levels = []  # which level was attended
+            round_inputs_list = [r0_inputs]
+
+            for ri in range(self.sa.max_rounds):
+                inp = {k: v.to(device) for k, v in last_inputs.items()}
+                input_ids = inp["input_ids"]
+                attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
+
+                with torch.no_grad():
+                    cache = forward_for_cache(
+                        self.model, input_ids, inp.get("pixel_values"),
+                        inp.get("image_grid_thw"), attention_mask,
+                    )
+                    result = self._extract_attention_for_pointer(
+                        self.model, cache["hidden_states"], cache["position_ids"],
+                        input_ids, round_idx=ri,
+                    )
+                if result is None:
+                    break
+
+                selected_attn, _, best_head, visual_indices, range_offsets, vis_ranges = result
+
+                # Sample from attention
+                n_total = selected_attn.numel()
+                if self.args.attn_temperature != 1.0:
+                    logits = torch.log(selected_attn.clamp(min=1e-10)) / self.args.attn_temperature
+                    probs = F.softmax(logits, dim=-1)
+                else:
+                    probs = selected_attn
+                probs = probs.float()
+                probs = probs / probs.sum().clamp(min=1e-8)
+                dist_cat = torch.distributions.Categorical(probs=probs)
+                sampled_idx = dist_cat.sample()
+                log_prob = dist_cat.log_prob(sampled_idx)
+                round_log_probs.append(log_prob)
+
+                # Identify which image the sampled token is in
+                img_idx, local_idx = identify_attended_image(
+                    selected_attn,
+                    [(0, ro[1]) for ro in range_offsets],
+                )
+                attended_level = self.builder.image_infos[img_idx].level if img_idx < len(self.builder.image_infos) else 0
+
+                merge = self.model.visual.spatial_merge_size
+                grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
+                if img_idx < len(grid_dims):
+                    nh, nw = grid_dims[img_idx]
+                else:
+                    nw = nh = int(math.sqrt(range_offsets[img_idx][1]))
+
+                lx, ly = token_to_spatial(local_idx, nw, nh)
+                info = self.builder.image_infos[img_idx]
+                bx1, by1, bx2, by2 = info.global_bbox
+                ox = bx1 + lx * (bx2 - bx1)
+                oy = by1 + ly * (by2 - by1)
+
+                round_coords.append((ox, oy))
+                round_levels.append(attended_level)
+
+                # Foveation decision
+                decision = self.fov_loop.decide(state, attended_level, ox, oy)
+
+                if decision["action"] == "stop":
+                    break
+
+                if decision["action"] == "crop":
+                    next_level = decision["level"]
+                    cropped, cbbox = crop_image(img, ox, oy, self.sa.crop_ratio)
+                    try:
+                        ri_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                            cur_text, cur_images, cropped, cbbox, level=next_level,
+                        )
+                    except Exception:
+                        break
+                    last_inputs = ri_inputs
+                    round_inputs_list.append(ri_inputs)
+
+                if not self.fov_loop.should_continue(state, ri + 1):
+                    break
+
+            if not round_coords:
+                continue
+
+            final_x, final_y = round_coords[-1]
+            reward = position_reward(final_x, final_y, sample["bbox_gt"], img_w, img_h)
+
+            generations.append({
+                "reward": reward,
+                "round_log_probs": round_log_probs,
+                "round_coords": round_coords,
+                "round_levels": round_levels,
+                "round_inputs_list": round_inputs_list,
+                "pred_coord": (final_x, final_y),
+                "num_rounds": len(round_coords),
+            })
+
+        return generations
+
+    def _compute_loss(self, generations):
+        """GRPO loss: advantage-weighted log probability."""
+        device = _get_model_device(self.model)
+        rewards = torch.tensor([g["reward"] for g in generations], device=device)
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        total_loss = torch.tensor(0.0, device=device)
+        n_valid = 0
+        self.model.train()
+
+        for gen, adv in zip(generations, advantages):
+            if gen["pred_coord"] is None or abs(adv.item()) < 1e-8:
+                continue
+
+            num_rounds = gen["num_rounds"]
+            # Use the last round's inputs (contains all rounds' tokens)
+            last_inputs = gen["round_inputs_list"][-1]
+            inp = {k: v.to(device) for k, v in last_inputs.items()}
+            input_ids = inp["input_ids"]
+            attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
+
+            cache = forward_for_cache(
+                self.model, input_ids, inp.get("pixel_values"),
+                inp.get("image_grid_thw"), attention_mask,
+            )
+
+            diff_lp = torch.tensor(0.0, device=device)
+            for ri in range(num_rounds):
+                result = self._extract_attention_for_pointer(
+                    self.model, cache["hidden_states"], cache["position_ids"],
+                    input_ids, round_idx=ri,
+                )
+                if result is None:
+                    continue
+
+                selected_attn, _, _, visual_indices, range_offsets, vis_ranges = result
+
+                # Recompute log probability for the sampled token
+                if self.args.attn_temperature != 1.0:
+                    logits = torch.log(selected_attn.clamp(min=1e-10)) / self.args.attn_temperature
+                    log_p = F.log_softmax(logits, dim=-1)
+                else:
+                    log_p = torch.log(selected_attn.clamp(min=1e-10))
+
+                # Find which token was sampled at this round
+                # (we need to re-identify it from the global coords)
+                ox, oy = gen["round_coords"][ri]
+                img_idx = min(ri, len(self.builder.image_infos) - 1)
+                merge = self.model.visual.spatial_merge_size
+                grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
+                if img_idx < len(grid_dims):
+                    nh, nw = grid_dims[img_idx]
+                else:
+                    continue
+                info = self.builder.image_infos[img_idx] if img_idx < len(self.builder.image_infos) else None
+                if info is None:
+                    continue
+                bx1, by1, bx2, by2 = info.global_bbox
+                bw, bh = bx2 - bx1, by2 - by1
+                if bw <= 0 or bh <= 0:
+                    continue
+                local_x = (ox - bx1) / bw
+                local_y = (oy - by1) / bh
+                px = max(0, min(round(local_x * nw - 0.5), nw - 1))
+                py = max(0, min(round(local_y * nh - 0.5), nh - 1))
+                local_idx = py * nw + px
+
+                if img_idx < len(range_offsets):
+                    global_idx = range_offsets[img_idx][0] + local_idx
+                else:
+                    continue
+
+                if global_idx < log_p.numel():
+                    diff_lp = diff_lp + log_p[global_idx]
+
+            total_loss = total_loss + (-adv * diff_lp)
+            n_valid += 1
+
+        if n_valid > 0:
+            total_loss = total_loss / n_valid
+        return total_loss, n_valid
+
+    # ── train step dispatching ────────────────────────────────────────────
 
     def _grpo_train_step(self, sample):
-        """GRPO: sample generations → compute advantage-weighted loss."""
         device = _get_model_device(self.model)
         gens = self._sample_generations(sample, self.args.num_generations)
         if not gens:
@@ -520,58 +638,29 @@ class MultiRoundGRPOTrainer:
             else:
                 (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
 
-        # GRPO metrics
+        # Metrics
         rs = [g["reward"] for g in gens]
         self.metrics["reward"].append(sum(rs) / len(rs))
-        self.metrics["reward_max"].append(max(rs))
-        self.metrics["reward_min"].append(min(rs))
         self.metrics["reward_std"].append(
             (sum((r - sum(rs)/len(rs))**2 for r in rs) / len(rs)) ** 0.5)
         self.metrics["avg_rounds"].append(
             sum(g["num_rounds"] for g in gens) / len(gens))
-        self.metrics["max_rounds"].append(
-            max(g["num_rounds"] for g in gens))
         coords = [g["pred_coord"] for g in gens if g["pred_coord"]]
         gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
         gcy = (sample["bbox_gt"][1] + sample["bbox_gt"][3]) / 2
         if coords:
             dists = [math.sqrt((c[0]-gcx)**2+(c[1]-gcy)**2) for c in coords]
             self.metrics["avg_dist"].append(sum(dists) / len(dists))
-            self.metrics["min_dist"].append(min(dists))
-            hits = [1 for c in coords
-                    if sample["bbox_gt"][0]<=c[0]<=sample["bbox_gt"][2]
-                    and sample["bbox_gt"][1]<=c[1]<=sample["bbox_gt"][3]]
-            self.metrics["hit_rate"].append(len(hits) / len(coords))
-            converged = [g for g in gens if g["num_rounds"] < self.sa.max_rounds]
-            self.metrics["convergence_rate"].append(len(converged) / len(gens))
-            self.metrics["advantage_spread"].append(max(rs) - min(rs))
-            for g in gens:
-                for ri, (rx, ry) in enumerate(g["round_coords"]):
-                    key = f"round_{ri}_hit"
-                    if key not in self.metrics:
-                        self.metrics[key] = []
-                    self.metrics[key].append(
-                        1 if (sample["bbox_gt"][0]<=rx<=sample["bbox_gt"][2]
-                              and sample["bbox_gt"][1]<=ry<=sample["bbox_gt"][3]) else 0)
-        for g in gens:
-            rc = g["round_coords"]
-            if len(rc) > 0:
-                for ri, (rx, ry) in enumerate(rc):
-                    d = math.sqrt((rx - gcx)**2 + (ry - gcy)**2)
-                    key = f"round_{ri}_dist"
-                    if key not in self.metrics:
-                        self.metrics[key] = []
-                    self.metrics[key].append(d)
-                if self.global_step % 50 == 0:
-                    round_dists = [math.sqrt((rx-gcx)**2+(ry-gcy)**2) for rx, ry in rc]
-                    prog = " -> ".join(f"R{i}:{d:.4f}" for i, d in enumerate(round_dists))
-                    hit_str = "HIT" if (sample["bbox_gt"][0]<=rc[-1][0]<=sample["bbox_gt"][2]
-                                        and sample["bbox_gt"][1]<=rc[-1][1]<=sample["bbox_gt"][3]) else "MISS"
-                    print(f"  [Round Progress] step={self.global_step} {prog} {hit_str}")
+            hits = sum(1 for c in coords
+                       if sample["bbox_gt"][0]<=c[0]<=sample["bbox_gt"][2]
+                       and sample["bbox_gt"][1]<=c[1]<=sample["bbox_gt"][3])
+            self.metrics["hit_rate"].append(hits / len(coords))
+        levels = [l for g in gens for l in g.get("round_levels", [])]
+        if levels:
+            self.metrics["avg_level"].append(sum(levels) / len(levels))
         return loss.item() if nv > 0 else 0.0, nv
 
     def _sft_train_step(self, sample):
-        """SFT: teacher-forcing with GT coordinates."""
         loss, nv, round_preds = self._sft_forward(sample)
         if nv > 0 and loss.requires_grad:
             if self.use_deepspeed:
@@ -579,32 +668,17 @@ class MultiRoundGRPOTrainer:
             else:
                 (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
 
-        # SFT metrics
         gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
         gcy = (sample["bbox_gt"][1] + sample["bbox_gt"][3]) / 2
         self.metrics["avg_rounds"].append(len(round_preds))
         valid_preds = [p for p in round_preds if p is not None]
         if valid_preds:
             final_px, final_py = valid_preds[-1]
-            dist = math.sqrt((final_px - gcx)**2 + (final_py - gcy)**2)
-            self.metrics["avg_dist"].append(dist)
+            d = math.sqrt((final_px - gcx)**2 + (final_py - gcy)**2)
+            self.metrics["avg_dist"].append(d)
             hit = (sample["bbox_gt"][0] <= final_px <= sample["bbox_gt"][2]
                    and sample["bbox_gt"][1] <= final_py <= sample["bbox_gt"][3])
             self.metrics["hit_rate"].append(1 if hit else 0)
-            for ri, pred in enumerate(round_preds):
-                if pred is None:
-                    continue
-                d = math.sqrt((pred[0] - gcx)**2 + (pred[1] - gcy)**2)
-                key_d = f"round_{ri}_dist"
-                key_h = f"round_{ri}_hit"
-                if key_d not in self.metrics:
-                    self.metrics[key_d] = []
-                if key_h not in self.metrics:
-                    self.metrics[key_h] = []
-                self.metrics[key_d].append(d)
-                self.metrics[key_h].append(
-                    1 if (sample["bbox_gt"][0] <= pred[0] <= sample["bbox_gt"][2]
-                          and sample["bbox_gt"][1] <= pred[1] <= sample["bbox_gt"][3]) else 0)
         return loss.item() if nv > 0 else 0.0, nv
 
     def train_step(self, batch):
@@ -624,6 +698,8 @@ class MultiRoundGRPOTrainer:
                 import traceback; traceback.print_exc()
         return acc_loss, acc_n
 
+    # ── main train loop ──────────────────────────────────────────────────
+
     def train(self):
         bs = self.args.per_device_train_batch_size
         ga = max(self.args.gradient_accumulation_steps, 1)
@@ -633,15 +709,12 @@ class MultiRoundGRPOTrainer:
         is_sft = self.args.training_mode == "sft"
         if self.rank == 0:
             mode_str = "SFT (teacher forcing)" if is_sft else "GRPO"
-            print(f"=== Multi-Round Progressive {mode_str} ===")
+            print(f"=== Multi-Precision Foveated {mode_str} ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
-            if not is_sft:
-                print(f"  generations={self.args.num_generations}  max_rounds={self.sa.max_rounds}")
-            else:
-                print(f"  max_rounds={self.sa.max_rounds}")
-            print(f"  crop_ratio={self.sa.crop_ratio}")
-            print(f"  attn_temp={self.args.attn_temperature}  lr={self.args.learning_rate}")
-            print(f"  deepspeed={self.use_deepspeed}  world_size={self.world_size}  max_steps={max_steps}")
+            print(f"  max_rounds={self.sa.max_rounds}  initial_level={self.sa.initial_level}")
+            print(f"  levels={PRECISION_LEVELS}  stop_at={STOP_LEVELS}")
+            print(f"  crop_ratio={self.sa.crop_ratio}  lr={self.args.learning_rate}")
+            print(f"  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
 
         if not self.use_deepspeed:
             self.optimizer.zero_grad()
@@ -649,7 +722,6 @@ class MultiRoundGRPOTrainer:
 
         for epoch in range(epochs):
             random.shuffle(self.train_data)
-            # Shard data across ranks for distributed training
             if self.world_size > 1:
                 shard = self.train_data[self.rank::self.world_size]
             else:
@@ -660,7 +732,6 @@ class MultiRoundGRPOTrainer:
                 loss_val, nv = self.train_step(shard[i:i+bs])
                 micro += 1
                 if self.use_deepspeed:
-                    # DeepSpeed handles gradient accumulation internally
                     self.model_engine.step()
                     self.global_step += 1
                 elif micro % ga == 0:
@@ -671,40 +742,23 @@ class MultiRoundGRPOTrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
 
-                # Logging, saving, and stopping (shared by both DeepSpeed and non-DeepSpeed)
+                # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     should_log = self.use_deepspeed or (micro % ga == 0)
                     if should_log:
-                        ar = lambda k: sum(self.metrics[k][-20:]) / max(len(self.metrics[k][-20:]),1)
+                        ar = lambda k: sum(self.metrics[k][-20:]) / max(len(self.metrics[k][-20:]), 1)
                         lr_val = (self.model_engine.get_lr()[0] if self.use_deepspeed
                                   else self.scheduler.get_last_lr()[0])
                         if is_sft:
                             print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
                                   f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
-                                  f"rounds={ar('avg_rounds'):.1f} "
-                                  f"lr={lr_val:.2e}")
+                                  f"rounds={ar('avg_rounds'):.1f} lr={lr_val:.2e}")
                         else:
                             print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
                                   f"reward={ar('reward'):.3f} (+-{ar('reward_std'):.3f}) "
                                   f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
-                                  f"rounds={ar('avg_rounds'):.1f}/{ar('max_rounds'):.0f} "
-                                  f"conv={ar('convergence_rate'):.0%} "
-                                  f"lr={lr_val:.2e}")
-                        # Per-round distance + hit summary
-                        rd_parts = []
-                        for ri in range(self.sa.max_rounds):
-                            key_d = f"round_{ri}_dist"
-                            key_h = f"round_{ri}_hit"
-                            if key_d in self.metrics and self.metrics[key_d]:
-                                d_str = f"d={ar(key_d):.4f}"
-                                h_str = f"h={ar(key_h):.0%}" if key_h in self.metrics and self.metrics[key_h] else ""
-                                rd_parts.append(f"R{ri}({d_str},{h_str})")
-                        if rd_parts:
-                            print(f"           rounds: {' -> '.join(rd_parts)}")
-                        if not is_sft:
-                            print(f"           spread={ar('advantage_spread'):.3f} "
-                                  f"min_dist={ar('min_dist'):.4f}")
-                        # Trim metrics to prevent unbounded memory growth
+                                  f"rounds={ar('avg_rounds'):.1f} "
+                                  f"level={ar('avg_level'):.1f} lr={lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 200:
                                 self.metrics[key] = self.metrics[key][-200:]
@@ -771,18 +825,14 @@ def main():
     model.config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
     model.config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
     model.config.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]
-    for attr in ('query_topk', 'kl_query_weighting', 'part_query_weighting', 'layer_wise_query_weighting'):
-        if not hasattr(model.config, attr):
-            setattr(model.config, attr, 1 if attr == 'query_topk' else False)
 
-    # For DeepSpeed, don't move to device — deepspeed.initialize() handles it
     if not (HAS_DEEPSPEED and ta.deepspeed):
         model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples)
     os.makedirs(ta.output_dir, exist_ok=True)
 
-    trainer = MultiRoundGRPOTrainer(model, processor, tokenizer, train_data, ta, sa)
+    trainer = MultiRoundTrainer(model, processor, tokenizer, train_data, ta, sa)
     trainer.train()
 
 

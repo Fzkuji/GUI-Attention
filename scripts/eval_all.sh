@@ -3,7 +3,7 @@
 # Full Evaluation Pipeline
 # ============================================================================
 # Runs all evaluation configurations for a given model.
-# Covers: standard baselines + aligned multi-round + ablations.
+# Covers: standard baselines + multi-precision foveation + ablations.
 #
 # Usage:
 #   bash scripts/eval_all.sh /path/to/model
@@ -42,7 +42,7 @@ echo ""
 
 # ── 1. Standard baselines (GUI-AIMA inference pipeline) ─────────────────────
 
-echo ">>> [1/6] Standard single-round, HIGH res"
+echo ">>> [1/7] Standard single-round, HIGH res"
 python eval/eval_screenspot_pro.py \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA_PATH}" \
@@ -51,7 +51,7 @@ python eval/eval_screenspot_pro.py \
     ${SAMPLE_FLAG} 2>&1 | tail -5
 echo ""
 
-echo ">>> [2/6] Standard single-round, LOW res"
+echo ">>> [2/7] Standard single-round, LOW res"
 python eval/eval_screenspot_pro.py \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA_PATH}" \
@@ -60,41 +60,50 @@ python eval/eval_screenspot_pro.py \
     ${SAMPLE_FLAG} 2>&1 | tail -5
 echo ""
 
-echo ">>> [3/6] Standard 2-round crop_resize, HIGH res"
-python eval/eval_screenspot_pro.py \
-    --model_name_or_path "${MODEL}" \
-    --data_path "${DATA_PATH}" \
-    --save_path "${SAVE_BASE}/${MODEL_NAME}/r2_crop_resize_high" \
-    --rounds 2 --multi_strategy crop_resize --resolution high \
-    ${SAMPLE_FLAG} 2>&1 | tail -5
-echo ""
+# ── 2. Multi-precision foveation (our method) ──────────────────────────────
 
-# ── 2. Aligned multi-round (our method) ────────────────────────────────────
-
-echo ">>> [4/6] Aligned 5-round, region prediction (our method)"
+echo ">>> [3/7] Foveation 5-round, L0 start (our method)"
 python eval/eval_screenspot_pro_aligned.py \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA_PATH}" \
-    --save_path "${SAVE_BASE}/${MODEL_NAME}/aligned_r5_crop0.3_region" \
-    --mode aligned --rounds 5 --crop_ratio 0.3 --prediction_method region \
+    --save_path "${SAVE_BASE}/${MODEL_NAME}/fov_r5_L0_crop0.3" \
+    --rounds 5 --initial_level 0 --crop_ratio 0.3 \
     ${SAMPLE_FLAG} 2>&1 | tail -5
 echo ""
 
-echo ">>> [5/6] Aligned 3-round, region prediction"
+echo ">>> [4/7] Foveation 3-round, L0 start"
 python eval/eval_screenspot_pro_aligned.py \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA_PATH}" \
-    --save_path "${SAVE_BASE}/${MODEL_NAME}/aligned_r3_crop0.3_region" \
-    --mode aligned --rounds 3 --crop_ratio 0.3 --prediction_method region \
+    --save_path "${SAVE_BASE}/${MODEL_NAME}/fov_r3_L0_crop0.3" \
+    --rounds 3 --initial_level 0 --crop_ratio 0.3 \
     ${SAMPLE_FLAG} 2>&1 | tail -5
 echo ""
 
-echo ">>> [6/6] Aligned 5-round, argmax prediction (ablation)"
+echo ">>> [5/7] Foveation 1-round, L1 (single-round original res)"
 python eval/eval_screenspot_pro_aligned.py \
     --model_name_or_path "${MODEL}" \
     --data_path "${DATA_PATH}" \
-    --save_path "${SAVE_BASE}/${MODEL_NAME}/aligned_r5_crop0.3_argmax" \
-    --mode aligned --rounds 5 --crop_ratio 0.3 --prediction_method argmax \
+    --save_path "${SAVE_BASE}/${MODEL_NAME}/fov_r1_L1" \
+    --rounds 1 --initial_level 1 \
+    ${SAMPLE_FLAG} 2>&1 | tail -5
+echo ""
+
+echo ">>> [6/7] Foveation 1-round, L2 (single-round high res)"
+python eval/eval_screenspot_pro_aligned.py \
+    --model_name_or_path "${MODEL}" \
+    --data_path "${DATA_PATH}" \
+    --save_path "${SAVE_BASE}/${MODEL_NAME}/fov_r1_L2" \
+    --rounds 1 --initial_level 2 \
+    ${SAMPLE_FLAG} 2>&1 | tail -5
+echo ""
+
+echo ">>> [7/7] Foveation 5-round, L1 start (ablation)"
+python eval/eval_screenspot_pro_aligned.py \
+    --model_name_or_path "${MODEL}" \
+    --data_path "${DATA_PATH}" \
+    --save_path "${SAVE_BASE}/${MODEL_NAME}/fov_r5_L1_crop0.3" \
+    --rounds 5 --initial_level 1 --crop_ratio 0.3 \
     ${SAMPLE_FLAG} 2>&1 | tail -5
 echo ""
 

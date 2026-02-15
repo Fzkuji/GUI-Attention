@@ -1,10 +1,14 @@
-"""MultiRoundInputBuilder: incrementally builds multi-round conversation tokens.
+"""MultiRoundInputBuilder: builds multi-round multi-precision conversation tokens.
 
-Each round's image is pre-processed at its own resolution so the processor
+Each round's image is pre-processed at its own resolution level so the processor
 never re-sizes an image intended for a different precision level.
+
+Tracks which precision level and spatial bbox each image belongs to, so that
+after attention extraction we can identify which image an attended token is from.
 """
 
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -13,13 +17,20 @@ from qwen_vl_utils import process_vision_info, smart_resize
 
 from gui_aima.constants import chat_template, grounding_system_message
 
-from gui_attention.constants import PLACEHOLDER_SUFFIX, precision_for_round
+from gui_attention.constants import PLACEHOLDER_SUFFIX, precision_for_level
+
+
+@dataclass
+class ImageInfo:
+    """Metadata for one image in the multi-round context."""
+    level: int                          # precision level (0-3)
+    global_bbox: Tuple[float, ...]      # (x1, y1, x2, y2) in original image coords, normalised
+    # Filled in after tokenisation:
+    visual_range: Optional[Tuple[int, int]] = None  # (start, end) in input_ids
 
 
 def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136) -> Image.Image:
-    """Pre-resize an image to the exact dimensions the Qwen2.5-VL processor
-    would use, so a subsequent processor call with large max_pixels won't
-    resize it further."""
+    """Pre-resize to the exact dims the Qwen2.5-VL processor would use."""
     w, h = image.size
     new_h, new_w = smart_resize(h, w, max_pixels=max_pixels, min_pixels=min_pixels)
     if (new_w, new_h) != (w, h):
@@ -28,23 +39,18 @@ def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136) 
 
 
 class MultiRoundInputBuilder:
-    """Incrementally builds the multi-round conversation and tokenises it.
+    """Incrementally builds multi-round conversation tokens with precision tracking."""
 
-    Round 0 (full image):
-        system + user[image, instruction] + placeholder
+    # Large enough that the processor won't further resize pre-resized images.
+    _PASSTHROUGH_MAX = 20_000_000
 
-    Round k (crop):
-        ... previous ... + crop_image [Zoomed ...] + placeholder
-    """
-
-    def __init__(self, model_path: str, tokenizer, min_pixels: int):
+    def __init__(self, model_path: str, tokenizer, min_pixels: int = 3136):
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.min_pixels = min_pixels
         self._processor_cache: Dict[int, AutoProcessor] = {}
-        # Pre-resized images (one per round) – kept so they can be passed
-        # together to a single processor call without further resizing.
         self._resized_images: List[Image.Image] = []
+        self.image_infos: List[ImageInfo] = []
 
     def _get_processor(self, max_pixels: int):
         if max_pixels not in self._processor_cache:
@@ -55,13 +61,22 @@ class MultiRoundInputBuilder:
             self._processor_cache[max_pixels] = p
         return self._processor_cache[max_pixels]
 
-    # Large enough that the processor won't resize our pre-resized images.
-    _PASSTHROUGH_MAX = 20_000_000
+    def reset(self):
+        """Clear state for a new sample."""
+        self._resized_images = []
+        self.image_infos = []
 
-    def build_round0(self, image_or_path, instruction: str, max_pixels: int):
-        """Build round-0 inputs (full image)."""
+    # ----- round 0 --------------------------------------------------------
+
+    def build_round0(self, image_or_path, instruction: str, level: int = 0):
+        """Build round-0 inputs (full image at given precision level).
+
+        Returns (inputs_dict, raw_text, images_list).
+        """
         if isinstance(image_or_path, dict):
             image_or_path = image_or_path["image_path"]
+
+        max_px = precision_for_level(level)
         conv = [
             {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
             {"role": "user", "content": [
@@ -69,36 +84,42 @@ class MultiRoundInputBuilder:
                 {"type": "text", "text": instruction},
             ]},
         ]
-        text = self._get_processor(max_pixels).apply_chat_template(
+        text = self._get_processor(max_px).apply_chat_template(
             conv, tokenize=False, add_generation_prompt=False, chat_template=chat_template,
         )
         text += PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)
 
-        # Pre-resize the round-0 image so its token count is locked in.
-        resized_r0 = _presize_image(images[0], max_pixels, self.min_pixels)
+        resized_r0 = _presize_image(images[0], max_px, self.min_pixels)
         self._resized_images = [resized_r0]
+        self.image_infos = [ImageInfo(level=level, global_bbox=(0.0, 0.0, 1.0, 1.0))]
 
-        inputs = self._get_processor(max_pixels)(
+        inputs = self._get_processor(max_px)(
             text=[text], images=[resized_r0], return_tensors="pt", padding=True,
         )
-        return inputs, text, images  # return original images list for extend
+        # Fill visual_range for round 0
+        self._update_visual_ranges(inputs["input_ids"][0])
+        return inputs, text, images
+
+    # ----- subsequent rounds ----------------------------------------------
 
     def extend_with_crop(self, prev_text: str, prev_images: list,
                          crop_pil: Image.Image, crop_bbox: tuple,
-                         round_idx: int):
-        """Append a crop round to the existing conversation.
+                         level: int):
+        """Append a crop at the specified precision level.
 
-        The crop is pre-resized at this round's resolution, then ALL images
-        (each already at its own target resolution) are passed to a single
-        processor with a very large max_pixels so no further resizing occurs.
+        Args:
+            crop_bbox: (x1, y1, x2, y2) normalised in original image coords.
+            level: precision level for this crop (0-3).
+
+        Returns (inputs_dict, raw_text, images_list).
         """
-        max_px = precision_for_round(round_idx)
-        # Use <|vision_start|><|image_pad|><|vision_end|> instead of raw <image>
-        # so the processor correctly expands the placeholder to match features.
+        max_px = precision_for_level(level)
+        round_num = len(self.image_infos)
+
         zoom_text = (
             f"\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-            f"[Zoomed region round {round_idx + 1} around "
+            f"[Zoomed region round {round_num + 1} around "
             f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
             f"<|im_end|>\n"
             + PLACEHOLDER_SUFFIX
@@ -106,15 +127,33 @@ class MultiRoundInputBuilder:
         new_text = prev_text + zoom_text
         new_images = prev_images + [crop_pil]
 
-        # Pre-resize the crop at this round's resolution
         resized_crop = _presize_image(crop_pil, max_px, self.min_pixels)
         self._resized_images.append(resized_crop)
+        self.image_infos.append(ImageInfo(level=level, global_bbox=crop_bbox))
 
-        # Process with a large max_pixels so the processor doesn't resize
-        # any of our pre-resized images.
         proc = self._get_processor(self._PASSTHROUGH_MAX)
         inputs = proc(
             text=[new_text], images=self._resized_images,
             return_tensors="pt", padding=True,
         )
+        self._update_visual_ranges(inputs["input_ids"][0])
         return inputs, new_text, new_images
+
+    # ----- helpers --------------------------------------------------------
+
+    def _update_visual_ranges(self, input_ids_1d: torch.Tensor):
+        """Scan input_ids to find contiguous image-token blocks and update image_infos."""
+        from gui_attention.attention import find_image_visual_ranges
+        img_tok = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        ranges = find_image_visual_ranges(input_ids_1d, img_tok)
+        for i, info in enumerate(self.image_infos):
+            if i < len(ranges):
+                info.visual_range = ranges[i]
+
+    def get_image_grid_dims(self, image_grid_thw: torch.Tensor, merge_size: int):
+        """Return list of (n_height, n_width) for each image after spatial merging."""
+        dims = []
+        for i in range(image_grid_thw.shape[0]):
+            _, nh, nw = (image_grid_thw[i] // merge_size).tolist()
+            dims.append((int(nh), int(nw)))
+        return dims
