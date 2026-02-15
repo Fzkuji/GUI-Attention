@@ -138,7 +138,8 @@ def extract_last_layer_attention(
         k = k.repeat_interleave(num_kv_groups, dim=1)   # (1, H, n_vis, d)
 
     # Scaled dot-product attention
-    scores = torch.matmul(q, k.transpose(-2, -1)) * attn.scaling  # (1, H, 1, n_vis)
+    scaling = getattr(attn, 'scaling', head_dim ** -0.5)
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scaling  # (1, H, 1, n_vis)
     attn_weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
 
     per_head = attn_weights[0, :, 0, :]   # (H, n_vis)
@@ -184,7 +185,7 @@ def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
         return None
 
     # Position IDs
-    position_ids, _ = model.get_rope_index(
+    position_ids, _ = model.model.get_rope_index(
         input_ids=input_ids, image_grid_thw=image_grid_thw,
         video_grid_thw=None, attention_mask=attention_mask,
     )
@@ -221,7 +222,7 @@ def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
 
 def forward_for_cache(model, input_ids, pixel_values, image_grid_thw, attention_mask):
     """Run model forward and cache outputs for multi-round extraction."""
-    position_ids, _ = model.get_rope_index(
+    position_ids, _ = model.model.get_rope_index(
         input_ids=input_ids, image_grid_thw=image_grid_thw,
         video_grid_thw=None, attention_mask=attention_mask,
     )
