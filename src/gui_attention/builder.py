@@ -30,10 +30,10 @@ class ImageInfo:
     visual_range: Optional[Tuple[int, int]] = None  # (start, end) in input_ids
 
 
-def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136) -> Image.Image:
+def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136, factor: int = 28) -> Image.Image:
     """Pre-resize to the exact dims the Qwen2.5-VL processor would use."""
     w, h = image.size
-    new_h, new_w = smart_resize(h, w, max_pixels=max_pixels, min_pixels=min_pixels)
+    new_h, new_w = smart_resize(h, w, factor=factor, max_pixels=max_pixels, min_pixels=min_pixels)
     if (new_w, new_h) != (w, h):
         return image.resize((new_w, new_h), Image.LANCZOS)
     return image
