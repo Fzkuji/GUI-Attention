@@ -170,7 +170,7 @@ def run_single_round_standard(image, instruction, model, tokenizer, processor,
 
 def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
                             builder, max_rounds=5, crop_ratio=0.3, device="cuda:0",
-                            prediction_method="region"):
+                            prediction_method="region", r0_precision=None):
     """
     Multi-round inference using attention-based prediction, aligned with training.
 
@@ -181,9 +181,10 @@ def run_multi_round_aligned(image, image_path, instruction, model, tokenizer,
     - Same precision levels
     """
     predict_fn = region_from_attention if prediction_method == "region" else argmax_from_attention
-    # Round 0: full image, low resolution
+    # Round 0: full image
+    r0_max_pixels = r0_precision if r0_precision is not None else precision_for_round(0)
     r0_inputs, r0_text, r0_images = builder.build_round0(
-        image_path, instruction, precision_for_round(0)
+        image_path, instruction, r0_max_pixels
     )
     r0_dev = {k: v.to(device) for k, v in r0_inputs.items()}
 
@@ -325,6 +326,7 @@ def evaluate_all(model, tokenizer, processor, data, image_dir, args, builder):
                 max_rounds=args.rounds, crop_ratio=args.crop_ratio,
                 device=str(device),
                 prediction_method=args.prediction_method,
+                r0_precision=getattr(args, 'r0_precision', None),
             )
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
@@ -396,6 +398,8 @@ def main():
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--r0_precision", type=int, default=None,
+                        help="Override round-0 max_pixels (e.g. 5760000 for high-res first round)")
 
     args = parser.parse_args()
 
