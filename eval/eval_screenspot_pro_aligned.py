@@ -27,17 +27,21 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_aima.utils import do_boxes_overlap
-from gui_aima.constants import (
+from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+
+from gui_attention.constants import (
+    precision_for_level,
     ADDITIONAL_SPECIAL_TOKENS,
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
 )
-from transformers import AutoProcessor, AutoTokenizer
 
-from gui_attention.constants import precision_for_level
+
+def do_boxes_overlap(box1, box2):
+    """Check if two bounding boxes overlap."""
+    return not (box1[2] < box2[0] or box1[0] > box2[2] or
+                box1[3] < box2[1] or box1[1] > box2[3])
 from gui_attention.crop import crop_image
 from gui_attention.attention import (
     find_image_visual_ranges,
@@ -411,7 +415,7 @@ def main():
     if num_new > 0:
         print(f"Added {num_new} special tokens to tokenizer")
 
-    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
         device_map=args.device,

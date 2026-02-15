@@ -15,9 +15,10 @@ from PIL import Image
 from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info, smart_resize
 
-from gui_aima.constants import chat_template, grounding_system_message
-
-from gui_attention.constants import PLACEHOLDER_SUFFIX, precision_for_level
+from gui_attention.constants import (
+    PLACEHOLDER_SUFFIX, precision_for_level,
+    CHAT_TEMPLATE, GROUNDING_SYSTEM_MESSAGE,
+)
 
 
 @dataclass
@@ -78,14 +79,14 @@ class MultiRoundInputBuilder:
 
         max_px = precision_for_level(level)
         conv = [
-            {"role": "system", "content": [{"type": "text", "text": grounding_system_message}]},
+            {"role": "system", "content": [{"type": "text", "text": GROUNDING_SYSTEM_MESSAGE}]},
             {"role": "user", "content": [
                 {"type": "image", "image": image_or_path},
                 {"type": "text", "text": instruction},
             ]},
         ]
         text = self._get_processor(max_px).apply_chat_template(
-            conv, tokenize=False, add_generation_prompt=False, chat_template=chat_template,
+            conv, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE,
         )
         text += PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)

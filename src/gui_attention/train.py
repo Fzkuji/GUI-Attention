@@ -47,16 +47,14 @@ except ImportError:
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_aima.constants import (
+from transformers import Qwen2_5_VLForConditionalGeneration
+
+from gui_attention.constants import (
+    PRECISION_LEVELS, STOP_LEVELS, precision_for_level,
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
     ADDITIONAL_SPECIAL_TOKENS,
-)
-
-from gui_attention.constants import (
-    PRECISION_LEVELS, STOP_LEVELS, precision_for_level,
 )
 from gui_attention.crop import crop_image
 from gui_attention.attention import (
@@ -796,7 +794,7 @@ def main():
     sa, ta = parser.parse_args_into_dataclasses()
 
     print(f"Loading model: {sa.model_name_or_path}")
-    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         sa.model_name_or_path,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
