@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================================================================
-# Multi-Precision Foveation Evaluation
+# Multi-Precision Foveation Evaluation (v3)
 # ============================================================================
-# Uses last-layer Q*K attention with FoveationLoop for progressive zoom.
+# Uses gui_aima multi-layer attention with FoveationLoop for progressive zoom.
 #
 # Usage:
 #   bash scripts/eval_aligned.sh                           # default: 5 rounds, L0 start
@@ -25,6 +25,7 @@ SAVE_BASE="${BASE_DIR}/results/screenspot_pro"
 ROUNDS="${ROUNDS:-5}"
 CROP_RATIO="${CROP_RATIO:-0.3}"
 LEVEL="${LEVEL:-0}"               # initial precision level (0-3)
+QUERY_WEIGHTING="${QUERY_WEIGHTING:-query_1}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"     # empty = all samples
 
 # ── Run ─────────────────────────────────────────────────────────────────────
@@ -49,7 +50,8 @@ CMD="python eval/eval_screenspot_pro_aligned.py \
     --save_path ${SAVE_PATH} \
     --rounds ${ROUNDS} \
     --initial_level ${LEVEL} \
-    --crop_ratio ${CROP_RATIO}"
+    --crop_ratio ${CROP_RATIO} \
+    --query_weighting ${QUERY_WEIGHTING}"
 
 if [ -n "${MAX_SAMPLES}" ]; then
     CMD="${CMD} --max_samples ${MAX_SAMPLES}"

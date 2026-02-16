@@ -1,8 +1,8 @@
 """
-ScreenSpot-Pro evaluation using multi-precision foveation (v2).
+ScreenSpot-Pro evaluation using multi-precision foveation (v3).
 
-Uses simplified last-layer Q*K attention extraction with max-peak head
-selection and FoveationLoop for progressive zoom.
+Uses gui_aima's multi-layer multi-head attention aggregation with
+visual-sink head weighting and FoveationLoop for progressive zoom.
 
 Usage:
   # Multi-round foveation eval
@@ -27,27 +27,21 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+from gui_aima.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
+from gui_aima.constants import ADDITIONAL_SPECIAL_TOKENS
+from transformers import AutoProcessor, AutoTokenizer
 
 from gui_attention.constants import (
     precision_for_level,
-    ADDITIONAL_SPECIAL_TOKENS,
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
 )
-
-
-def do_boxes_overlap(box1, box2):
-    """Check if two bounding boxes overlap."""
-    return not (box1[2] < box2[0] or box1[0] > box2[2] or
-                box1[3] < box2[1] or box1[1] > box2[3])
 from gui_attention.crop import crop_image
 from gui_attention.attention import (
     find_image_visual_ranges,
     find_nth_pointer_pad,
-    extract_last_layer_attention,
-    forward_for_cache,
+    extract_attention,
     identify_attended_image,
     token_to_spatial,
 )
@@ -58,6 +52,12 @@ from gui_attention.foveation import FoveationLoop
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def do_boxes_overlap(box1, box2):
+    """Check if two bounding boxes overlap."""
+    return not (box1[2] < box2[0] or box1[0] > box2[2] or
+                box1[3] < box2[1] or box1[1] > box2[3])
+
 
 def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
     x1, y1, x2, y2 = bbox_x1y1x2y2
@@ -81,6 +81,21 @@ def _get_all_visual_indices(input_ids, image_token_id, up_to_pos=None):
     if not indices:
         return None, []
     return torch.cat(indices), range_offsets
+
+
+def _get_query_indices(input_ids, image_token_id, pointer_pad_id, up_to_pos):
+    """Get indices of text tokens before up_to_pos."""
+    vis_set = set()
+    ranges = find_image_visual_ranges(input_ids, image_token_id)
+    for vs, ve in ranges:
+        for i in range(vs, ve):
+            vis_set.add(i)
+    pp_set = set(pointer_pad_id) if isinstance(pointer_pad_id, list) else {pointer_pad_id}
+    query_indices = []
+    for i in range(up_to_pos):
+        if i not in vis_set and input_ids[i].item() not in pp_set:
+            query_indices.append(i)
+    return query_indices
 
 
 # ---------------------------------------------------------------------------
@@ -163,20 +178,14 @@ def get_metric(list_of_examples,
 
 
 # ---------------------------------------------------------------------------
-# Multi-round foveation inference (v2)
+# Multi-round foveation inference (v3)
 # ---------------------------------------------------------------------------
 
 def run_multi_round_foveation(image, image_path, instruction, model, tokenizer,
                                builder, max_rounds=5, crop_ratio=0.3,
                                device="cuda:0", initial_level=0):
     """
-    Multi-round inference using multi-precision foveation.
-
-    Uses FoveationLoop for progressive zoom decisions:
-    - Attention from pointer_pad to ALL visual tokens across all images
-    - Identify which image (precision level) is attended
-    - Level 2+ attended → stop (final prediction)
-    - Otherwise crop and add higher-precision image
+    Multi-round inference using multi-precision foveation with gui_aima attention.
     """
     fov_loop = FoveationLoop(max_rounds=max_rounds, crop_ratio=crop_ratio)
     state = fov_loop.new_state()
@@ -184,7 +193,6 @@ def run_multi_round_foveation(image, image_path, instruction, model, tokenizer,
     builder.reset()
     level = initial_level
 
-    # Round 0: full image at initial level
     r0_inputs, cur_text, cur_images = builder.build_round0(
         image_path, instruction, level=level,
     )
@@ -195,16 +203,25 @@ def run_multi_round_foveation(image, image_path, instruction, model, tokenizer,
     merge = model.visual.spatial_merge_size
 
     round_coords = []
+    nw, nh = 1, 1
 
     for ri in range(max_rounds):
         inp = {k: v.to(device) for k, v in last_inputs.items()}
         input_ids = inp["input_ids"]
         attention_mask = inp.get("attention_mask", torch.ones_like(input_ids))
 
+        # Get position IDs
+        position_ids, _ = model.get_rope_index(
+            input_ids=input_ids, image_grid_thw=inp.get("image_grid_thw"),
+            video_grid_thw=None, attention_mask=attention_mask,
+        )
+
         # Forward pass
-        cache = forward_for_cache(
-            model, input_ids, inp.get("pixel_values"),
-            inp.get("image_grid_thw"), attention_mask,
+        outputs = model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            pixel_values=inp.get("pixel_values"),
+            image_grid_thw=inp.get("image_grid_thw"),
+            output_hidden_states=True,
         )
 
         # Find pointer_pad for this round
@@ -212,22 +229,29 @@ def run_multi_round_foveation(image, image_path, instruction, model, tokenizer,
         if ptr_pos is None:
             break
 
-        # Get all visual tokens before this pointer
+        # Visual and query indices
         visual_indices, range_offsets = _get_all_visual_indices(
             input_ids[0], img_tok, up_to_pos=ptr_pos,
         )
         if visual_indices is None:
             break
 
-        # Extract attention
-        per_head, selected, best_head = extract_last_layer_attention(
-            model, cache["hidden_states"], cache["position_ids"],
-            ptr_pos, visual_indices,
+        query_indices = _get_query_indices(
+            input_ids[0], img_tok, pp_id, up_to_pos=ptr_pos,
+        )
+
+        # Extract multi-layer attention
+        attn_weights, _ = extract_attention(
+            model, outputs, input_ids, position_ids, attention_mask,
+            visual_indices=visual_indices.tolist(),
+            query_indices=query_indices,
+            target_index=ptr_pos,
         )
 
         # Identify which image has the max-attended token
+        attn_1d = attn_weights.squeeze(0)
         img_idx, local_idx = identify_attended_image(
-            selected, [(0, ro[1]) for ro in range_offsets],
+            attn_1d, [(0, ro[1]) for ro in range_offsets],
         )
 
         # Get spatial coordinates
@@ -357,7 +381,7 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ScreenSpot-Pro eval (multi-precision foveation)")
+    parser = argparse.ArgumentParser(description="ScreenSpot-Pro eval (multi-precision foveation v3)")
 
     # Model
     parser.add_argument("--model_name_or_path", type=str, default="smz8599/GUI-AIMA-3B")
@@ -374,6 +398,10 @@ def main():
     parser.add_argument("--initial_level", type=int, default=0,
                         help="Precision level for round 0 (0=low, 1=original, 2=high, 3=ultra)")
 
+    # Attention config
+    parser.add_argument("--query_weighting", type=str, default="query_1",
+                        help="Visual-sink weighting strategy (e.g., query_1, query_5, kl)")
+
     # Misc
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -387,10 +415,11 @@ def main():
         args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{model_name}/{tag}"
 
     print(f"=== Config ===")
-    print(f"  rounds:         {args.rounds}")
-    print(f"  initial_level:  {args.initial_level}")
-    print(f"  crop_ratio:     {args.crop_ratio}")
-    print(f"  device:         {args.device}")
+    print(f"  rounds:           {args.rounds}")
+    print(f"  initial_level:    {args.initial_level}")
+    print(f"  crop_ratio:       {args.crop_ratio}")
+    print(f"  query_weighting:  {args.query_weighting}")
+    print(f"  device:           {args.device}")
     print()
 
     # Load data
@@ -412,22 +441,22 @@ def main():
     processor = AutoProcessor.from_pretrained(processor_path, max_pixels=max_pixels)
     tokenizer = processor.tokenizer
 
-    num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
-    if num_new > 0:
-        print(f"Added {num_new} special tokens to tokenizer")
-
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
         device_map=args.device,
         attn_implementation="flash_attention_2",
     ).eval()
 
-    if num_new > 0:
-        model.resize_token_embeddings(len(tokenizer))
+    # Configure attention args
+    model.set_attention_args(args.query_weighting)
 
-    # Set pointer token IDs
+    # Ensure pointer token IDs are set
     if not hasattr(model.config, 'pointer_pad_token_id') or model.config.pointer_pad_token_id is None:
+        num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
+        if num_new > 0:
+            print(f"Added {num_new} special tokens to tokenizer")
+            model.resize_token_embeddings(len(tokenizer))
         model.config.pointer_start_token_id = tokenizer.encode(DEFAULT_POINTER_START_TOKEN)[0]
         model.config.pointer_end_token_id = tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
         model.config.pointer_pad_token_id = tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0]

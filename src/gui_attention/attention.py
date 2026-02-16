@@ -1,7 +1,8 @@
-"""Simplified attention extraction: last-layer Q*K with max-peak head selection.
+"""Attention extraction using gui_aima's multi-layer multi-head aggregation.
 
-No dependency on gui_aima's grounding head. Works directly with Qwen2.5-VL's
-transformer layers, handling GQA and M-RoPE.
+Replaces the v2 last-layer Q*K approach with gui_aima's full pipeline:
+  calculate_attention_from_qk -> visual-sink head weighting ->
+  multi_patch_pointer_head_attention -> aggregated (1, n_vis) distribution.
 """
 
 import math
@@ -10,33 +11,11 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-
-# ---------------------------------------------------------------------------
-# M-RoPE helpers (extracted from transformers to avoid version coupling)
-# ---------------------------------------------------------------------------
-
-def _rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_mrope(x, cos, sin, mrope_section):
-    """Apply M-RoPE to a single tensor (Q or K independently)."""
-    sec2 = [s * 2 for s in mrope_section]
-    # cos/sin shape: (3, batch, seq_len, head_dim)
-    # Split head_dim into mrope sections, pick temporal/height/width dims
-    cos_c = torch.cat(
-        [m[i % 3] for i, m in enumerate(cos.split(sec2, dim=-1))], dim=-1
-    ).unsqueeze(1)  # (batch, 1, seq_len, head_dim) — broadcast over heads
-    sin_c = torch.cat(
-        [m[i % 3] for i, m in enumerate(sin.split(sec2, dim=-1))], dim=-1
-    ).unsqueeze(1)
-    return (x * cos_c) + (_rotate_half(x) * sin_c)
+from gui_aima.model_utils import calculate_attention_from_qk
 
 
 # ---------------------------------------------------------------------------
-# Token-range helpers
+# Token-range helpers (unchanged from v2)
 # ---------------------------------------------------------------------------
 
 def find_image_visual_ranges(input_ids, image_token_id):
@@ -72,214 +51,105 @@ def find_nth_pointer_pad(input_ids, pointer_pad_id, n):
 
 
 # ---------------------------------------------------------------------------
-# Core: last-layer attention extraction
+# Core: extract attention via gui_aima multi-layer aggregation
 # ---------------------------------------------------------------------------
 
-def extract_last_layer_attention(
-    model,
-    hidden_states: list,
-    position_ids: torch.Tensor,
-    pointer_pos: int,
-    visual_indices: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Extract the last transformer layer's attention from pointer_pad to visual tokens.
+def extract_attention(model, outputs, input_ids, position_ids, attention_mask,
+                      visual_indices, query_indices, target_index):
+    """Extract aggregated attention using gui_aima's multi-layer pipeline.
+
+    Steps:
+        1. calculate_attention_from_qk -> per-layer per-head attention
+        2. Visual-sink query weighting -> head weights
+        3. model.multi_patch_pointer_head_attention -> aggregated attention
 
     Args:
-        model: Qwen2.5-VL model (or AIMA variant).
-        hidden_states: list from model(..., output_hidden_states=True).hidden_states.
-            hidden_states[0] = embedding output, hidden_states[i] = output of layer i-1.
-        position_ids: (3, batch, seq_len) M-RoPE position IDs.
-        pointer_pos: scalar index of pointer_pad in the sequence.
-        visual_indices: 1-D LongTensor of visual token positions.
+        model: Qwen2_5_VLForConditionalGenerationWithPointer.
+        outputs: model forward outputs (with output_hidden_states=True).
+        input_ids: (1, seq_len).
+        position_ids: (3, 1, seq_len) M-RoPE position IDs.
+        attention_mask: (1, seq_len).
+        visual_indices: list of int, positions of visual tokens.
+        query_indices: list of int, positions of text query tokens.
+        target_index: int, position of the pointer_pad token.
 
     Returns:
-        per_head_attn: (num_heads, n_vis) — attention distribution per Q-head.
-        selected_attn: (n_vis,) — attention from the max-peak head.
-        best_head_idx: int — index of the selected head.
+        attn_weights: (1, n_vis) normalised attention distribution.
+        loss: KL loss if labels were passed via the grounding head, else None.
     """
-    last_layer = model.model.layers[-1]
-    attn = last_layer.self_attn
+    hidden_states = list(outputs.hidden_states)
 
-    # Input to last layer = output of previous layer, then apply input_layernorm
-    h = hidden_states[-2]  # (batch, seq_len, hidden_dim)
-    h = last_layer.input_layernorm(h)
+    # 1. Multi-layer attention extraction
+    all_attentions = calculate_attention_from_qk(
+        model,
+        all_hidden_states=[hidden_states],
+        all_position_ids=position_ids,
+        all_attention_mask=attention_mask,
+        query_indices=[target_index],
+    )
+    # all_attentions[0] = list of per-layer tensors, each (B, H, 1, seq_len)
+    layer_attns = all_attentions[0]
 
-    # Project Q (pointer only) and K (visual tokens only)
-    ptr_h = h[:, pointer_pos : pointer_pos + 1, :]     # (1, 1, D)
-    vis_h = h[:, visual_indices, :]                      # (1, n_vis, D)
+    # 2. Visual-sink query weighting
+    topk_query_indices = _compute_visual_sink_queries(
+        model, hidden_states, visual_indices, query_indices,
+    )
 
-    q = attn.q_proj(ptr_h)    # (1, 1, num_heads * head_dim)
-    k = attn.k_proj(vis_h)    # (1, n_vis, num_kv_heads * head_dim)
+    # 3. Aggregate via grounding head
+    attn_weights, loss = model.multi_patch_pointer_head_attention(
+        query_indices=query_indices,
+        visual_indices=visual_indices,
+        target_indices=[target_index],
+        self_attentions=layer_attns,
+        topk_query_indices=topk_query_indices,
+        batch_idx=0,
+    )
 
-    num_heads = attn.num_heads
-    num_kv_heads = attn.num_key_value_heads
-    head_dim = attn.head_dim
-    num_kv_groups = num_heads // num_kv_heads
-
-    q = q.view(1, 1, num_heads, head_dim).transpose(1, 2)         # (1, H, 1, d)
-    k = k.view(1, -1, num_kv_heads, head_dim).transpose(1, 2)     # (1, Hkv, n_vis, d)
-
-    # Compute M-RoPE cos/sin for the subset of positions we need
-    device = visual_indices.device
-    all_idx = torch.cat([torch.tensor([pointer_pos], device=device), visual_indices])
-    subset_pos = position_ids[:, :, all_idx]   # (3, batch, 1+n_vis)
-
-    cos, sin = attn.rotary_emb(k, subset_pos)
-    # cos, sin: (3, batch, 1+n_vis, head_dim)
-
-    mrope_section = attn.rope_scaling["mrope_section"]
-
-    # Apply RoPE separately to Q (pos 0) and K (pos 1:)
-    q = _apply_mrope(q, cos[:, :, :1, :], sin[:, :, :1, :], mrope_section)
-    k = _apply_mrope(k, cos[:, :, 1:, :], sin[:, :, 1:, :], mrope_section)
-
-    # GQA: expand K heads to match Q heads
-    if num_kv_groups > 1:
-        k = k.repeat_interleave(num_kv_groups, dim=1)   # (1, H, n_vis, d)
-
-    # Scaled dot-product attention
-    scaling = getattr(attn, 'scaling', head_dim ** -0.5)
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scaling  # (1, H, 1, n_vis)
-    attn_weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-
-    per_head = attn_weights[0, :, 0, :]   # (H, n_vis)
-
-    # Select head with the highest peak attention value
-    best_head_idx = per_head.max(dim=-1).values.argmax().item()
-    selected = per_head[best_head_idx]     # (n_vis,)
-
-    return per_head, selected, best_head_idx
+    return attn_weights, loss
 
 
-# ---------------------------------------------------------------------------
-# High-level: forward + extract for a specific round
-# ---------------------------------------------------------------------------
+def _compute_visual_sink_queries(model, hidden_states, visual_indices, query_indices, topk=None):
+    """Compute top-K visual-sink query indices via cosine similarity.
 
-def forward_and_extract(model, input_ids, pixel_values, image_grid_thw,
-                        attention_mask, round_idx):
-    """Run model forward and extract attention for one round's pointer_pad.
-
-    Convenience wrapper combining forward pass + last-layer extraction.
+    For each text query token, compute sum of cosine similarities with all
+    visual tokens across all layers. Select the top-K queries with highest
+    aggregate similarity.
 
     Returns:
-        dict with keys:
-            attn_weights  — (1, n_vis) selected-head attention (for compat)
-            per_head_attn — (H, n_vis) all heads
-            best_head     — int
-            n_width, n_height — spatial grid dims of the attended image
-            visual_range  — (start, end) of this round's visual tokens
-        or None if the round's tokens are not found.
+        topk_indices: LongTensor of query_indices positions, or None.
     """
-    device = input_ids.device
-    img_tok = model.config.image_token_id
-    pp_id = model.config.pointer_pad_token_id
-
-    vis_ranges = find_image_visual_ranges(input_ids[0], img_tok)
-    if round_idx >= len(vis_ranges):
-        return None
-    vis_start, vis_end = vis_ranges[round_idx]
-    visual_indices = torch.arange(vis_start, vis_end, device=device)
-
-    target_pos = find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
-    if target_pos is None:
+    if not query_indices or not visual_indices:
         return None
 
-    # Position IDs
-    position_ids, _ = model.get_rope_index(
-        input_ids=input_ids, image_grid_thw=image_grid_thw,
-        video_grid_thw=None, attention_mask=attention_mask,
-    )
-
-    # Forward
-    outputs = model(
-        input_ids=input_ids, attention_mask=attention_mask,
-        pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-        output_hidden_states=True,
-    )
-
-    per_head, selected, best_head = extract_last_layer_attention(
-        model, list(outputs.hidden_states), position_ids,
-        target_pos, visual_indices,
-    )
-
-    # Spatial grid dimensions
-    merge = model.visual.spatial_merge_size
-    if round_idx < image_grid_thw.shape[0]:
-        _, nh, nw = (image_grid_thw[round_idx] // merge).tolist()
-    else:
-        n_vis = visual_indices.numel()
-        nw = nh = int(math.sqrt(n_vis))
-
-    return {
-        "attn_weights": selected.unsqueeze(0),   # (1, n_vis)
-        "per_head_attn": per_head,                # (H, n_vis)
-        "best_head": best_head,
-        "n_width": int(nw),
-        "n_height": int(nh),
-        "visual_range": (vis_start, vis_end),
-    }
-
-
-def forward_for_cache(model, input_ids, pixel_values, image_grid_thw, attention_mask):
-    """Run model forward and cache outputs for multi-round extraction."""
-    position_ids, _ = model.get_rope_index(
-        input_ids=input_ids, image_grid_thw=image_grid_thw,
-        video_grid_thw=None, attention_mask=attention_mask,
-    )
-    outputs = model(
-        input_ids=input_ids, attention_mask=attention_mask,
-        pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-        output_hidden_states=True,
-    )
-    return {
-        "position_ids": position_ids,
-        "hidden_states": list(outputs.hidden_states),
-    }
-
-
-def extract_round_from_cache(model, input_ids, image_grid_thw, cache, round_idx):
-    """Extract attention for a specific round from pre-computed forward outputs.
-
-    Returns dict like forward_and_extract, or None.
-    """
-    device = input_ids.device
-    img_tok = model.config.image_token_id
-    pp_id = model.config.pointer_pad_token_id
-
-    vis_ranges = find_image_visual_ranges(input_ids[0], img_tok)
-    if round_idx >= len(vis_ranges):
-        return None
-    vis_start, vis_end = vis_ranges[round_idx]
-    visual_indices = torch.arange(vis_start, vis_end, device=device)
-
-    target_pos = find_nth_pointer_pad(input_ids[0], pp_id, round_idx)
-    if target_pos is None:
+    k = topk
+    if k is None:
+        k = getattr(model.config, 'query_topk', 1)
+    if k is None or k <= 0:
         return None
 
-    per_head, selected, best_head = extract_last_layer_attention(
-        model, cache["hidden_states"], cache["position_ids"],
-        target_pos, visual_indices,
-    )
+    # Stack hidden states from all layers (skip embedding layer at index 0)
+    num_layers = len(hidden_states) - 1
+    device = hidden_states[1].device
 
-    merge = model.visual.spatial_merge_size
-    if round_idx < image_grid_thw.shape[0]:
-        _, nh, nw = (image_grid_thw[round_idx] // merge).tolist()
-    else:
-        n_vis = visual_indices.numel()
-        nw = nh = int(math.sqrt(n_vis))
+    q_idx = torch.tensor(query_indices, device=device)
+    v_idx = torch.tensor(visual_indices, device=device)
 
-    return {
-        "attn_weights": selected.unsqueeze(0),
-        "per_head_attn": per_head,
-        "best_head": best_head,
-        "n_width": int(nw),
-        "n_height": int(nh),
-        "visual_range": (vis_start, vis_end),
-    }
+    agg_sim = torch.zeros(len(query_indices), device=device)
+
+    for layer_idx in range(1, len(hidden_states)):
+        hs = hidden_states[layer_idx][0]  # (seq_len, hidden_dim)
+        q_hs = F.normalize(hs[q_idx], dim=-1)  # (n_query, D)
+        v_hs = F.normalize(hs[v_idx], dim=-1)  # (n_visual, D)
+        sim = torch.matmul(q_hs, v_hs.T)  # (n_query, n_visual)
+        agg_sim += sim.sum(dim=-1)  # (n_query,)
+
+    k = min(k, len(query_indices))
+    _, topk_local = torch.topk(agg_sim, k, largest=True)
+    return topk_local
 
 
 # ---------------------------------------------------------------------------
-# Multi-image helpers: identify which image an attended token belongs to
+# Multi-image helpers (unchanged from v2)
 # ---------------------------------------------------------------------------
 
 def identify_attended_image(
@@ -298,7 +168,6 @@ def identify_attended_image(
     """
     global_argmax = attn.argmax().item()
 
-    # Map global offset into image-specific offset
     cumulative = 0
     for img_idx, (vs, ve) in enumerate(visual_ranges):
         n_tokens = ve - vs
@@ -306,7 +175,6 @@ def identify_attended_image(
             return img_idx, global_argmax - cumulative
         cumulative += n_tokens
 
-    # Fallback: last image
     return len(visual_ranges) - 1, global_argmax - cumulative
 
 

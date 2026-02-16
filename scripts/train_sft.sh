@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# Multi-Precision Foveated SFT Training
+# Multi-Precision Foveated SFT Training (v3)
 # ============================================================================
-# Teacher-forcing: crop around GT at increasing precision levels.
-# Recommended as the first training stage before GRPO.
+# Teacher-forcing with gui_aima multi-layer attention + IoU x Gaussian labels.
+# Uses Qwen2_5_VLForConditionalGenerationWithPointer.
 #
 # Usage:
 #   bash scripts/train_sft.sh
@@ -57,6 +57,10 @@ python -m gui_attention.train \
     --max_rounds "${MAX_ROUNDS}" \
     --initial_level "${INITIAL_LEVEL}" \
     --crop_ratio "${CROP_RATIO}" \
+    --query_weighting query_1 \
+    --pointer_loss_weight 1.0 \
+    --lm_loss_weight 0.0 \
+    --sigma_scale 0.8 \
     --num_train_epochs "${EPOCHS}" \
     --per_device_train_batch_size "${BATCH_SIZE}" \
     --gradient_accumulation_steps "${GRAD_ACCUM}" \
