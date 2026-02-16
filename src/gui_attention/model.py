@@ -189,10 +189,11 @@ class Qwen25VLWithActionHead(nn.Module):
         )
         backbone.config.use_cache = False
 
-        # Add pointer tokens
+        # Add pointer tokens (tokenizer from checkpoint already has them,
+        # but we still need to resize embeddings to match)
         tokenizer = AutoTokenizer.from_pretrained(path)
-        num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
-        if num_new > 0:
+        tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
+        if len(tokenizer) != backbone.config.vocab_size:
             backbone.resize_token_embeddings(len(tokenizer))
 
         backbone.config.pointer_start_token_id = tokenizer.convert_tokens_to_ids(
