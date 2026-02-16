@@ -24,6 +24,7 @@ CUDA_VISIBLE_DEVICES="0" python3 -m gui_attention.train \
     --high_res_max_pixels 5720064 \
     --crop_ratio 0.3 \
     --crop_jitter 0.05 \
+    --max_saccade_rounds 3 \
     --lora_r 32 \
     --lora_alpha 64 \
     --lora_target_modules "q_proj,v_proj" \
