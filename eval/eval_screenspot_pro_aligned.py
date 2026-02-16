@@ -446,6 +446,7 @@ def main():
         torch_dtype=torch.bfloat16,
         device_map=args.device,
         attn_implementation="flash_attention_2",
+        ignore_mismatched_sizes=True,
     ).eval()
 
     # Configure attention args
