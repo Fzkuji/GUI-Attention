@@ -77,9 +77,10 @@ def build_model(
     backbone = get_peft_model(backbone, lora_config)
     backbone.print_trainable_parameters()
 
-    # Build action head
+    # Build action head (match backbone dtype)
     d_model = backbone.config.hidden_size
     action_head = ActionHead(d_model=d_model, projection_dim=d_model)
+    action_head = action_head.to(torch_dtype)
 
     # Processor
     processor = AutoProcessor.from_pretrained(model_name_or_path)
