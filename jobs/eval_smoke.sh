@@ -14,11 +14,13 @@ export PYTHONUNBUFFERED=1
 
 DATA=/home/zichuanfu2/data/ScreenSpot-Pro
 SAVE_BASE=/home/zichuanfu2/results/eval_smoke
+BASE_MODEL=/home/zichuanfu2/models/Qwen2.5-VL-3B-Instruct
+SFT_CKPT=/home/zichuanfu2/results/sft_foveated_smoke/checkpoint-500
 
 # 1) Baseline: Qwen2.5-VL-3B (no SFT), single-round at L1 (original resolution)
 echo "====== Baseline: Qwen2.5-VL-3B, single-round L1 ======"
 python3 eval/eval_screenspot_pro_aligned.py \
-    --model_name_or_path /home/zichuanfu2/models/Qwen2.5-VL-3B-Instruct \
+    --model_name_or_path "$BASE_MODEL" \
     --data_path "$DATA" \
     --save_path "$SAVE_BASE/baseline_L1" \
     --rounds 1 \
@@ -28,7 +30,8 @@ python3 eval/eval_screenspot_pro_aligned.py \
 # 2) SFT checkpoint-500, single-round at L1
 echo "====== SFT-500: single-round L1 ======"
 python3 eval/eval_screenspot_pro_aligned.py \
-    --model_name_or_path /home/zichuanfu2/results/sft_foveated_smoke/checkpoint-500 \
+    --model_name_or_path "$SFT_CKPT" \
+    --base_model_path "$BASE_MODEL" \
     --data_path "$DATA" \
     --save_path "$SAVE_BASE/sft500_L1" \
     --rounds 1 \
@@ -38,7 +41,8 @@ python3 eval/eval_screenspot_pro_aligned.py \
 # 3) SFT checkpoint-500, multi-round foveation from L0
 echo "====== SFT-500: multi-round foveation L0->L2 ======"
 python3 eval/eval_screenspot_pro_aligned.py \
-    --model_name_or_path /home/zichuanfu2/results/sft_foveated_smoke/checkpoint-500 \
+    --model_name_or_path "$SFT_CKPT" \
+    --base_model_path "$BASE_MODEL" \
     --data_path "$DATA" \
     --save_path "$SAVE_BASE/sft500_fov" \
     --rounds 5 \

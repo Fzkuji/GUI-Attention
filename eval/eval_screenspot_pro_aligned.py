@@ -361,6 +361,8 @@ def main():
 
     # Model
     parser.add_argument("--model_name_or_path", type=str, default="smz8599/GUI-AIMA-3B")
+    parser.add_argument("--base_model_path", type=str, default=None,
+                        help="Base model path for loading processor (if checkpoint has incompatible processor)")
 
     # Data
     parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data/ScreenSpot-Pro")
@@ -405,10 +407,9 @@ def main():
 
     # Load model
     max_pixels = precision_for_level(args.initial_level)
+    processor_path = args.base_model_path or args.model_name_or_path
     print(f"Loading model: {args.model_name_or_path} (max_pixels={max_pixels})")
-    processor = AutoProcessor.from_pretrained(
-        args.model_name_or_path, max_pixels=max_pixels,
-    )
+    processor = AutoProcessor.from_pretrained(processor_path, max_pixels=max_pixels)
     tokenizer = processor.tokenizer
 
     num_new = tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
@@ -434,7 +435,7 @@ def main():
               f"pad={model.config.pointer_pad_token_id}, end={model.config.pointer_end_token_id}")
 
     # Builder
-    builder = MultiRoundInputBuilder(args.model_name_or_path, tokenizer, min_pixels=3136)
+    builder = MultiRoundInputBuilder(processor_path, tokenizer, min_pixels=3136)
 
     # Check cache
     os.makedirs(args.save_path, exist_ok=True)
