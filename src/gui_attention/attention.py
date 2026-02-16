@@ -59,9 +59,13 @@ def extract_attention(model, outputs, input_ids, position_ids, attention_mask,
     """Extract aggregated attention using gui_aima's multi-layer pipeline.
 
     Steps:
-        1. calculate_attention_from_qk -> per-layer per-head attention
-        2. Visual-sink query weighting -> head weights
+        1. Compute visual-sink top-K query indices (cosine sim in hidden states)
+        2. calculate_attention_from_qk with combined [topk_queries + target]
         3. model.multi_patch_pointer_head_attention -> aggregated attention
+
+    The grounding head expects layer_attn[batch][:, -1, visual_indices] for target
+    and layer_attn[batch][:, topk_local, visual_indices] for head weighting.
+    So we place target_index last in the combined query list.
 
     Args:
         model: Qwen2_5_VLForConditionalGenerationWithPointer.
@@ -78,30 +82,49 @@ def extract_attention(model, outputs, input_ids, position_ids, attention_mask,
         loss: KL loss if labels were passed via the grounding head, else None.
     """
     hidden_states = list(outputs.hidden_states)
+    device = hidden_states[0].device
 
-    # 1. Multi-layer attention extraction
+    # 1. Compute visual-sink top-K query indices (local indices into query_indices)
+    topk_local = _compute_visual_sink_queries(
+        model, hidden_states, visual_indices, query_indices,
+    )
+
+    # 2. Build combined query list: [topk_abs_positions..., target_index]
+    # Target must be LAST so grounding head uses [:, -1, ...] for it
+    if topk_local is not None:
+        topk_abs = [query_indices[i] for i in topk_local.tolist()]
+    else:
+        topk_abs = []
+    combined_queries = topk_abs + [target_index]
+
+    # 3. Multi-layer attention extraction for combined queries
     all_attentions = calculate_attention_from_qk(
         model,
         all_hidden_states=[hidden_states],
         all_position_ids=position_ids,
         all_attention_mask=attention_mask,
-        query_indices=[target_index],
+        query_indices=combined_queries,
     )
-    # all_attentions[0] = list of per-layer tensors, each (B, H, 1, seq_len)
+    # all_attentions[0] = list of per-layer tensors, each (B, H, len(combined_queries), seq_len)
     layer_attns = all_attentions[0]
 
-    # 2. Visual-sink query weighting
-    topk_query_indices = _compute_visual_sink_queries(
-        model, hidden_states, visual_indices, query_indices,
-    )
+    # 4. topk indices within the Q dimension of layer_attns: [0, 1, ..., K-1]
+    if topk_abs:
+        topk_for_head = torch.arange(len(topk_abs), device=device)
+    else:
+        topk_for_head = None
 
-    # 3. Aggregate via grounding head
+    # 5. visual_indices as tensor (grounding head uses it for fancy indexing)
+    vis_tensor = torch.tensor(visual_indices, device=device) if not isinstance(visual_indices, torch.Tensor) else visual_indices.to(device)
+
+    # 6. Aggregate via grounding head
     attn_weights, loss = model.multi_patch_pointer_head_attention(
         query_indices=query_indices,
-        visual_indices=visual_indices,
+        visual_indices=vis_tensor,
         target_indices=[target_index],
         self_attentions=layer_attns,
-        topk_query_indices=topk_query_indices,
+        topk_query_indices=topk_for_head,
+        global_pattern_per_query=None,
         batch_idx=0,
     )
 
@@ -116,7 +139,7 @@ def _compute_visual_sink_queries(model, hidden_states, visual_indices, query_ind
     aggregate similarity.
 
     Returns:
-        topk_indices: LongTensor of query_indices positions, or None.
+        topk_local: LongTensor of local indices into query_indices, or None.
     """
     if not query_indices or not visual_indices:
         return None
@@ -127,12 +150,9 @@ def _compute_visual_sink_queries(model, hidden_states, visual_indices, query_ind
     if k is None or k <= 0:
         return None
 
-    # Stack hidden states from all layers (skip embedding layer at index 0)
-    num_layers = len(hidden_states) - 1
     device = hidden_states[1].device
-
     q_idx = torch.tensor(query_indices, device=device)
-    v_idx = torch.tensor(visual_indices, device=device)
+    v_idx = torch.tensor(visual_indices, device=device) if not isinstance(visual_indices, torch.Tensor) else visual_indices.to(device)
 
     agg_sim = torch.zeros(len(query_indices), device=device)
 
