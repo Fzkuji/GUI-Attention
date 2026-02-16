@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=sft_fov
-#SBATCH --output=/mnt/data/zichuanfu/GUI-Attention/logs/sft_smoke_%j.txt
-#SBATCH --error=/mnt/data/zichuanfu/GUI-Attention/logs/sft_smoke_err_%j.txt
+#SBATCH --output=/home/zichuanfu2/GUI-Attention/logs/sft_smoke_%j.txt
+#SBATCH --error=/home/zichuanfu2/GUI-Attention/logs/sft_smoke_err_%j.txt
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=04:00:00
@@ -9,19 +9,19 @@
 source /opt/anaconda3/etc/profile.d/conda.sh
 conda activate fzc-guiattn
 
-cd /mnt/data/zichuanfu/GUI-Attention
+cd /home/zichuanfu2/GUI-Attention
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="/mnt/data/zichuanfu/Experiments/GUI-AIMA/src:${PYTHONPATH}"
+export PYTHONPATH="/home/zichuanfu2/GUI-AIMA/src:${PYTHONPATH}"
 
 # Single GPU SFT smoke test with gui_aima attention
 # Uses GUI-AIMA-3B as base model (already has pointer tokens)
 # 500 steps should be enough to see if loss decreases
 CUDA_VISIBLE_DEVICES="0" python3 -m gui_attention.train \
     --training_mode sft \
-    --model_name_or_path /mnt/data/zichuanfu/models/GUI-AIMA-3B \
-    --data_path /mnt/data/zichuanfu/data/GUI-Actor/guiact_bbox.json \
-    --image_folder /mnt/data/zichuanfu/data/GUI-Actor/GUIAct/web_imgs \
-    --output_dir /mnt/data/zichuanfu/results/sft_foveated_smoke \
+    --model_name_or_path /home/zichuanfu2/models/GUI-AIMA-3B \
+    --data_path /home/zichuanfu2/data/GUI-Actor/guiact_bbox.json \
+    --image_folder /home/zichuanfu2/data/GUI-Actor/GUIAct/web_imgs \
+    --output_dir /home/zichuanfu2/results/sft_foveated_smoke \
     --min_pixels 3136 \
     --max_pixels 250000 \
     --max_rounds 3 \

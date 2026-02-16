@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eval_fov
-#SBATCH --output=/mnt/data/zichuanfu/GUI-Attention/logs/eval_smoke_%j.txt
-#SBATCH --error=/mnt/data/zichuanfu/GUI-Attention/logs/eval_smoke_err_%j.txt
+#SBATCH --output=/home/zichuanfu2/GUI-Attention/logs/eval_smoke_%j.txt
+#SBATCH --error=/home/zichuanfu2/GUI-Attention/logs/eval_smoke_err_%j.txt
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=01:00:00
@@ -9,14 +9,14 @@
 source /opt/anaconda3/etc/profile.d/conda.sh
 conda activate fzc-guiattn
 
-cd /mnt/data/zichuanfu/GUI-Attention
+cd /home/zichuanfu2/GUI-Attention
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="/mnt/data/zichuanfu/Experiments/GUI-AIMA/src:${PYTHONPATH}"
+export PYTHONPATH="/home/zichuanfu2/GUI-AIMA/src:${PYTHONPATH}"
 
-DATA=/mnt/data/zichuanfu/data/ScreenSpot-Pro
-SAVE_BASE=/mnt/data/zichuanfu/results/eval_smoke
-BASE_MODEL=/mnt/data/zichuanfu/models/GUI-AIMA-3B
-SFT_CKPT=/mnt/data/zichuanfu/results/sft_foveated_smoke/checkpoint-500
+DATA=/home/zichuanfu2/data/ScreenSpot-Pro
+SAVE_BASE=/home/zichuanfu2/results/eval_smoke
+BASE_MODEL=/home/zichuanfu2/models/GUI-AIMA-3B
+SFT_CKPT=/home/zichuanfu2/results/sft_foveated_smoke/checkpoint-500
 
 # 1) Baseline: GUI-AIMA-3B, single-round at L1 (original resolution)
 echo "====== Baseline: GUI-AIMA-3B, single-round L1 ======"
