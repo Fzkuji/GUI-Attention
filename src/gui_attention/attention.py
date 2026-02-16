@@ -1,21 +1,14 @@
-"""Attention extraction using gui_aima's multi-layer multi-head aggregation.
+"""Attention utilities for action head (v4, no gui_aima dependency).
 
-Replaces the v2 last-layer Q*K approach with gui_aima's full pipeline:
-  calculate_attention_from_qk -> visual-sink head weighting ->
-  multi_patch_pointer_head_attention -> aggregated (1, n_vis) distribution.
+Extracts LLM last-layer hidden states and feeds them through the ActionHead.
 """
 
-import math
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
-import torch.nn.functional as F
-
-from gui_aima.model_utils import calculate_attention_from_qk
-
 
 # ---------------------------------------------------------------------------
-# Token-range helpers (unchanged from v2)
+# Token-range helpers
 # ---------------------------------------------------------------------------
 
 def find_image_visual_ranges(input_ids, image_token_id):
@@ -51,125 +44,59 @@ def find_nth_pointer_pad(input_ids, pointer_pad_id, n):
 
 
 # ---------------------------------------------------------------------------
-# Core: extract attention via gui_aima multi-layer aggregation
+# Hidden state extraction for action head
 # ---------------------------------------------------------------------------
 
-def extract_attention(model, outputs, input_ids, position_ids, attention_mask,
-                      visual_indices, query_indices, target_index):
-    """Extract aggregated attention using gui_aima's multi-layer pipeline.
-
-    Steps:
-        1. Compute visual-sink top-K query indices (cosine sim in hidden states)
-        2. calculate_attention_from_qk with combined [topk_queries + target]
-        3. model.multi_patch_pointer_head_attention -> aggregated attention
-
-    The grounding head expects layer_attn[batch][:, -1, visual_indices] for target
-    and layer_attn[batch][:, topk_local, visual_indices] for head weighting.
-    So we place target_index last in the combined query list.
+def extract_visual_hidden_states(hidden_states, input_ids, image_token_id):
+    """Extract visual token hidden states from LLM last layer.
 
     Args:
-        model: Qwen2_5_VLForConditionalGenerationWithPointer.
-        outputs: model forward outputs (with output_hidden_states=True).
+        hidden_states: last-layer hidden states (1, seq_len, d_model).
         input_ids: (1, seq_len).
-        position_ids: (3, 1, seq_len) M-RoPE position IDs.
-        attention_mask: (1, seq_len).
-        visual_indices: list of int, positions of visual tokens.
-        query_indices: list of int, positions of text query tokens.
-        target_index: int, position of the pointer_pad token.
+        image_token_id: token ID for image patches.
 
     Returns:
-        attn_weights: (1, n_vis) normalised attention distribution.
-        loss: KL loss if labels were passed via the grounding head, else None.
+        visual_hidden: (n_vis, d_model) hidden states at visual positions.
+        visual_ranges: list of (start_in_flat, n_tokens) per image block.
     """
-    hidden_states = list(outputs.hidden_states)
-    device = hidden_states[0].device
+    hs = hidden_states[0]  # (seq_len, d_model)
+    ids_1d = input_ids[0]
+    ranges = find_image_visual_ranges(ids_1d, image_token_id)
 
-    # 1. Compute visual-sink top-K query indices (local indices into query_indices)
-    topk_local = _compute_visual_sink_queries(
-        model, hidden_states, visual_indices, query_indices,
-    )
+    parts = []
+    range_offsets = []
+    offset = 0
+    for vs, ve in ranges:
+        n = ve - vs
+        parts.append(hs[vs:ve])
+        range_offsets.append((offset, n))
+        offset += n
 
-    # 2. Build combined query list: [topk_abs_positions..., target_index]
-    # Target must be LAST so grounding head uses [:, -1, ...] for it
-    if topk_local is not None:
-        topk_abs = [query_indices[i] for i in topk_local.tolist()]
-    else:
-        topk_abs = []
-    combined_queries = topk_abs + [target_index]
-
-    # 3. Multi-layer attention extraction for combined queries
-    all_attentions = calculate_attention_from_qk(
-        model,
-        all_hidden_states=[hidden_states],
-        all_position_ids=position_ids,
-        all_attention_mask=attention_mask,
-        query_indices=combined_queries,
-    )
-    # all_attentions[0] = list of per-layer tensors, each (B, H, len(combined_queries), seq_len)
-    layer_attns = all_attentions[0]
-
-    # 4. topk indices within the Q dimension of layer_attns: [0, 1, ..., K-1]
-    if topk_abs:
-        topk_for_head = torch.arange(len(topk_abs), device=device)
-    else:
-        topk_for_head = None
-
-    # 5. visual_indices as tensor (grounding head uses it for fancy indexing)
-    vis_tensor = torch.tensor(visual_indices, device=device) if not isinstance(visual_indices, torch.Tensor) else visual_indices.to(device)
-
-    # 6. Aggregate via grounding head
-    attn_weights, loss = model.multi_patch_pointer_head_attention(
-        query_indices=query_indices,
-        visual_indices=vis_tensor,
-        target_indices=[target_index],
-        self_attentions=layer_attns,
-        topk_query_indices=topk_for_head,
-        global_pattern_per_query=None,
-        batch_idx=0,
-    )
-
-    return attn_weights, loss
+    if not parts:
+        return None, []
+    return torch.cat(parts, dim=0), range_offsets
 
 
-def _compute_visual_sink_queries(model, hidden_states, visual_indices, query_indices, topk=None):
-    """Compute top-K visual-sink query indices via cosine similarity.
+def extract_anchor_hidden_states(hidden_states, input_ids, pointer_pad_id, n=0):
+    """Extract the n-th pointer_pad token's hidden state from LLM last layer.
 
-    For each text query token, compute sum of cosine similarities with all
-    visual tokens across all layers. Select the top-K queries with highest
-    aggregate similarity.
+    Args:
+        hidden_states: last-layer hidden states (1, seq_len, d_model).
+        input_ids: (1, seq_len).
+        pointer_pad_id: token ID(s) for pointer pad.
+        n: which pointer_pad to extract (0-based).
 
     Returns:
-        topk_local: LongTensor of local indices into query_indices, or None.
+        anchor_hidden: (1, d_model) or None if not found.
     """
-    if not query_indices or not visual_indices:
+    pos = find_nth_pointer_pad(input_ids[0], pointer_pad_id, n)
+    if pos is None:
         return None
-
-    k = topk
-    if k is None:
-        k = getattr(model.config, 'query_topk', 1)
-    if k is None or k <= 0:
-        return None
-
-    device = hidden_states[1].device
-    q_idx = torch.tensor(query_indices, device=device)
-    v_idx = torch.tensor(visual_indices, device=device) if not isinstance(visual_indices, torch.Tensor) else visual_indices.to(device)
-
-    agg_sim = torch.zeros(len(query_indices), device=device)
-
-    for layer_idx in range(1, len(hidden_states)):
-        hs = hidden_states[layer_idx][0]  # (seq_len, hidden_dim)
-        q_hs = F.normalize(hs[q_idx], dim=-1)  # (n_query, D)
-        v_hs = F.normalize(hs[v_idx], dim=-1)  # (n_visual, D)
-        sim = torch.matmul(q_hs, v_hs.T)  # (n_query, n_visual)
-        agg_sim += sim.sum(dim=-1)  # (n_query,)
-
-    k = min(k, len(query_indices))
-    _, topk_local = torch.topk(agg_sim, k, largest=True)
-    return topk_local
+    return hidden_states[0, pos:pos + 1]  # (1, d_model)
 
 
 # ---------------------------------------------------------------------------
-# Multi-image helpers (unchanged from v2)
+# Multi-image helpers
 # ---------------------------------------------------------------------------
 
 def identify_attended_image(
@@ -180,7 +107,7 @@ def identify_attended_image(
 
     Args:
         attn: (n_total_vis,) attention weights over concatenated visual tokens.
-        visual_ranges: list of (start, end) per image in the input_ids sequence.
+        visual_ranges: list of (offset, n_tokens) per image.
 
     Returns:
         image_idx: which image (0-based) the max token belongs to.
@@ -189,8 +116,7 @@ def identify_attended_image(
     global_argmax = attn.argmax().item()
 
     cumulative = 0
-    for img_idx, (vs, ve) in enumerate(visual_ranges):
-        n_tokens = ve - vs
+    for img_idx, (offset, n_tokens) in enumerate(visual_ranges):
         if cumulative + n_tokens > global_argmax:
             return img_idx, global_argmax - cumulative
         cumulative += n_tokens

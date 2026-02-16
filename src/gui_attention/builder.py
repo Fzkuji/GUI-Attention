@@ -1,32 +1,35 @@
-"""MultiRoundInputBuilder: builds multi-round multi-precision conversation tokens.
+"""MultiRoundInputBuilder: builds saccade conversation tokens (v4).
 
-Each round's image is pre-processed at its own resolution level so the processor
+Simplified to 2 precision levels:
+  - Low-res: full image at LOW_RES_MAX_PIXELS
+  - High-res: crop at HIGH_RES_MAX_PIXELS
+
+Each round's image is pre-processed at its own resolution so the processor
 never re-sizes an image intended for a different precision level.
-
-Tracks which precision level and spatial bbox each image belongs to, so that
-after attention extraction we can identify which image an attended token is from.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info, smart_resize
+from transformers import AutoProcessor
 
 from gui_attention.constants import (
-    PLACEHOLDER_SUFFIX, precision_for_level,
-    CHAT_TEMPLATE, GROUNDING_SYSTEM_MESSAGE,
+    CHAT_TEMPLATE,
+    GROUNDING_SYSTEM_MESSAGE,
+    HIGH_RES_MAX_PIXELS,
+    LOW_RES_MAX_PIXELS,
+    PLACEHOLDER_SUFFIX,
 )
 
 
 @dataclass
 class ImageInfo:
     """Metadata for one image in the multi-round context."""
-    level: int                          # precision level (0-3)
+    resolution: str                     # 'low' or 'high'
     global_bbox: Tuple[float, ...]      # (x1, y1, x2, y2) in original image coords, normalised
-    # Filled in after tokenisation:
     visual_range: Optional[Tuple[int, int]] = None  # (start, end) in input_ids
 
 
@@ -40,15 +43,17 @@ def _presize_image(image: Image.Image, max_pixels: int, min_pixels: int = 3136, 
 
 
 class MultiRoundInputBuilder:
-    """Incrementally builds multi-round conversation tokens with precision tracking."""
+    """Incrementally builds saccade conversation tokens with resolution tracking."""
 
-    # Large enough that the processor won't further resize pre-resized images.
     _PASSTHROUGH_MAX = 20_000_000
 
-    def __init__(self, model_path: str, tokenizer, min_pixels: int = 3136):
+    def __init__(self, model_path: str, tokenizer, min_pixels: int = 3136,
+                 low_res_max_pixels: int = None, high_res_max_pixels: int = None):
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.min_pixels = min_pixels
+        self.low_res_max_pixels = low_res_max_pixels or LOW_RES_MAX_PIXELS
+        self.high_res_max_pixels = high_res_max_pixels or HIGH_RES_MAX_PIXELS
         self._processor_cache: Dict[int, AutoProcessor] = {}
         self._resized_images: List[Image.Image] = []
         self.image_infos: List[ImageInfo] = []
@@ -67,17 +72,17 @@ class MultiRoundInputBuilder:
         self._resized_images = []
         self.image_infos = []
 
-    # ----- round 0 --------------------------------------------------------
+    # ----- round 0: low-res full image ------------------------------------
 
-    def build_round0(self, image_or_path, instruction: str, level: int = 0):
-        """Build round-0 inputs (full image at given precision level).
+    def build_round0(self, image_or_path, instruction: str):
+        """Build round-0 inputs (full image at low resolution).
 
         Returns (inputs_dict, raw_text, images_list).
         """
         if isinstance(image_or_path, dict):
             image_or_path = image_or_path["image_path"]
 
-        max_px = precision_for_level(level)
+        max_px = self.low_res_max_pixels
         conv = [
             {"role": "system", "content": [{"type": "text", "text": GROUNDING_SYSTEM_MESSAGE}]},
             {"role": "user", "content": [
@@ -93,34 +98,31 @@ class MultiRoundInputBuilder:
 
         resized_r0 = _presize_image(images[0], max_px, self.min_pixels)
         self._resized_images = [resized_r0]
-        self.image_infos = [ImageInfo(level=level, global_bbox=(0.0, 0.0, 1.0, 1.0))]
+        self.image_infos = [ImageInfo(resolution="low", global_bbox=(0.0, 0.0, 1.0, 1.0))]
 
         inputs = self._get_processor(max_px)(
             text=[text], images=[resized_r0], return_tensors="pt", padding=True,
         )
-        # Fill visual_range for round 0
         self._update_visual_ranges(inputs["input_ids"][0])
         return inputs, text, images
 
-    # ----- subsequent rounds ----------------------------------------------
+    # ----- subsequent rounds: high-res crop -------------------------------
 
     def extend_with_crop(self, prev_text: str, prev_images: list,
-                         crop_pil: Image.Image, crop_bbox: tuple,
-                         level: int):
-        """Append a crop at the specified precision level.
+                         crop_pil: Image.Image, crop_bbox: tuple):
+        """Append a high-res crop.
 
         Args:
             crop_bbox: (x1, y1, x2, y2) normalised in original image coords.
-            level: precision level for this crop (0-3).
 
         Returns (inputs_dict, raw_text, images_list).
         """
-        max_px = precision_for_level(level)
+        max_px = self.high_res_max_pixels
         round_num = len(self.image_infos)
 
         zoom_text = (
             f"\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-            f"[Zoomed region round {round_num + 1} around "
+            f"[Zoomed region round {round_num} around "
             f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
             f"<|im_end|>\n"
             + PLACEHOLDER_SUFFIX
@@ -130,7 +132,7 @@ class MultiRoundInputBuilder:
 
         resized_crop = _presize_image(crop_pil, max_px, self.min_pixels)
         self._resized_images.append(resized_crop)
-        self.image_infos.append(ImageInfo(level=level, global_bbox=crop_bbox))
+        self.image_infos.append(ImageInfo(resolution="high", global_bbox=crop_bbox))
 
         proc = self._get_processor(self._PASSTHROUGH_MAX)
         inputs = proc(

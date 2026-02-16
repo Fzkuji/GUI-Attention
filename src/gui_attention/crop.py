@@ -1,6 +1,5 @@
 """Image cropping and coordinate helpers."""
 
-import math
 from PIL import Image
 
 

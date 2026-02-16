@@ -1,110 +1,75 @@
-"""Multi-precision foveation loop.
+"""Saccade foveation loop.
 
-Progressively zooms into the image by tracking which precision level
-the model attends to, and adding higher-resolution crops as needed.
+Simulates human eye: peripheral vision (low-res full image) + foveal vision
+(high-res crop at one focus point). The focus point can move (saccade).
 
 Algorithm:
-    1. Start with full image at Level 0 (low precision).
-    2. Extract pointer attention over ALL visual tokens (across all images).
-    3. Find max-attended token → identify image (level) and spatial location.
-    4. If attended level >= STOP threshold → final prediction.
-    5. Otherwise, crop around attended location, add at next precision level.
-       If the same area was already visited at this level, skip a level.
-    6. Repeat until stop or max rounds.
+    Round 0: [low-res full image] → action head → attention → select focus
+    Round 1+: [low-res full (masked)] + [high-res crop] → action head
+              → argmax in high-res → click (done)
+              → argmax in low-res → saccade (move focus, next round)
+    Stop: argmax in high-res, or max_rounds reached.
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from gui_attention.constants import STOP_LEVELS, PRECISION_LEVELS
-
 
 @dataclass
-class FoveationState:
-    """Tracks the state of one foveation trajectory."""
-    # Each entry: (global_x, global_y, level) for images added to context
-    history: List[Tuple[float, float, int]] = field(default_factory=list)
-    # Visited points: rounded coords → highest level seen
-    visited: dict = field(default_factory=dict)
+class SaccadeState:
+    """Tracks the state of one saccade trajectory."""
+    history: List[Tuple[float, float, str]] = field(default_factory=list)
     stopped: bool = False
     final_coords: Optional[Tuple[float, float]] = None
 
-    def _round_key(self, x: float, y: float, tolerance: float = 0.05) -> Tuple[int, int]:
-        """Quantise coordinates for 'already visited' matching."""
-        return (round(x / tolerance), round(y / tolerance))
+    def record(self, x: float, y: float, source: str):
+        """Record a fixation point. source is 'low' or 'high'."""
+        self.history.append((x, y, source))
 
 
-class FoveationLoop:
-    """Manages the progressive zoom decision logic."""
+class SaccadeLoop:
+    """Manages the saccade decision logic."""
 
-    def __init__(self, max_rounds: int = 5, crop_ratio: float = 0.3,
-                 stop_levels: Optional[set] = None,
-                 max_level: int = 3):
+    def __init__(self, max_rounds: int = 3, crop_ratio: float = 0.3):
         self.max_rounds = max_rounds
         self.crop_ratio = crop_ratio
-        self.stop_levels = stop_levels or STOP_LEVELS
-        self.max_level = max_level
 
-    def new_state(self) -> FoveationState:
-        return FoveationState()
+    def new_state(self) -> SaccadeState:
+        return SaccadeState()
 
-    def decide(self, state: FoveationState, attended_level: int,
-               global_x: float, global_y: float) -> dict:
-        """Given where the model attended, decide the next action.
+    def decide_round0(self, state: SaccadeState, global_x: float, global_y: float) -> dict:
+        """After round 0 (low-res only), always crop around the attended point.
+
+        Returns:
+            dict with action="crop", coords=(x, y).
+        """
+        state.record(global_x, global_y, "low")
+        state.final_coords = (global_x, global_y)
+        return {"action": "crop", "coords": (global_x, global_y)}
+
+    def decide_saccade(self, state: SaccadeState, attended_source: str,
+                       global_x: float, global_y: float) -> dict:
+        """After round 1+, decide whether to click or saccade.
 
         Args:
-            state: current foveation state.
-            attended_level: precision level of the image containing the max-attended token.
+            attended_source: 'high' if argmax was in the high-res crop,
+                             'low' if argmax was in the (unmasked) low-res patches.
             global_x, global_y: attended point in original image normalised coords.
 
         Returns:
-            dict with:
-                action: "stop" | "crop"
-                level: (for "crop") precision level for the new crop
-                coords: (global_x, global_y) of the attended point
+            dict with action="stop" (click) or action="saccade" (move focus).
         """
-        state.history.append((global_x, global_y, attended_level))
-
-        # Stop condition 1: attended to high/ultra-high precision
-        if attended_level in self.stop_levels:
-            state.stopped = True
-            state.final_coords = (global_x, global_y)
-            return {"action": "stop", "coords": (global_x, global_y)}
-
-        # Determine next level
-        next_level = attended_level + 1
-
-        # Skip logic: if this area was already visited at this level, jump +2
-        key = state._round_key(global_x, global_y)
-        prev_level = state.visited.get(key)
-        if prev_level is not None and prev_level >= attended_level:
-            next_level = attended_level + 2
-
-        # Clamp to max level
-        next_level = min(next_level, self.max_level)
-
-        # Stop condition 2: next level would exceed max
-        if next_level > self.max_level:
-            state.stopped = True
-            state.final_coords = (global_x, global_y)
-            return {"action": "stop", "coords": (global_x, global_y)}
-
-        # Stop condition 3: next level is itself a stop level
-        if next_level in self.stop_levels:
-            # Still add the crop, but this will be the last round
-            pass
-
-        state.visited[key] = next_level
+        state.record(global_x, global_y, attended_source)
         state.final_coords = (global_x, global_y)
 
-        return {
-            "action": "crop",
-            "level": next_level,
-            "coords": (global_x, global_y),
-        }
+        if attended_source == "high":
+            state.stopped = True
+            return {"action": "stop", "coords": (global_x, global_y)}
+        else:
+            # Saccade: move focus to new location
+            return {"action": "saccade", "coords": (global_x, global_y)}
 
-    def should_continue(self, state: FoveationState, current_round: int) -> bool:
-        """Check if we should run another round."""
+    def should_continue(self, state: SaccadeState, current_round: int) -> bool:
         if state.stopped:
             return False
         if current_round >= self.max_rounds:

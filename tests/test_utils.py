@@ -1,17 +1,16 @@
 """
-Unit tests for GUI-Attention utility functions.
+Unit tests for GUI-Attention v4 utility functions.
 
-Tests the core helper functions that don't depend on gui_aima or model weights.
+Tests the core helper functions that don't depend on model weights.
 Run with: python -m pytest tests/test_utils.py -v
 """
 
 import math
+
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
-
-# ── Test crop_image ──────────────────────────────────────────────────────────
+# -- Test crop_image ----------------------------------------------------------
 
 def test_crop_image_center():
     from gui_attention.crop import crop_image
@@ -40,7 +39,7 @@ def test_crop_image_bottom_right():
     assert abs(bbox[3] - 1.0) < 0.01
 
 
-# ── Test get_patch_bbox ──────────────────────────────────────────────────────
+# -- Test get_patch_bbox ------------------------------------------------------
 
 def test_get_patch_bbox_center():
     from gui_attention.crop import get_patch_bbox
@@ -60,7 +59,7 @@ def test_get_patch_bbox_edge():
     assert bbox == (0.9, 0.9, 1.0, 1.0)
 
 
-# ── Test point_in_bbox ───────────────────────────────────────────────────────
+# -- Test point_in_bbox -------------------------------------------------------
 
 def test_point_in_bbox():
     from gui_attention.crop import point_in_bbox
@@ -69,36 +68,7 @@ def test_point_in_bbox():
     assert point_in_bbox(0.0, 0.0, (0.0, 0.0, 1.0, 1.0))
 
 
-# ── Test position_reward ─────────────────────────────────────────────────────
-
-def _position_reward(pred_x, pred_y, bbox_gt, img_w, img_h):
-    gt_cx = (bbox_gt[0] + bbox_gt[2]) / 2
-    gt_cy = (bbox_gt[1] + bbox_gt[3]) / 2
-    dist_px = math.sqrt(((pred_x - gt_cx) * img_w) ** 2 +
-                        ((pred_y - gt_cy) * img_h) ** 2)
-    bbox_diag = max(math.sqrt(((bbox_gt[2] - bbox_gt[0]) * img_w) ** 2 +
-                              ((bbox_gt[3] - bbox_gt[1]) * img_h) ** 2), 1.0)
-    return 1.0 / (dist_px / bbox_diag + 1.0)
-
-
-def test_position_reward_perfect():
-    r = _position_reward(0.5, 0.5, [0.4, 0.4, 0.6, 0.6], 1920, 1080)
-    assert r > 0.99
-
-
-def test_position_reward_far():
-    r = _position_reward(0.0, 0.0, [0.8, 0.8, 1.0, 1.0], 1920, 1080)
-    assert r < 0.2
-
-
-def test_position_reward_monotonic():
-    bbox = [0.4, 0.4, 0.6, 0.6]
-    r_close = _position_reward(0.48, 0.48, bbox, 1920, 1080)
-    r_far = _position_reward(0.1, 0.1, bbox, 1920, 1080)
-    assert r_close > r_far
-
-
-# ── Test sample_from_attention ───────────────────────────────────────────────
+# -- Test sample_from_attention -----------------------------------------------
 
 def test_sample_from_attention_range():
     from gui_attention.sampling import sample_from_attention
@@ -140,7 +110,7 @@ def test_sample_from_attention_temperature():
     assert hits > 45, f"Expected mostly idx=12 with low temp, got {hits}/50"
 
 
-# ── Test compute_round_log_prob ──────────────────────────────────────────────
+# -- Test compute_round_log_prob ----------------------------------------------
 
 def test_compute_round_log_prob_peaked():
     from gui_attention.sampling import compute_round_log_prob
@@ -158,7 +128,7 @@ def test_compute_round_log_prob_uniform():
     assert abs(lp.item() - (-math.log(n))) < 0.01
 
 
-# ── Test argmax_prediction ───────────────────────────────────────────────────
+# -- Test argmax_prediction ---------------------------------------------------
 
 def test_argmax_prediction():
     from gui_attention.sampling import argmax_prediction
@@ -178,7 +148,7 @@ def test_argmax_prediction_corner():
     assert abs(y - 0.1) < 0.01
 
 
-# ── Test find_image_visual_ranges ────────────────────────────────────────────
+# -- Test find_image_visual_ranges -------------------------------------------
 
 def test_find_image_visual_ranges():
     from gui_attention.attention import find_image_visual_ranges
@@ -198,7 +168,7 @@ def test_find_image_visual_ranges_trailing():
     assert ranges[0] == (2, 4)
 
 
-# ── Test find_nth_pointer_pad ────────────────────────────────────────────────
+# -- Test find_nth_pointer_pad ------------------------------------------------
 
 def test_find_nth_pointer_pad():
     from gui_attention.attention import find_nth_pointer_pad
@@ -209,44 +179,69 @@ def test_find_nth_pointer_pad():
     assert find_nth_pointer_pad(ids, PP_TOK, 2) is None
 
 
-# ── Test precision_for_level ─────────────────────────────────────────────────
+# -- Test resolution constants ------------------------------------------------
 
-def test_precision_for_level():
-    from gui_attention.constants import precision_for_level, PRECISION_LEVELS
-    assert precision_for_level(0) == PRECISION_LEVELS[0]
-    assert precision_for_level(1) == PRECISION_LEVELS[1]
-    assert precision_for_level(3) == PRECISION_LEVELS[3]
-    # Clamped
-    assert precision_for_level(99) == PRECISION_LEVELS[3]
+def test_resolution_constants():
+    from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
+    assert LOW_RES_MAX_PIXELS == 1_003_520
+    assert HIGH_RES_MAX_PIXELS == 5_720_064
+    assert LOW_RES_MAX_PIXELS < HIGH_RES_MAX_PIXELS
 
 
-# ── Test FoveationState ──────────────────────────────────────────────────────
+# -- Test SaccadeLoop ---------------------------------------------------------
 
-def test_foveation_state_round_key():
-    from gui_attention.foveation import FoveationState
-    state = FoveationState()
-    k1 = state._round_key(0.51, 0.49)
-    k2 = state._round_key(0.52, 0.48)
-    assert k1 == k2, "Close points should map to same key"
-
-    k3 = state._round_key(0.8, 0.2)
-    assert k1 != k3, "Distant points should map to different keys"
+def test_saccade_round0():
+    from gui_attention.foveation import SaccadeLoop
+    loop = SaccadeLoop(max_rounds=3)
+    state = loop.new_state()
+    d = loop.decide_round0(state, 0.5, 0.5)
+    assert d["action"] == "crop"
+    assert d["coords"] == (0.5, 0.5)
 
 
-# ── Test identify_attended_image ─────────────────────────────────────────────
+def test_saccade_stop_on_high():
+    from gui_attention.foveation import SaccadeLoop
+    loop = SaccadeLoop(max_rounds=3)
+    state = loop.new_state()
+    loop.decide_round0(state, 0.5, 0.5)
+    d = loop.decide_saccade(state, "high", 0.5, 0.5)
+    assert d["action"] == "stop"
+    assert state.stopped
+
+
+def test_saccade_move_on_low():
+    from gui_attention.foveation import SaccadeLoop
+    loop = SaccadeLoop(max_rounds=3)
+    state = loop.new_state()
+    loop.decide_round0(state, 0.5, 0.5)
+    d = loop.decide_saccade(state, "low", 0.3, 0.3)
+    assert d["action"] == "saccade"
+    assert not state.stopped
+
+
+def test_saccade_max_rounds():
+    from gui_attention.foveation import SaccadeLoop
+    loop = SaccadeLoop(max_rounds=2)
+    state = loop.new_state()
+    assert loop.should_continue(state, 0)
+    assert loop.should_continue(state, 1)
+    assert not loop.should_continue(state, 2)
+
+
+# -- Test identify_attended_image ---------------------------------------------
 
 def test_identify_attended_image():
     from gui_attention.attention import identify_attended_image
     attn = torch.zeros(30)
     attn[15] = 1.0
-    # 3 images: 10, 10, 10 tokens
-    ranges = [(0, 10), (10, 20), (20, 30)]
+    # (offset, n_tokens) format
+    ranges = [(0, 10), (10, 10), (20, 10)]
     img_idx, local = identify_attended_image(attn, ranges)
     assert img_idx == 1
     assert local == 5
 
 
-# ── Test token_to_spatial ────────────────────────────────────────────────────
+# -- Test token_to_spatial ----------------------------------------------------
 
 def test_token_to_spatial():
     from gui_attention.attention import token_to_spatial
@@ -259,7 +254,69 @@ def test_token_to_spatial():
     assert abs(y - 0.55) < 0.01
 
 
-# ── Test metrics truncation ──────────────────────────────────────────────────
+# -- Test ActionHead ----------------------------------------------------------
+
+def test_action_head_shapes():
+    from gui_attention.action_head import ActionHead
+    head = ActionHead(d_model=64, projection_dim=64)
+    vis = torch.randn(50, 64)
+    anchor = torch.randn(1, 64)
+    attn, loss = head(vis, anchor)
+    assert attn.shape == (1, 50)
+    assert loss is None
+    assert abs(attn.sum().item() - 1.0) < 1e-5
+
+
+def test_action_head_with_labels():
+    from gui_attention.action_head import ActionHead
+    head = ActionHead(d_model=64)
+    vis = torch.randn(50, 64)
+    anchor = torch.randn(1, 64)
+    labels = torch.zeros(1, 50)
+    labels[0, 20:25] = 1.0
+    attn, loss = head(vis, anchor, labels=labels)
+    assert loss is not None
+    assert loss.item() > 0
+
+
+def test_action_head_masking():
+    from gui_attention.action_head import ActionHead
+    head = ActionHead(d_model=64)
+    vis = torch.randn(50, 64)
+    anchor = torch.randn(1, 64)
+    mask = torch.zeros(50, dtype=torch.bool)
+    mask[10:20] = True
+    attn, _ = head(vis, anchor, mask=mask)
+    assert attn[0, mask].sum().item() < 1e-6
+
+
+# -- Test binary labels -------------------------------------------------------
+
+def test_binary_labels_overlap():
+    from gui_attention.labels import compute_binary_labels
+    labels = compute_binary_labels(10, 10, (0.3, 0.3, 0.6, 0.6))
+    assert labels.shape == (100,)
+    assert labels.sum() > 0
+    assert labels.max() == 1.0
+    assert labels.min() == 0.0
+
+
+def test_binary_labels_fallback():
+    from gui_attention.labels import compute_binary_labels
+    # Tiny bbox that might not overlap any patch center
+    labels = compute_binary_labels(2, 2, (0.001, 0.001, 0.002, 0.002))
+    assert labels.sum() >= 1.0  # Fallback should set at least one patch
+
+
+def test_overlap_mask():
+    from gui_attention.labels import compute_overlap_mask
+    mask = compute_overlap_mask(10, 10, (0.2, 0.2, 0.5, 0.5))
+    assert mask.dtype == torch.bool
+    assert mask.shape == (100,)
+    assert mask.sum() > 0
+
+
+# -- Test metrics truncation --------------------------------------------------
 
 def test_metrics_truncation():
     from collections import defaultdict
