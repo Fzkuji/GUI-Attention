@@ -154,8 +154,11 @@ class SaccadeTrainer:
             high_res_max_pixels=script_args.high_res_max_pixels,
         )
 
+        # Determine world_size early for total_steps calculation
+        ws = dist.get_world_size() if dist.is_initialized() else 1
         total_steps = (
             int(args.num_train_epochs) * len(train_data)
+            // ws
             // max(args.per_device_train_batch_size, 1)
             // max(args.gradient_accumulation_steps, 1)
         )
@@ -174,6 +177,13 @@ class SaccadeTrainer:
         else:
             self.model = model
             self.model_engine = None
+            # Detect distributed (torchrun)
+            if dist.is_initialized():
+                self.rank = dist.get_rank()
+                self.world_size = dist.get_world_size()
+            else:
+                self.rank = 0
+                self.world_size = 1
             # Dual LR: action_head gets higher LR, LoRA gets lower LR
             action_head_params = list(model.action_head.parameters())
             backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -187,8 +197,7 @@ class SaccadeTrainer:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=max(total_steps, 1), eta_min=1e-7,
             )
-            self.rank = 0
-            self.world_size = 1
+
 
         self.metrics = defaultdict(list)
         self.global_step = 0
@@ -452,14 +461,16 @@ class SaccadeTrainer:
             print(f"  action_head_lr={self.sa.action_head_lr}  lora_lr={self.sa.lora_lr}")
             print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
             print(f"  lora_targets={self.sa.lora_target_modules}")
-            print(f"  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
+            print(f"  world_size={self.world_size}  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
 
         if not self.use_deepspeed:
             self.optimizer.zero_grad()
         micro = 0
 
         for epoch in range(epochs):
-            random.shuffle(self.train_data)
+            # Deterministic shuffle: same order across all ranks for correct sharding
+            epoch_rng = random.Random(42 + epoch)
+            epoch_rng.shuffle(self.train_data)
             if self.world_size > 1:
                 shard = self.train_data[self.rank::self.world_size]
             else:
@@ -473,6 +484,11 @@ class SaccadeTrainer:
                     self.model_engine.step()
                     self.global_step += 1
                 elif micro % ga == 0:
+                    # Sync gradients across GPUs before optimizer step
+                    if self.world_size > 1:
+                        for p in self.model.parameters():
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                     if any(p.grad is not None for p in self.model.parameters()):
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                         self.optimizer.step()
@@ -510,6 +526,8 @@ class SaccadeTrainer:
             print(f"Done. Saved to {self.args.output_dir}")
 
     def _save(self, name):
+        if self.world_size > 1:
+            dist.barrier()
         if self.rank != 0:
             return
         p = os.path.join(self.args.output_dir, name)
@@ -524,10 +542,19 @@ class SaccadeTrainer:
 # -- Main --------------------------------------------------------------------
 
 def main():
+    # Distributed setup (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
     parser = transformers.HfArgumentParser((ScriptArgs, TrainArgs))
     sa, ta = parser.parse_args_into_dataclasses()
 
-    print(f"Building model: {sa.model_name_or_path}")
+    if rank == 0:
+        print(f"Building model: {sa.model_name_or_path}")
     model, tokenizer, processor = build_model(
         sa.model_name_or_path,
         lora_r=sa.lora_r,
@@ -538,13 +565,16 @@ def main():
     )
 
     if not (HAS_DEEPSPEED and ta.deepspeed):
-        model.to("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(f"cuda:{local_rank}")
 
     train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples)
     os.makedirs(ta.output_dir, exist_ok=True)
 
     trainer = SaccadeTrainer(model, tokenizer, train_data, ta, sa)
     trainer.train()
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
