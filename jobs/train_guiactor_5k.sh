@@ -14,10 +14,11 @@ export PYTHONUNBUFFERED=1
 set -e  # stop if any stage fails
 
 DATA_YAML=/home/zichuanfu2/GUI-Actor/data/guiact_5k_config.yaml
+DS_CONFIG=/home/zichuanfu2/GUI-Actor/scripts/zero3.json
 
 # ===== Stage 1: Warmup (pointer head only) =====
 echo "====== Stage 1: Warmup ======"
-CUDA_VISIBLE_DEVICES="0" python3 train.py \
+CUDA_VISIBLE_DEVICES="0" torchrun --nproc_per_node=1 --master_port=29500 train.py \
     --data_path "$DATA_YAML" \
     --image_folder "" \
     --model_type qwen25vl \
@@ -51,7 +52,8 @@ CUDA_VISIBLE_DEVICES="0" python3 train.py \
     --unfreeze_visual False \
     --pointer_loss_weight 1.0 \
     --lm_loss_weight -1.0 \
-    --report_to none
+    --report_to none \
+    --deepspeed "$DS_CONFIG"
 
 echo "====== Stage 1 Done ======"
 
@@ -65,7 +67,7 @@ if [ -z "$WARMUP_CKPT" ]; then
 fi
 echo "Using warmup checkpoint: $WARMUP_CKPT"
 
-CUDA_VISIBLE_DEVICES="0" python3 train.py \
+CUDA_VISIBLE_DEVICES="0" torchrun --nproc_per_node=1 --master_port=29500 train.py \
     --data_path "$DATA_YAML" \
     --image_folder "" \
     --model_type qwen25vl \
@@ -99,6 +101,7 @@ CUDA_VISIBLE_DEVICES="0" python3 train.py \
     --unfreeze_visual False \
     --pointer_loss_weight 1.0 \
     --lm_loss_weight 1.0 \
-    --report_to none
+    --report_to none \
+    --deepspeed "$DS_CONFIG"
 
 echo "====== Stage 2 Done ======"
