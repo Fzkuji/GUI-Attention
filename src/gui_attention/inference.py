@@ -163,6 +163,9 @@ def run_saccade_inference(
     final_point = (focus_x, focus_y)
 
     # Subsequent rounds
+    cumulative_low_mask = None  # tracks all crop-covered low-res patches
+    total_vis_tokens = vis_hidden.shape[0] if vis_hidden is not None else 0
+
     for ri in range(1, max_rounds):
         if not saccade.should_continue(state, ri):
             break
@@ -195,12 +198,19 @@ def run_saccade_inference(
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
         nh_low, nw_low = grid_dims[0]
 
-        # Mask low-res patches covered by crop
-        low_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
+        # Cumulative mask: low-res patches covered by ANY crop so far
+        this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox)
+        if cumulative_low_mask is None:
+            cumulative_low_mask = this_crop_mask
+        else:
+            cumulative_low_mask = cumulative_low_mask | this_crop_mask
+
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-        full_mask[:n_low] = low_mask
+        full_mask[:n_low] = cumulative_low_mask.to(device)
+
+        total_vis_tokens = n_total
 
         attn_ri, _ = model.action_head(vis_hidden, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
@@ -236,4 +246,5 @@ def run_saccade_inference(
         "n_width": nw_final,
         "n_height": nh_final,
         "num_rounds": len(state.history),
+        "total_vis_tokens": total_vis_tokens,
     }

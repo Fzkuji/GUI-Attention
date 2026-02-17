@@ -186,6 +186,7 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
         ele["pred_x"] = px
         ele["pred_y"] = py
         ele["num_rounds"] = pred.get("num_rounds", 1)
+        ele["total_vis_tokens"] = pred.get("total_vis_tokens", 0)
 
         results.append(ele)
 
@@ -291,6 +292,12 @@ def main():
             nr = r.get("num_rounds", 1)
             round_counts[nr] = round_counts.get(nr, 0) + 1
         print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+
+        # Token usage stats
+        token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
+        if token_counts:
+            avg_tokens = sum(token_counts) / len(token_counts)
+            print(f"Avg visual tokens (final round): {avg_tokens:.0f}")
 
     # Compute metrics
     if not os.path.exists(metric_path):

@@ -11,6 +11,7 @@ conda activate fzc-guiattn
 
 cd /home/zichuanfu2/GUI-Actor
 export PYTHONUNBUFFERED=1
+set -e  # stop if any stage fails
 
 DATA_YAML=/home/zichuanfu2/GUI-Actor/data/guiact_5k_config.yaml
 
@@ -49,7 +50,8 @@ CUDA_VISIBLE_DEVICES="0" python3 train.py \
     --unfreeze_new_tokens True \
     --unfreeze_visual False \
     --pointer_loss_weight 1.0 \
-    --lm_loss_weight -1.0
+    --lm_loss_weight -1.0 \
+    --report_to none
 
 echo "====== Stage 1 Done ======"
 
@@ -96,6 +98,7 @@ CUDA_VISIBLE_DEVICES="0" python3 train.py \
     --unfreeze_new_tokens False \
     --unfreeze_visual False \
     --pointer_loss_weight 1.0 \
-    --lm_loss_weight 1.0
+    --lm_loss_weight 1.0 \
+    --report_to none
 
 echo "====== Stage 2 Done ======"
