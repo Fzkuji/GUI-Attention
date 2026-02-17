@@ -44,10 +44,11 @@ CUDA_VISIBLE_DEVICES="0" python3 /home/zichuanfu2/GUI-Attention/eval/time_gui_ac
 echo "====== Eval: Ours v4 single-round ======"
 cd /home/zichuanfu2/GUI-Attention
 
-# Find latest our checkpoint
-OURS_CKPT=$(ls -d /home/zichuanfu2/results/ours_v4_5k/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
-if [ -z "$OURS_CKPT" ]; then
+# Use final checkpoint (full training), fall back to latest intermediate
+if [ -d /home/zichuanfu2/results/ours_v4_5k/final ]; then
     OURS_CKPT=/home/zichuanfu2/results/ours_v4_5k/final
+else
+    OURS_CKPT=$(ls -d /home/zichuanfu2/results/ours_v4_5k/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
 fi
 echo "Our checkpoint: $OURS_CKPT"
 
