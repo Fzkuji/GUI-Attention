@@ -1,25 +1,58 @@
 # GUI-Attention
 
-**From Efficient Grounding to Efficient Agent: Foveated Visual Attention for GUI Understanding**
+**Saccade Foveation for Efficient GUI Grounding**
 
-<p align="center">
-  <img src="assets/images/overview.png" width="90%">
-</p>
+## Overview
 
-## 🔥 Highlights
+GUI-Attention introduces a **saccade foveation** mechanism for GUI element grounding, inspired by human eye movement. Instead of processing screenshots at uniform high resolution (expensive, ~7,000+ visual tokens) or using multi-step zoom-in pipelines (slow), we use:
 
-- **Single-pass foveated grounding** — replaces multi-step zoom-in with human-vision-inspired multi-resolution processing
-- **5x token reduction** — from ~18,800 to ~5,000 visual tokens without accuracy loss
-- **Plug-and-play** — compatible with mainstream VLM backbones (Qwen2.5-VL, etc.)
-- **State-of-the-art** on ScreenSpot-Pro, ScreenSpot-V2, and OSWorld benchmarks
+- **Peripheral vision**: low-resolution full image (~1,300 patches) for coarse localization
+- **Foveal vision**: one high-resolution crop (~2,000 patches) at the attention focus
+- **Saccade**: the focus point moves across rounds if needed
 
-## 📋 Overview
+This gives comparable accuracy to full-resolution methods while using **2-4x fewer visual tokens** and being **2.5x faster**.
 
-GUI-Attention introduces a foveated visual attention mechanism for GUI grounding that mimics human visual perception. Instead of processing the entire screen at uniform high resolution (expensive) or using multi-step zoom-in pipelines (slow), we apply a single-pass multi-resolution scheme: high resolution at the attention focus, progressively lower resolution in the periphery.
+### Key Differences from GUI-Actor
 
-## 🚀 Quick Start
+| | GUI-Actor | Ours |
+|---|---|---|
+| Visual features | Vision encoder embeddings (pre-LLM) | LLM last-layer hidden states (post-LLM, text-aware) |
+| Action head | Self-Attn + MLP_V + MLP_T | MLP_V + MLP_T (no self-attn needed) |
+| Backbone training | Full fine-tune (two-stage) | LoRA (single-stage) |
+| Inference | Single image, single round | Multi-round saccade foveation |
+| Resolution | Uniform high-res (~5.7M pixels) | Low-res full + high-res crop |
 
-### Installation
+## Architecture
+
+```
+Round 0: [low-res full image ~1,300 patches] [instruction] [anchor]
+         -> LLM -> last-layer hidden states -> ActionHead -> attention
+         -> select focus point
+
+Round 1: [low-res full (focus area masked)] + [high-res crop ~2,000 patches]
+         -> LLM -> ActionHead (with mask)
+         -> argmax in high-res patch -> CLICK (target found)
+         -> argmax in low-res patch -> SACCADE (move focus, next round)
+
+Round 2: [low-res + new high-res crop] -> repeat...
+
+Stop: argmax in high-res, or max_rounds reached
+```
+
+Token budget stays constant: ~3,300-4,300 per round (vs GUI-Actor's ~7,000+).
+
+## Results (ScreenSpot-Pro, 5K training data)
+
+| Method | hit@1 | overlap@1 | Avg time | Visual tokens |
+|--------|-------|-----------|----------|---------------|
+| GUI-Actor 5K SFT | 20.75% | 27.07% | 1.80s | ~7,000 |
+| Ours single-round | 7.15% | 19.04% | 0.43s | ~1,300 |
+| **Ours saccade 3 rounds** | **21.13%** | **36.50%** | **0.72s** | **~1,900 avg** |
+
+- 97.3% of samples finish in 2 rounds, 2.7% need 3 rounds
+- Both methods trained on the same 5K GUIAct subset for fair comparison
+
+## Installation
 
 ```bash
 conda create -n gui-attention python=3.11
@@ -27,102 +60,83 @@ conda activate gui-attention
 pip install -e .
 ```
 
-Requires [GUI-AIMA](https://github.com/HeimingX/GUI-AIMA) source on `PYTHONPATH` (the scripts handle this automatically).
+No external dependencies on GUI-AIMA or GUI-Actor source code (fully self-contained).
 
-### Training
-
-Two-stage pipeline: SFT warm-up → GRPO reinforcement.
-
-**Stage 1 — SFT** (teacher-forcing with GT coordinates):
+## Training
 
 ```bash
-bash scripts/train_sft.sh          # default: 2 rounds
-bash scripts/train_sft.sh 3        # override max_rounds
+python -m gui_attention.train \
+    --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
+    --data_path /path/to/guiact_5k_seed42.json \
+    --image_folder /path/to/GUIAct/web_imgs \
+    --output_dir /path/to/output \
+    --crop_ratio 0.3 --max_saccade_rounds 3 \
+    --lora_r 32 --lora_alpha 64 \
+    --action_head_lr 1e-4 --lora_lr 5e-5 \
+    --per_device_train_batch_size 1 --gradient_accumulation_steps 4 \
+    --num_train_epochs 1 --bf16 true
 ```
 
-**Stage 2 — GRPO** (policy gradient with sampled trajectories):
+See `jobs/train_ours_5k.sh` for a complete example.
+
+## Evaluation
 
 ```bash
-bash scripts/train_grpo.sh                           # from base model
-bash scripts/train_grpo.sh /path/to/sft/checkpoint   # from SFT checkpoint
+# Single-round (no saccade)
+python eval/eval_screenspot_pro_aligned.py \
+    --checkpoint /path/to/checkpoint \
+    --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+    --data_path /path/to/ScreenSpot-Pro \
+    --rounds 1
+
+# Multi-round saccade
+python eval/eval_screenspot_pro_aligned.py \
+    --checkpoint /path/to/checkpoint \
+    --base_model Qwen/Qwen2.5-VL-3B-Instruct \
+    --data_path /path/to/ScreenSpot-Pro \
+    --rounds 3 --crop_ratio 0.3
 ```
 
-All scripts use `BASE_DIR` at the top for path configuration. Modify it for your environment.
+See `jobs/eval_comparison.sh` for the full comparison pipeline.
 
-### Evaluation
-
-**Single configuration:**
-
-```bash
-# Standard eval (GUI-AIMA inference pipeline)
-bash scripts/eval_standard.sh /path/to/model
-
-# Aligned eval (matches training: attention extraction → crop → predict)
-bash scripts/eval_aligned.sh /path/to/model
-
-# Override parameters via environment variables
-ROUNDS=3 PRED=argmax bash scripts/eval_aligned.sh /path/to/model
-```
-
-**Full evaluation suite** (6 configs: baselines + ablations):
-
-```bash
-bash scripts/eval_all.sh /path/to/model
-MAX_SAMPLES=50 bash scripts/eval_all.sh /path/to/model   # quick test
-```
-
-### Tests
+## Tests
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 GUI-Attention/
-├── src/gui_attention/              # Core package (pip install -e .)
-│   ├── train.py                    # Training entry point (SFT + GRPO)
-│   ├── constants.py                # Precision levels, placeholder tokens
-│   ├── attention.py                # Attention extraction (QK-recompute)
-│   ├── sampling.py                 # Sample / argmax / region prediction
-│   ├── crop.py                     # Image crop & coordinate helpers
-│   └── builder.py                  # Multi-round conversation tokenizer
-├── eval/                           # Evaluation scripts
-│   ├── eval_screenspot_pro.py      # Standard eval (GUI-AIMA pipeline)
-│   └── eval_screenspot_pro_aligned.py  # Aligned eval (our pipeline)
-├── scripts/                        # Shell scripts
-│   ├── train_sft.sh / train_grpo.sh
-│   ├── eval_standard.sh / eval_aligned.sh / eval_all.sh
-│   └── convert_screenspot_to_gta.py
-└── tests/                          # Unit tests (28 tests)
+├── src/gui_attention/
+│   ├── train.py           # SaccadeTrainer: multi-round training with model's own predictions
+│   ├── model.py           # Qwen25VLWithActionHead: backbone + LoRA + ActionHead
+│   ├── action_head.py     # ActionHead: MLP_V + MLP_T + scaled dot product + KL loss
+│   ├── inference.py       # BFS region prediction + multi-round saccade inference
+│   ├── builder.py         # MultiRoundInputBuilder: tokenizes multi-image conversations
+│   ├── foveation.py       # SaccadeLoop: round decisions (crop / saccade / stop)
+│   ├── attention.py       # Hidden state extraction from LLM last layer
+│   ├── labels.py          # Binary overlap labels + overlap masking
+│   ├── constants.py       # Pointer tokens, resolution levels, chat template
+│   ├── crop.py            # Image cropping utilities
+│   └── sampling.py        # Attention sampling / argmax prediction
+├── eval/
+│   ├── eval_screenspot_pro_aligned.py   # ScreenSpot-Pro evaluation
+│   └── time_gui_actor.py               # GUI-Actor inference timing
+├── jobs/                  # SLURM job scripts
+│   ├── train_ours_5k.sh   # Train our method on 5K subset
+│   ├── train_guiactor_5k.sh  # Train GUI-Actor baseline
+│   ├── eval_comparison.sh    # Run all evaluations
+│   └── ...
+└── tests/                 # Unit tests (43 tests)
 ```
 
-## 📊 Results
+## Related Projects
 
-| Method | Backbone | ScreenSpot-Pro | Tokens | Latency |
-|--------|----------|----------------|--------|---------|
-| GUI-AIMA (2-step) | Qwen2.5-VL-3B | 59.6% | ~18,800 | 2x |
-| RegionFocus | Qwen2.5-VL-72B | 61.6% | ~75,000 | 3-5x |
-| **GUI-Attention** | Qwen2.5-VL-3B | **TBD** | **~5,000** | **1x** |
+- [GUI-Actor](https://github.com/cckevinn/GUI-Actor) (NeurIPS 2025) — Action head architecture baseline
+- [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) — Vision-language backbone
 
-## 🔗 Related Projects
+## License
 
-- [GUI-AIMA](https://github.com/HeimingX/GUI-AIMA) — Attention-Informed Multi-grained Anchor for GUI grounding
-- [RegionFocus](https://github.com/tiangeluo/RegionFocus) — Visual test-time scaling for GUI grounding
-- [CoACT-1](https://github.com/SalesforceAIResearch/CoAct-1) — Collaborative Agent framework
-
-## 📄 Citation
-
-```bibtex
-@inproceedings{fu2026guiattention,
-  title={From Efficient Grounding to Efficient Agent: Foveated Visual Attention for GUI Understanding},
-  author={Fu, Zichuan and others},
-  booktitle={NeurIPS},
-  year={2026}
-}
-```
-
-## 📜 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Apache License 2.0
