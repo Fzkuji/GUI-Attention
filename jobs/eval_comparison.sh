@@ -32,6 +32,14 @@ CUDA_VISIBLE_DEVICES="0" python3 eval/screenSpot_pro.py \
     --resize_to_pixels 5760000 \
     --topk 3
 
+# ===== 1b. Time GUI-Actor inference =====
+echo "====== Timing: GUI-Actor ======"
+CUDA_VISIBLE_DEVICES="0" python3 /home/zichuanfu2/GUI-Attention/eval/time_gui_actor.py \
+    --model_name_or_path "$GUIACTOR_CKPT" \
+    --data_path "$DATA" \
+    --save_path /home/zichuanfu2/results/eval_guiactor_5k \
+    --resize_to_pixels 5760000
+
 # ===== 2. Eval Ours v4: single-round =====
 echo "====== Eval: Ours v4 single-round ======"
 cd /home/zichuanfu2/GUI-Attention

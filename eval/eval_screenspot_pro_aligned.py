@@ -155,12 +155,14 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
         image = Image.open(image_path).convert("RGB")
         gt_bbox = ele["bbox_x1y1x2y2"]
 
+        t_start = time.time()
         pred = run_saccade_inference(
             image, image_path, example["instruction"],
             model, tokenizer, builder,
             max_rounds=args.rounds, crop_ratio=args.crop_ratio,
             device=str(device),
         )
+        t_elapsed = time.time() - t_start
 
         topk_points = pred["topk_points"]
         if not topk_points:
@@ -187,6 +189,7 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
         ele["pred_y"] = py
         ele["num_rounds"] = pred.get("num_rounds", 1)
         ele["total_vis_tokens"] = pred.get("total_vis_tokens", 0)
+        ele["inference_time"] = t_elapsed
 
         results.append(ele)
 
@@ -298,6 +301,13 @@ def main():
         if token_counts:
             avg_tokens = sum(token_counts) / len(token_counts)
             print(f"Avg visual tokens (final round): {avg_tokens:.0f}")
+
+        # Inference time stats
+        times = [r.get("inference_time", 0) for r in results if r.get("inference_time", 0) > 0]
+        if times:
+            avg_time = sum(times) / len(times)
+            print(f"Avg inference time: {avg_time:.3f}s/sample")
+            print(f"Min/Max inference time: {min(times):.3f}s / {max(times):.3f}s")
 
     # Compute metrics
     if not os.path.exists(metric_path):
