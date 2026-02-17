@@ -225,7 +225,6 @@ class SaccadeTrainer:
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         n_valid = 0
         round_preds = []
-        cumulative_low_mask = None  # tracks all crop-covered low-res patches
 
         # ===== Round 0: low-res full image =====
         r0_inputs, cur_text, cur_images = self.builder.build_round0(
@@ -266,6 +265,8 @@ class SaccadeTrainer:
             round_preds.append((pred_x, pred_y))
 
         # ===== Subsequent rounds: saccade with model's own predictions =====
+        # Each round rebuilds with [low-res + ONE current crop] only.
+        # Previous crops are discarded; only the latest crop masks low-res.
         for round_n in range(1, self.sa.max_saccade_rounds):
             # Crop at model's prediction from previous round
             cropped, crop_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio)
@@ -273,17 +274,14 @@ class SaccadeTrainer:
             # Check if GT center is findable in this crop
             gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
 
-            # Update cumulative low-res mask (union of all crop regions)
-            this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
-            if cumulative_low_mask is None:
-                cumulative_low_mask = this_crop_mask
-            else:
-                cumulative_low_mask = cumulative_low_mask | this_crop_mask
-
-            # Extend context with high-res crop
+            # Rebuild input: low-res + this single crop (no previous crops)
+            self.builder.reset()
+            _, base_text, base_images = self.builder.build_round0(
+                sample, sample["instruction"],
+            )
             try:
                 r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                    cur_text, cur_images, cropped, crop_bbox,
+                    base_text, base_images, cropped, crop_bbox,
                 )
             except Exception:
                 break
@@ -300,24 +298,25 @@ class SaccadeTrainer:
 
             vis_hidden, vis_ranges = extract_visual_hidden_states(
                 last_hs, inp["input_ids"], img_tok)
+            # Always anchor n=1 (the crop's anchor, since input is always [low-res, one-crop])
             anchor = extract_anchor_hidden_states(
-                last_hs, inp["input_ids"], pp_id, n=round_n)
+                last_hs, inp["input_ids"], pp_id, n=1)
 
-            if vis_hidden is None or anchor is None:
+            if vis_hidden is None or anchor is None or len(vis_ranges) < 2:
                 break
 
             grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
             n_low = vis_ranges[0][1]
             n_total = vis_hidden.shape[0]
 
-            # Cumulative mask: all low-res patches covered by any crop
+            # Mask: only this crop's overlap with low-res (not cumulative)
+            this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
             full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-            full_mask[:n_low] = cumulative_low_mask.to(device)
+            full_mask[:n_low] = this_crop_mask.to(device)
 
             if gt_in_crop:
                 # --- Target found in crop: supervise high-res localization ---
-                latest_img_idx = len(vis_ranges) - 1
-                nh_high, nw_high = grid_dims[latest_img_idx]
+                nh_high, nw_high = grid_dims[1]  # always index 1
 
                 cbx1, cby1, cbx2, cby2 = crop_bbox
                 cbw, cbh = cbx2 - cbx1, cby2 - cby1
@@ -330,10 +329,10 @@ class SaccadeTrainer:
                     )
                     high_labels = compute_binary_labels(nh_high, nw_high, local_gt)
                 else:
-                    high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
+                    high_labels = torch.zeros(vis_ranges[1][1])
 
                 full_labels = torch.zeros(1, n_total, device=device)
-                offset_hi, n_hi = vis_ranges[latest_img_idx]
+                offset_hi, n_hi = vis_ranges[1]
                 full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
                 attn, loss = self.model.action_head(
@@ -362,7 +361,7 @@ class SaccadeTrainer:
             else:
                 # --- Saccade: GT not in crop, redirect to unmasked low-res ---
                 low_labels = compute_binary_labels(nh0, nw0, bbox_gt)
-                low_labels[cumulative_low_mask] = 0.0  # zero out masked patches
+                low_labels[this_crop_mask] = 0.0  # zero out only this crop's patches
 
                 if low_labels.sum() > 0:
                     full_labels = torch.zeros(1, n_total, device=device)

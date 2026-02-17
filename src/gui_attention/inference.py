@@ -162,8 +162,8 @@ def run_saccade_inference(
     nw_final, nh_final = nw0, nh0
     final_point = (focus_x, focus_y)
 
-    # Subsequent rounds
-    cumulative_low_mask = None  # tracks all crop-covered low-res patches
+    # Subsequent rounds: each round rebuilds with [low-res + ONE current crop]
+    # Previous crops are discarded; only the latest crop masks low-res.
     total_vis_tokens = vis_hidden.shape[0] if vis_hidden is not None else 0
 
     for ri in range(1, max_rounds):
@@ -172,9 +172,13 @@ def run_saccade_inference(
 
         # Crop around current focus
         cropped, crop_bbox = crop_image(image, focus_x, focus_y, crop_ratio)
+
+        # Rebuild input: low-res + this single crop only (discard previous crops)
+        builder.reset()
+        _, base_text, base_images = builder.build_round0(image_path, instruction)
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                cur_text, cur_images, cropped, crop_bbox,
+                base_text, base_images, cropped, crop_bbox,
             )
         except Exception:
             break
@@ -190,25 +194,21 @@ def run_saccade_inference(
 
         last_hs = outputs.hidden_states[-1]
         vis_hidden, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
-        anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=ri)
+        # Always anchor n=1 (the crop's anchor, since input is always [low-res, one-crop])
+        anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=1)
 
-        if vis_hidden is None or anchor is None:
+        if vis_hidden is None or anchor is None or len(vis_ranges) < 2:
             break
 
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
         nh_low, nw_low = grid_dims[0]
 
-        # Cumulative mask: low-res patches covered by ANY crop so far
-        this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox)
-        if cumulative_low_mask is None:
-            cumulative_low_mask = this_crop_mask
-        else:
-            cumulative_low_mask = cumulative_low_mask | this_crop_mask
-
+        # Mask: only this crop's overlap with low-res (not cumulative)
+        this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-        full_mask[:n_low] = cumulative_low_mask.to(device)
+        full_mask[:n_low] = this_crop_mask
 
         total_vis_tokens = n_total
 
