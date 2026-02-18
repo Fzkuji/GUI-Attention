@@ -72,8 +72,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 @dataclass
 class ScriptArgs:
     model_name_or_path: str = field(default="Qwen/Qwen2.5-VL-3B-Instruct")
-    data_path: str = field(default=None)
-    image_folder: str = field(default=None)
+    data_path: str = field(default=None, metadata={"help": "JSON path(s), comma-separated for multiple datasets"})
+    image_folder: str = field(default=None, metadata={"help": "Image folder(s), comma-separated, matching data_path order"})
     max_samples: Optional[int] = field(default=None)
     min_pixels: int = field(default=3136)
     low_res_max_pixels: int = field(default=LOW_RES_MAX_PIXELS)
@@ -101,12 +101,9 @@ class TrainArgs(transformers.TrainingArguments):
 
 # -- Data ---------------------------------------------------------------------
 
-def load_dataset(data_path, image_folder, max_samples=None):
+def load_single_dataset(data_path, image_folder):
     with open(data_path) as f:
         raw = json.load(f)
-    if max_samples:
-        random.shuffle(raw)
-        raw = raw[:max_samples]
     samples = []
     for item in raw:
         img_file = item["image"]
@@ -125,7 +122,28 @@ def load_dataset(data_path, image_folder, max_samples=None):
                 user_text = re.sub(r"<image>", "", conv.get("value", conv.get("content", ""))).strip()
         if bbox_gt and user_text:
             samples.append({"image_path": img_path, "instruction": user_text, "bbox_gt": bbox_gt})
-    print(f"Loaded {len(samples)} samples")
+    return samples
+
+
+def load_dataset(data_path, image_folder, max_samples=None):
+    """Load one or more datasets. Comma-separated paths for multiple datasets."""
+    data_paths = [p.strip() for p in data_path.split(",")]
+    image_folders = [p.strip() for p in image_folder.split(",")]
+    if len(image_folders) == 1 and len(data_paths) > 1:
+        image_folders = image_folders * len(data_paths)
+    assert len(data_paths) == len(image_folders), \
+        f"Mismatch: {len(data_paths)} data_paths vs {len(image_folders)} image_folders"
+
+    samples = []
+    for dp, imf in zip(data_paths, image_folders):
+        s = load_single_dataset(dp, imf)
+        print(f"  {os.path.basename(dp)}: {len(s)} samples")
+        samples.extend(s)
+
+    if max_samples:
+        random.shuffle(samples)
+        samples = samples[:max_samples]
+    print(f"Total: {len(samples)} samples")
     return samples
 
 
