@@ -231,7 +231,7 @@ def main():
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
         tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
-        args.save_path = f"/root/autodl-tmp/results/screenspot_pro/{ckpt_name}/{tag}"
+        args.save_path = f"results/screenspot_pro/{ckpt_name}/{tag}"
 
     print("=== Config ===")
     print(f"  checkpoint:  {args.checkpoint}")
