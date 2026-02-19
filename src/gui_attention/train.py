@@ -212,8 +212,11 @@ class SaccadeTrainer:
             self.optimizer = torch.optim.AdamW(
                 param_groups, weight_decay=args.weight_decay,
             )
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=max(total_steps, 1), eta_min=1e-7,
+            warmup_steps = int(total_steps * args.warmup_ratio) if args.warmup_ratio > 0 else 0
+            self.scheduler = transformers.get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=max(total_steps, 1),
             )
 
 
