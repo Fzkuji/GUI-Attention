@@ -88,6 +88,8 @@ class ScriptArgs:
     # Dual LR
     action_head_lr: float = field(default=1e-4)
     lora_lr: float = field(default=5e-5)
+    # Resume
+    resume_from_checkpoint: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
 
 
 @dataclass
@@ -222,6 +224,17 @@ class SaccadeTrainer:
 
         self.metrics = defaultdict(list)
         self.global_step = 0
+
+        # Resume training state (optimizer, scheduler, step)
+        if script_args.resume_from_checkpoint:
+            state_path = os.path.join(script_args.resume_from_checkpoint, "training_state.pt")
+            if os.path.exists(state_path) and not self.use_deepspeed:
+                state = torch.load(state_path, map_location="cpu")
+                self.optimizer.load_state_dict(state["optimizer"])
+                self.scheduler.load_state_dict(state["scheduler"])
+                self.global_step = state["global_step"]
+                if self.rank == 0:
+                    print(f"  Resumed training state: global_step={self.global_step}")
 
     # -- multi-round saccade forward ----------------------------------------
 
@@ -486,7 +499,7 @@ class SaccadeTrainer:
 
         if not self.use_deepspeed:
             self.optimizer.zero_grad()
-        micro = 0
+        micro = self.global_step * ga  # correct micro count for resume
 
         for epoch in range(epochs):
             # Deterministic shuffle: same order across all ranks for correct sharding
@@ -496,6 +509,18 @@ class SaccadeTrainer:
                 shard = self.train_data[self.rank::self.world_size]
             else:
                 shard = self.train_data
+
+            # Skip already-processed samples when resuming
+            skip_samples = self.global_step * ga * bs
+            if skip_samples > 0 and skip_samples < len(shard):
+                if self.rank == 0:
+                    print(f"  Resuming: skipping {skip_samples} samples (step {self.global_step})")
+                shard = shard[skip_samples:]
+            elif skip_samples >= len(shard):
+                if self.rank == 0:
+                    print(f"  Epoch {epoch+1} already completed, skipping")
+                continue
+
             pbar = tqdm(range(0, len(shard), bs), desc=f"Epoch {epoch+1}/{epochs}",
                         disable=(self.rank != 0))
             for i in pbar:
@@ -557,6 +582,13 @@ class SaccadeTrainer:
         self.tokenizer.save_pretrained(p)
         with open(os.path.join(p, "metrics.json"), "w") as f:
             json.dump({k: v[-100:] for k, v in self.metrics.items()}, f)
+        # Save training state for resume
+        if not self.use_deepspeed:
+            torch.save({
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+            }, os.path.join(p, "training_state.pt"))
         print(f"  Saved: {p}")
 
 
@@ -584,6 +616,29 @@ def main():
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
         gradient_checkpointing=ta.gradient_checkpointing,
     )
+
+    # Load model weights from checkpoint if resuming
+    if sa.resume_from_checkpoint:
+        ckpt = sa.resume_from_checkpoint
+        if rank == 0:
+            print(f"Loading model weights from checkpoint: {ckpt}")
+        # Load LoRA adapter weights
+        from peft import set_peft_model_state_dict
+        adapter_file = os.path.join(ckpt, "adapter_model.safetensors")
+        if os.path.exists(adapter_file):
+            from safetensors.torch import load_file
+            adapter_state = load_file(adapter_file)
+        else:
+            adapter_state = torch.load(os.path.join(ckpt, "adapter_model.bin"),
+                                       map_location="cpu", weights_only=True)
+        set_peft_model_state_dict(model.backbone, adapter_state)
+        # Load action head weights
+        head_path = os.path.join(ckpt, "action_head.pt")
+        if os.path.exists(head_path):
+            model.action_head.load_state_dict(
+                torch.load(head_path, map_location="cpu", weights_only=True))
+        if rank == 0:
+            print(f"  Model weights loaded from {ckpt}")
 
     if not (HAS_DEEPSPEED and ta.deepspeed):
         model.to(f"cuda:{local_rank}")
