@@ -123,7 +123,7 @@ else
         if echo "$DATASETS" | grep -q "$ds"; then
             if [ ! -f "$json" ]; then
                 echo "    Downloading $json..."
-                wget -q --show-progress "$HF_DATA_REPO/$json" -O "$json"
+                wget --progress=bar:force "$HF_DATA_REPO/$json" -O "$json"
             else
                 echo "    $json exists"
             fi
@@ -137,7 +137,7 @@ else
             echo "  GUIAct images: exists"
         else
             echo "  Downloading GUIAct images (4 GB)..."
-            wget -q --show-progress "$HF_DATA_REPO/GUIAct_images.zip" -O GUIAct_images.zip
+            wget --progress=bar:force "$HF_DATA_REPO/GUIAct_images.zip" -O GUIAct_images.zip
             unzip -q -o GUIAct_images.zip -d GUIAct/
             rm -f GUIAct_images.zip
         fi
@@ -149,7 +149,7 @@ else
             echo "  GUIEnv images: exists"
         else
             echo "  Downloading GUIEnv images (5.9 GB)..."
-            wget -q --show-progress "$HF_DATA_REPO/GUIEnv_images.zip" -O GUIEnv_images.zip
+            wget --progress=bar:force "$HF_DATA_REPO/GUIEnv_images.zip" -O GUIEnv_images.zip
             mkdir -p GUIEnv
             unzip -q -o GUIEnv_images.zip -d GUIEnv/
             rm -f GUIEnv_images.zip
@@ -162,7 +162,7 @@ else
             echo "  Wave-UI images: exists"
         else
             echo "  Downloading Wave-UI images (24.4 GB)..."
-            wget -q --show-progress "$HF_DATA_REPO/Wave-UI_images.zip" -O Wave-UI_images.zip
+            wget --progress=bar:force "$HF_DATA_REPO/Wave-UI_images.zip" -O Wave-UI_images.zip
             mkdir -p Wave-UI
             unzip -q -o Wave-UI_images.zip -d Wave-UI/
             rm -f Wave-UI_images.zip
@@ -175,7 +175,7 @@ else
             echo "  AndroidControl images: exists"
         else
             echo "  Downloading AndroidControl images (49.3 GB)..."
-            wget -q --show-progress "$HF_DATA_REPO/AndroidControl_images.zip" -O AndroidControl_images.zip
+            wget --progress=bar:force "$HF_DATA_REPO/AndroidControl_images.zip" -O AndroidControl_images.zip
             mkdir -p AndroidControl
             unzip -q -o AndroidControl_images.zip -d AndroidControl/
             rm -f AndroidControl_images.zip
@@ -190,7 +190,7 @@ else
             echo "  Downloading AMEX images (92 GB, 3 parts)..."
             for part in amex_images_part_aa amex_images_part_ab amex_images_part_ac; do
                 if [ ! -f "$part" ]; then
-                    wget -q --show-progress "$HF_DATA_REPO/$part" -O "$part"
+                    wget --progress=bar:force "$HF_DATA_REPO/$part" -O "$part"
                 fi
             done
             echo "    Combining and extracting..."
@@ -209,7 +209,7 @@ else
             echo "  Downloading UGround images (256 GB, 6 split files)..."
             for part in Uground_images_split.z01 Uground_images_split.z02 Uground_images_split.z03 Uground_images_split.z04 Uground_images_split.z05 Uground_images_split.zip; do
                 if [ ! -f "$part" ]; then
-                    wget -q --show-progress "$HF_DATA_REPO/$part" -O "$part"
+                    wget --progress=bar:force "$HF_DATA_REPO/$part" -O "$part"
                 fi
             done
             echo "    Combining and extracting..."
