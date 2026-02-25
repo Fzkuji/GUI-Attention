@@ -1,16 +1,23 @@
 #!/bin/bash
 # ============================================================================
-# GUI-Attention: Full Setup, Data Download, and Training
+# GUI-Attention: Data Download, Training, and Evaluation
 # ============================================================================
-# One-script setup for a fresh server. Handles:
-#   1. Clone repos & install dependencies
-#   2. Download base model
-#   3. Download all 6 GUI-Actor training datasets
-#   4. Train (2-GPU data parallel, LoRA + ActionHead)
+# Handles:
+#   1. Clone/pull code
+#   2. Download base model (Qwen2.5-VL-3B-Instruct)
+#   3. Download all 6 GUI-Actor training datasets (~438GB)
+#   4. Train (multi-GPU data parallel, LoRA + ActionHead)
 #   5. Evaluate on ScreenSpot v1/v2/Pro
 #
+# Prerequisites — install environment manually before running:
+#   conda create -n gui-attention python=3.10 -y
+#   conda activate gui-attention
+#   pip install -e ".[train,eval]"
+#   pip install flash-attn --no-build-isolation
+#
 # Usage:
-#   bash jobs/setup_and_train.sh [OPTIONS]
+#   conda activate gui-attention
+#   NUM_GPUS=8 bash jobs/setup_and_train.sh
 #
 # Options (env vars):
 #   WORK_DIR        - working directory (default: ~/GUI-Attention-Workspace)
@@ -20,7 +27,6 @@
 #   SKIP_EVAL       - set to 1 to skip evaluation
 #   DATASETS        - comma-separated dataset names to use
 #                     (default: all 6: guiact,guienv,amex,androidcontrol,waveui,uground)
-#   CONDA_ENV       - conda env name (default: gui-attention)
 #   MAX_EPOCHS      - training epochs (default: 1)
 # ============================================================================
 
