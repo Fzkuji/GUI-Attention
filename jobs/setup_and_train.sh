@@ -58,9 +58,9 @@ echo "  MAX_EPOCHS:  $MAX_EPOCHS"
 echo "============================================================"
 echo ""
 
-# ── Step 1: Clone code & install ────────────────────────────────────────────
+# ── Step 1: Clone code ─────────────────────────────────────────────────────
 
-echo ">>> [1/5] Setting up code and environment"
+echo ">>> [1/5] Setting up code"
 
 if [ ! -d "$CODE_DIR" ]; then
     echo "  Cloning GUI-Attention..."
@@ -70,21 +70,8 @@ else
     cd "$CODE_DIR" && git pull
 fi
 
-# Conda env setup
-if ! conda info --envs 2>/dev/null | grep -q "$CONDA_ENV"; then
-    echo "  Creating conda env: $CONDA_ENV"
-    conda create -n "$CONDA_ENV" python=3.10 -y
-fi
-
-# Activate
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV"
-
-echo "  Installing dependencies..."
 cd "$CODE_DIR"
-pip install -e ".[train,eval]" -q
-# flash-attn (optional, build from source)
-pip install flash-attn --no-build-isolation -q 2>/dev/null || echo "  (flash-attn install failed, continuing without it)"
+export PYTHONPATH=src:$PYTHONPATH
 
 echo ""
 
