@@ -49,7 +49,8 @@ MODEL_DIR="$WORK_DIR/models"
 RESULT_DIR="$WORK_DIR/results"
 LOG_DIR="$WORK_DIR/logs"
 
-HF_DATA_REPO="https://huggingface.co/datasets/cckevinn/GUI-Actor-Data/resolve/main"
+HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+HF_DATA_REPO="${HF_ENDPOINT}/datasets/cckevinn/GUI-Actor-Data/resolve/main"
 BASE_MODEL_HF="Qwen/Qwen2.5-VL-3B-Instruct"
 
 mkdir -p "$WORK_DIR" "$DATA_DIR" "$MODEL_DIR" "$RESULT_DIR" "$LOG_DIR"
