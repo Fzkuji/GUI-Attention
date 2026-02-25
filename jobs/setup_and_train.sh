@@ -106,129 +106,80 @@ if [ "$SKIP_DOWNLOAD" = "1" ]; then
     echo ">>> [3/5] Skipping data download (SKIP_DOWNLOAD=1)"
 else
     echo ">>> [3/5] Downloading training data"
+    echo "  Using HF endpoint: $HF_ENDPOINT"
 
+    # Download entire GUI-Actor dataset from HuggingFace (respects HF_ENDPOINT mirror)
+    echo "  Downloading GUI-Actor dataset (~438GB)..."
+    python -c "
+import os
+os.environ.setdefault('HF_ENDPOINT', '$HF_ENDPOINT')
+from huggingface_hub import snapshot_download
+snapshot_download('cckevinn/GUI-Actor-Data', local_dir='$DATA_DIR', repo_type='dataset')
+print('  Download complete.')
+"
+
+    # Extract image archives
     cd "$DATA_DIR"
 
-    # --- JSON annotations (always download, they're small) ---
-    echo "  Downloading JSON annotations..."
-    declare -A JSON_FILES=(
-        ["guiact"]="guiact_bbox.json"
-        ["guienv"]="guienv_bbox.json"
-        ["amex"]="amex_bbox.json"
-        ["androidcontrol"]="androidcontrol_bbox.json"
-        ["waveui"]="wave_ui_bbox.json"
-        ["uground"]="uground_bbox.json"
-    )
-    for ds in guiact guienv amex androidcontrol waveui uground; do
-        json="${JSON_FILES[$ds]}"
-        if echo "$DATASETS" | grep -q "$ds"; then
-            if [ ! -f "$json" ]; then
-                echo "    Downloading $json..."
-                wget --progress=bar:force "$HF_DATA_REPO/$json" -O "$json"
-            else
-                echo "    $json exists"
-            fi
-        fi
-    done
-
-    # --- Image archives ---
     # GUIAct (4 GB)
-    if echo "$DATASETS" | grep -q "guiact"; then
-        if [ -d "GUIAct/web_imgs" ] && [ -n "$(ls GUIAct/web_imgs/ 2>/dev/null | head -1)" ]; then
-            echo "  GUIAct images: exists"
-        else
-            echo "  Downloading GUIAct images (4 GB)..."
-            wget --progress=bar:force "$HF_DATA_REPO/GUIAct_images.zip" -O GUIAct_images.zip
-            unzip -q -o GUIAct_images.zip -d GUIAct/
-            rm -f GUIAct_images.zip
-        fi
+    if [ -f "GUIAct_images.zip" ] && [ ! -d "GUIAct/web_imgs" ]; then
+        echo "  Extracting GUIAct..."
+        unzip -q -o GUIAct_images.zip -d GUIAct/
+        rm -f GUIAct_images.zip
     fi
 
     # GUIEnv (5.9 GB)
-    if echo "$DATASETS" | grep -q "guienv"; then
-        if [ -d "GUIEnv/guienvs/images" ] && [ -n "$(ls GUIEnv/guienvs/images/ 2>/dev/null | head -1)" ]; then
-            echo "  GUIEnv images: exists"
-        else
-            echo "  Downloading GUIEnv images (5.9 GB)..."
-            wget --progress=bar:force "$HF_DATA_REPO/GUIEnv_images.zip" -O GUIEnv_images.zip
-            mkdir -p GUIEnv
-            unzip -q -o GUIEnv_images.zip -d GUIEnv/
-            rm -f GUIEnv_images.zip
-        fi
+    if [ -f "GUIEnv_images.zip" ] && [ ! -d "GUIEnv/guienvs/images" ]; then
+        echo "  Extracting GUIEnv..."
+        mkdir -p GUIEnv
+        unzip -q -o GUIEnv_images.zip -d GUIEnv/
+        rm -f GUIEnv_images.zip
     fi
 
     # Wave-UI (24.4 GB)
-    if echo "$DATASETS" | grep -q "waveui"; then
-        if [ -d "Wave-UI/images_fixed" ] && [ -n "$(ls Wave-UI/images_fixed/ 2>/dev/null | head -1)" ]; then
-            echo "  Wave-UI images: exists"
-        else
-            echo "  Downloading Wave-UI images (24.4 GB)..."
-            wget --progress=bar:force "$HF_DATA_REPO/Wave-UI_images.zip" -O Wave-UI_images.zip
-            mkdir -p Wave-UI
-            unzip -q -o Wave-UI_images.zip -d Wave-UI/
-            rm -f Wave-UI_images.zip
-        fi
+    if [ -f "Wave-UI_images.zip" ] && [ ! -d "Wave-UI/images_fixed" ]; then
+        echo "  Extracting Wave-UI..."
+        mkdir -p Wave-UI
+        unzip -q -o Wave-UI_images.zip -d Wave-UI/
+        rm -f Wave-UI_images.zip
     fi
 
     # AndroidControl (49.3 GB)
-    if echo "$DATASETS" | grep -q "androidcontrol"; then
-        if [ -d "AndroidControl/tfrecord/images" ] && [ -n "$(ls AndroidControl/tfrecord/images/ 2>/dev/null | head -1)" ]; then
-            echo "  AndroidControl images: exists"
-        else
-            echo "  Downloading AndroidControl images (49.3 GB)..."
-            wget --progress=bar:force "$HF_DATA_REPO/AndroidControl_images.zip" -O AndroidControl_images.zip
-            mkdir -p AndroidControl
-            unzip -q -o AndroidControl_images.zip -d AndroidControl/
-            rm -f AndroidControl_images.zip
-        fi
+    if [ -f "AndroidControl_images.zip" ] && [ ! -d "AndroidControl/tfrecord/images" ]; then
+        echo "  Extracting AndroidControl..."
+        mkdir -p AndroidControl
+        unzip -q -o AndroidControl_images.zip -d AndroidControl/
+        rm -f AndroidControl_images.zip
     fi
 
     # AMEX (92 GB, 3 parts)
-    if echo "$DATASETS" | grep -q "amex"; then
-        if [ -d "AMEX/screenshots" ] && [ -n "$(ls AMEX/screenshots/ 2>/dev/null | head -1)" ]; then
-            echo "  AMEX images: exists"
-        else
-            echo "  Downloading AMEX images (92 GB, 3 parts)..."
-            for part in amex_images_part_aa amex_images_part_ab amex_images_part_ac; do
-                if [ ! -f "$part" ]; then
-                    wget --progress=bar:force "$HF_DATA_REPO/$part" -O "$part"
-                fi
-            done
-            echo "    Combining and extracting..."
-            cat amex_images_part_* > amex_images.zip
-            mkdir -p AMEX
-            7z x amex_images.zip -aoa -oAMEX/ || unzip -q -o amex_images.zip -d AMEX/
-            rm -f amex_images_part_* amex_images.zip
-        fi
+    if [ -f "amex_images_part_aa" ] && [ ! -d "AMEX/screenshots" ]; then
+        echo "  Extracting AMEX (combining 3 parts)..."
+        cat amex_images_part_* > amex_images.zip
+        mkdir -p AMEX
+        7z x amex_images.zip -aoa -oAMEX/ || unzip -q -o amex_images.zip -d AMEX/
+        rm -f amex_images_part_* amex_images.zip
     fi
 
     # UGround (256 GB, 6 parts)
-    if echo "$DATASETS" | grep -q "uground"; then
-        if [ -d "Uground/images" ] && [ -n "$(ls Uground/images/ 2>/dev/null | head -1)" ]; then
-            echo "  UGround images: exists"
-        else
-            echo "  Downloading UGround images (256 GB, 6 split files)..."
-            for part in Uground_images_split.z01 Uground_images_split.z02 Uground_images_split.z03 Uground_images_split.z04 Uground_images_split.z05 Uground_images_split.zip; do
-                if [ ! -f "$part" ]; then
-                    wget --progress=bar:force "$HF_DATA_REPO/$part" -O "$part"
-                fi
-            done
-            echo "    Combining and extracting..."
-            cat Uground_images_split.z* Uground_images_split.zip > Uground_images.zip
-            mkdir -p Uground
-            7z x Uground_images.zip -aoa -oUground/ || unzip -q -o Uground_images.zip -d Uground/
-            rm -f Uground_images_split.z* Uground_images_split.zip Uground_images.zip
-        fi
+    if [ -f "Uground_images_split.zip" ] && [ ! -d "Uground/images" ]; then
+        echo "  Extracting UGround (combining 6 parts)..."
+        cat Uground_images_split.z* Uground_images_split.zip > Uground_images.zip
+        mkdir -p Uground
+        7z x Uground_images.zip -aoa -oUground/ || unzip -q -o Uground_images.zip -d Uground/
+        rm -f Uground_images_split.z* Uground_images_split.zip Uground_images.zip
     fi
 
     # ScreenSpot-Pro eval data
     echo "  Downloading ScreenSpot-Pro eval data..."
     if [ ! -d "ScreenSpot-Pro" ]; then
         python -c "
+import os
+os.environ.setdefault('HF_ENDPOINT', '$HF_ENDPOINT')
 from huggingface_hub import snapshot_download
 snapshot_download('liuzhch/ScreenSpot-Pro', local_dir='$DATA_DIR/ScreenSpot-Pro', repo_type='dataset')
 print('  Done.')
-" 2>/dev/null || echo "  (ScreenSpot-Pro download skipped, will use HF datasets at eval time)"
+" 2>/dev/null || echo "  (ScreenSpot-Pro download skipped)"
     else
         echo "  ScreenSpot-Pro exists"
     fi
