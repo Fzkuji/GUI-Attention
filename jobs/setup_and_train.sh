@@ -108,12 +108,12 @@ else
     echo ">>> [3/5] Downloading training data"
     echo "  Using HF endpoint: $HF_ENDPOINT"
 
-    # Check if all requested datasets are already extracted
+    # Check if all requested datasets are already extracted (check top-level dir only)
     ALL_EXTRACTED=1
     declare -A _DS_CHECK_DIR=(
-        ["guiact"]="GUIAct/web_imgs" ["guienv"]="GUIEnv/guienvs/images"
-        ["amex"]="AMEX/screenshots" ["androidcontrol"]="AndroidControl/tfrecord/images"
-        ["waveui"]="Wave-UI/images_fixed" ["uground"]="Uground/images"
+        ["guiact"]="GUIAct" ["guienv"]="GUIEnv"
+        ["amex"]="AMEX" ["androidcontrol"]="AndroidControl"
+        ["waveui"]="Wave-UI" ["uground"]="Uground"
     )
     IFS=',' read -ra _DS_CHECK <<< "$DATASETS"
     for _ds in "${_DS_CHECK[@]}"; do
