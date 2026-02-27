@@ -108,20 +108,20 @@ else
     echo ">>> [3/5] Downloading training data"
     echo "  Using HF endpoint: $HF_ENDPOINT"
 
-    # Check if all datasets are already extracted
+    # Check if all requested datasets are already extracted
     ALL_EXTRACTED=1
-    IFS=',' read -ra _DS_CHECK <<< "$DATASETS"
     declare -A _DS_CHECK_DIR=(
         ["guiact"]="GUIAct/web_imgs" ["guienv"]="GUIEnv/guienvs/images"
         ["amex"]="AMEX/screenshots" ["androidcontrol"]="AndroidControl/tfrecord/images"
         ["waveui"]="Wave-UI/images_fixed" ["uground"]="Uground/images"
     )
+    IFS=',' read -ra _DS_CHECK <<< "$DATASETS"
     for _ds in "${_DS_CHECK[@]}"; do
         _ds=$(echo "$_ds" | xargs)
         _dir="${_DS_CHECK_DIR[$_ds]}"
         if [ -n "$_dir" ] && [ ! -d "$DATA_DIR/$_dir" ]; then
+            echo "  Dataset '$_ds' not found at $DATA_DIR/$_dir"
             ALL_EXTRACTED=0
-            break
         fi
     done
 
