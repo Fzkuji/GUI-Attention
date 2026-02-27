@@ -108,15 +108,36 @@ else
     echo ">>> [3/5] Downloading training data"
     echo "  Using HF endpoint: $HF_ENDPOINT"
 
-    # Download entire GUI-Actor dataset from HuggingFace (respects HF_ENDPOINT mirror)
-    echo "  Downloading GUI-Actor dataset (~438GB)..."
-    python -c "
+    # Check if all datasets are already extracted
+    ALL_EXTRACTED=1
+    IFS=',' read -ra _DS_CHECK <<< "$DATASETS"
+    declare -A _DS_CHECK_DIR=(
+        ["guiact"]="GUIAct/web_imgs" ["guienv"]="GUIEnv/guienvs/images"
+        ["amex"]="AMEX/screenshots" ["androidcontrol"]="AndroidControl/tfrecord/images"
+        ["waveui"]="Wave-UI/images_fixed" ["uground"]="Uground/images"
+    )
+    for _ds in "${_DS_CHECK[@]}"; do
+        _ds=$(echo "$_ds" | xargs)
+        _dir="${_DS_CHECK_DIR[$_ds]}"
+        if [ -n "$_dir" ] && [ ! -d "$DATA_DIR/$_dir" ]; then
+            ALL_EXTRACTED=0
+            break
+        fi
+    done
+
+    if [ "$ALL_EXTRACTED" = "1" ]; then
+        echo "  All datasets already extracted, skipping download"
+    else
+        # Download entire GUI-Actor dataset from HuggingFace (respects HF_ENDPOINT mirror)
+        echo "  Downloading GUI-Actor dataset (~438GB)..."
+        python -c "
 import os
 os.environ.setdefault('HF_ENDPOINT', '$HF_ENDPOINT')
 from huggingface_hub import snapshot_download
 snapshot_download('cckevinn/GUI-Actor-Data', local_dir='$DATA_DIR', repo_type='dataset')
 print('  Download complete.')
 "
+    fi
 
     # Extract image archives
     cd "$DATA_DIR"
@@ -152,22 +173,26 @@ print('  Download complete.')
         rm -f AndroidControl_images.zip
     fi
 
-    # AMEX (92 GB, 3 parts)
+    # AMEX (92 GB, 3 split parts → cat → zip)
     if [ -f "amex_images_part_aa" ] && [ ! -d "AMEX/screenshots" ]; then
         echo "  Extracting AMEX (combining 3 parts)..."
-        cat amex_images_part_* > amex_images.zip
+        cat amex_images_part_* > amex_images_combined.zip
         mkdir -p AMEX
-        7z x amex_images.zip -aoa -oAMEX/ || unzip -q -o amex_images.zip -d AMEX/
-        rm -f amex_images_part_* amex_images.zip
+        7z x amex_images_combined.zip -aoa -oAMEX/ || unzip -q -o amex_images_combined.zip -d AMEX/
+        rm -f amex_images_part_* amex_images_combined.zip
     fi
 
-    # UGround (256 GB, 6 parts)
+    # UGround (256 GB, 6 zip split volumes: .zip + .z01-.z05)
+    # Use 7z directly on the main volume — do NOT cat/merge
     if [ -f "Uground_images_split.zip" ] && [ ! -d "Uground/images" ]; then
-        echo "  Extracting UGround (combining 6 parts)..."
-        cat Uground_images_split.z* Uground_images_split.zip > Uground_images.zip
+        echo "  Extracting UGround (6-part zip split volume)..."
         mkdir -p Uground
-        7z x Uground_images.zip -aoa -oUground/ || unzip -q -o Uground_images.zip -d Uground/
-        rm -f Uground_images_split.z* Uground_images_split.zip Uground_images.zip
+        7z x Uground_images_split.zip -aoa -oUground/
+        # Inner zip: if 7z extracted a nested Uground_images.zip, unzip it
+        if [ -f "Uground/Uground_images.zip" ]; then
+            cd Uground && 7z x Uground_images.zip -aoa && rm -f Uground_images.zip && cd ..
+        fi
+        rm -f Uground_images_split.z* Uground_images_split.zip
     fi
 
     # ScreenSpot-Pro eval data
