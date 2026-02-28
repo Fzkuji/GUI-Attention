@@ -286,7 +286,14 @@ class SaccadeTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
-        _base = self.model.backbone.base_model.model
+        # Navigate to the underlying model (handle both PEFT-wrapped and plain backbone)
+        _backbone = self.model.backbone
+        if hasattr(_backbone, 'base_model'):
+            # PEFT wrapper: backbone.base_model.model
+            _base = _backbone.base_model.model
+        else:
+            # Plain model (no LoRA)
+            _base = _backbone
         _visual = getattr(_base, 'visual', None) or getattr(_base, 'vision_model', None) or _base.model.visual
         merge = _visual.spatial_merge_size
 

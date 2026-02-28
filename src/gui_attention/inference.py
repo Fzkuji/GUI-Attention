@@ -128,7 +128,13 @@ def run_saccade_inference(
 
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
-    merge = model.backbone.base_model.model.visual.spatial_merge_size
+    # Navigate to the underlying model (handle both PEFT-wrapped and plain backbone)
+    _backbone = model.backbone
+    if hasattr(_backbone, 'base_model'):
+        _base = _backbone.base_model.model
+    else:
+        _base = _backbone
+    merge = _base.visual.spatial_merge_size
 
     # Round 0: low-res only
     r0_inputs, cur_text, cur_images = builder.build_round0(image_path, instruction)

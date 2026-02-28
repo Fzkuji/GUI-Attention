@@ -221,8 +221,24 @@ class Qwen25VLWithActionHead(nn.Module):
             ADDITIONAL_SPECIAL_TOKENS[2]
         )
 
-        # Load LoRA adapter
-        backbone = PeftModel.from_pretrained(backbone, path)
+        # Load weights: detect LoRA (adapter_config.json) vs full model
+        adapter_cfg = os.path.join(path, "adapter_config.json")
+        if os.path.exists(adapter_cfg):
+            # LoRA checkpoint
+            backbone = PeftModel.from_pretrained(backbone, path)
+        else:
+            # Full model checkpoint — load state dict directly
+            model_file = os.path.join(path, "model.safetensors")
+            if os.path.exists(model_file):
+                from safetensors.torch import load_file
+                state = load_file(model_file)
+                backbone.load_state_dict(state, strict=False)
+            else:
+                # Try pytorch_model.bin
+                bin_file = os.path.join(path, "pytorch_model.bin")
+                if os.path.exists(bin_file):
+                    state = torch.load(bin_file, map_location=device, weights_only=True)
+                    backbone.load_state_dict(state, strict=False)
 
         # Load action head
         d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
