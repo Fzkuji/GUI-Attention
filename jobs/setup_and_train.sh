@@ -236,12 +236,12 @@ else
         ["uground"]="uground_bbox.json"
     )
     declare -A DS_IMGDIR=(
-        ["guiact"]="GUIAct/web_imgs"
+        ["guiact"]="GUIAct/GUIAct/web_imgs"
         ["guienv"]="GUIEnv/guienvs/images"
         ["amex"]="AMEX/screenshots"
-        ["androidcontrol"]="AndroidControl/tfrecord/images"
-        ["waveui"]="Wave-UI/images_fixed"
-        ["uground"]="Uground/images"
+        ["androidcontrol"]="AndroidControl/AndroidControl/tfrecord/images"
+        ["waveui"]="Wave-UI/Wave-UI/images_fixed"
+        ["uground"]="Uground/Uground/images"
     )
 
     IFS=',' read -ra DS_LIST <<< "$DATASETS"
