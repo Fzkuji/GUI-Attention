@@ -89,7 +89,7 @@ class ScriptArgs:
     action_head_lr: float = field(default=1e-4)
     lora_lr: float = field(default=5e-5)
     # Resume
-    resume_from_checkpoint: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
+    resume_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
 
 
 @dataclass
@@ -226,8 +226,8 @@ class SaccadeTrainer:
         self.global_step = 0
 
         # Resume training state (optimizer, scheduler, step)
-        if script_args.resume_from_checkpoint:
-            state_path = os.path.join(script_args.resume_from_checkpoint, "training_state.pt")
+        if script_args.resume_ckpt:
+            state_path = os.path.join(script_args.resume_ckpt, "training_state.pt")
             if os.path.exists(state_path) and not self.use_deepspeed:
                 state = torch.load(state_path, map_location="cpu")
                 self.optimizer.load_state_dict(state["optimizer"])
@@ -618,8 +618,8 @@ def main():
     )
 
     # Load model weights from checkpoint if resuming
-    if sa.resume_from_checkpoint:
-        ckpt = sa.resume_from_checkpoint
+    if sa.resume_ckpt:
+        ckpt = sa.resume_ckpt
         if rank == 0:
             print(f"Loading model weights from checkpoint: {ckpt}")
         # Load LoRA adapter weights
