@@ -212,10 +212,17 @@ class SaccadeTrainer:
             total_steps = min(total_steps, args.max_steps)
 
         if self.use_deepspeed:
+            # Resolve deepspeed config (HF TrainingArguments may parse it)
+            ds_config = args.deepspeed
+            if isinstance(ds_config, str):
+                import json as _json
+                with open(ds_config) as _f:
+                    ds_config = _json.load(_f)
+
             self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
                 model=model,
                 model_parameters=[p for p in model.parameters() if p.requires_grad],
-                config=args.deepspeed,
+                config=ds_config,
             )
             self.model = self.model_engine.module
             self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -286,15 +293,21 @@ class SaccadeTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
-        # Navigate to the underlying model (handle both PEFT-wrapped and plain backbone)
+        # Navigate to spatial_merge_size (handle PEFT-wrapped, plain, and DeepSpeed-wrapped)
         _backbone = self.model.backbone
-        if hasattr(_backbone, 'base_model'):
-            # PEFT wrapper: backbone.base_model.model
-            _base = _backbone.base_model.model
+        # Unwrap PEFT if present
+        if hasattr(_backbone, 'base_model') and hasattr(_backbone.base_model, 'model'):
+            _inner = _backbone.base_model.model
         else:
-            # Plain model (no LoRA)
-            _base = _backbone
-        _visual = getattr(_base, 'visual', None) or getattr(_base, 'vision_model', None) or _base.model.visual
+            _inner = _backbone
+        # Qwen2_5_VLForConditionalGeneration has .model.visual
+        # Qwen2_5_VLModel has .visual directly
+        if hasattr(_inner, 'visual'):
+            _visual = _inner.visual
+        elif hasattr(_inner, 'model') and hasattr(_inner.model, 'visual'):
+            _visual = _inner.model.visual
+        else:
+            raise AttributeError(f"Cannot find visual module in {type(_inner)}")
         merge = _visual.spatial_merge_size
 
         self.builder.reset()
