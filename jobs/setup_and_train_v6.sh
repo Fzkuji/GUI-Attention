@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================================
-# GUI-Attention v6: Full-param + ZeRO-3, GUI-AIMA aligned config
+# GUI-Attention v6: Full-param + DDP, GUI-AIMA aligned config
 # ============================================================================
 # Changes from v5:
 #   - Full parameter fine-tuning (no LoRA), matching GUI-AIMA
-#   - DeepSpeed ZeRO-3
+#   - Manual DDP (torchrun + all_reduce), no DeepSpeed (95GB VRAM sufficient)
 #   - lr=5e-6 for backbone (matching GUI-AIMA), action_head_lr=5e-5
 #   - GA=8 → effective batch=64 (matching GUI-AIMA)
 #   - Dataset: GUIAct + AndroidControl + Wave-UI + UGround(60K) + GTA(60K)
@@ -102,7 +102,6 @@ else
         --image_folder "$IMAGE_FOLDERS" \
         --max_samples_per_dataset "$MAX_PER_DS" \
         --output_dir "$RESULT_DIR/$OUTPUT_NAME" \
-        --deepspeed jobs/zero3.json \
         --min_pixels 3136 \
         --low_res_max_pixels 1003520 \
         --high_res_max_pixels 5720064 \
