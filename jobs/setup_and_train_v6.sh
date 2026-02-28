@@ -85,11 +85,11 @@ else
 
     # Dataset: GUI-AIMA aligned (5 datasets)
     # GUIAct + AndroidControl + Wave-UI + UGround (first 60K) + GTA (60K)
-    DATA_PATHS="$DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json,$DATA_DIR/gta/gta_data_wo_web_output_60k.json"
-    IMAGE_FOLDERS="$DATA_DIR/GUIAct/GUIAct/web_imgs,$DATA_DIR/AndroidControl/AndroidControl/tfrecord/images,$DATA_DIR/Wave-UI/Wave-UI/images_fixed,$DATA_DIR/Uground/Uground/images,$DATA_DIR/gta/image"
+    DATA_PATHS="$DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json,$DATA_DIR/gta/gta_data/gta_data_wo_web.json"
+    IMAGE_FOLDERS="$DATA_DIR/GUIAct/GUIAct/web_imgs,$DATA_DIR/AndroidControl/AndroidControl/tfrecord/images,$DATA_DIR/Wave-UI/Wave-UI/images_fixed,$DATA_DIR/Uground/Uground/images,$DATA_DIR/gta/gta_data/image"
 
-    # Per-dataset limits: GUIAct=all, AndroidControl=all, Wave-UI=all, UGround=60K, GTA=all
-    MAX_PER_DS="0,0,0,60000,0"
+    # Per-dataset limits: GUIAct=all, AndroidControl=all, Wave-UI=all, UGround=60K, GTA=60K
+    MAX_PER_DS="0,0,0,60000,60000"
 
     OUTPUT_NAME="ours_v6_fullparam_aima_aligned"
 
