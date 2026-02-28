@@ -575,8 +575,9 @@ class SaccadeTrainer:
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     should_log = self.use_deepspeed or (micro % ga == 0)
                     if should_log:
-                        def ar(k):
-                            return sum(self.metrics[k][-20:]) / max(len(self.metrics[k][-20:]), 1)
+                        def ar(k, n=100):
+                            vals = self.metrics[k][-n:]
+                            return sum(vals) / max(len(vals), 1)
                         lr_val = (self.model_engine.get_lr()[0] if self.use_deepspeed
                                   else self.scheduler.get_last_lr()[0])
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
@@ -584,8 +585,8 @@ class SaccadeTrainer:
                               f"rounds={ar('avg_rounds'):.1f} "
                               f"crop_hit={ar('crop_hit'):.1%} lr={lr_val:.2e}")
                         for key in list(self.metrics.keys()):
-                            if len(self.metrics[key]) > 200:
-                                self.metrics[key] = self.metrics[key][-200:]
+                            if len(self.metrics[key]) > 500:
+                                self.metrics[key] = self.metrics[key][-500:]
 
                 if self.global_step % self.args.save_steps == 0 and self.global_step > 0:
                     self._save(f"checkpoint-{self.global_step}")
