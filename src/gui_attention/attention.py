@@ -170,14 +170,12 @@ def token_to_spatial(local_token_idx: int, n_width: int, n_height: int,
             pixel_attn = F.conv2d(pixel_attn, k_h)
             pixel_attn = F.conv2d(pixel_attn, k_w)
 
-        # Weighted average coordinate (normalised 0-1)
+        # Argmax on blurred pixel-level attention → sub-patch precision
         pixel_attn = pixel_attn.squeeze()  # (h_px, w_px)
-        ys = torch.arange(h_px, dtype=torch.float32, device=pixel_attn.device)
-        xs = torch.arange(w_px, dtype=torch.float32, device=pixel_attn.device)
-        total = pixel_attn.sum()
-        if total > 0:
-            wy = (pixel_attn.sum(dim=1) * ys).sum() / total / h_px
-            wx = (pixel_attn.sum(dim=0) * xs).sum() / total / w_px
-            return wx.item(), wy.item()
+        peak_idx = pixel_attn.argmax().item()
+        peak_row = peak_idx // w_px
+        peak_col = peak_idx % w_px
+        # Normalise to [0, 1] — use pixel center (+0.5)
+        return (peak_col + 0.5) / w_px, (peak_row + 0.5) / h_px
 
     return (col + 0.5) / n_width, (row + 0.5) / n_height
