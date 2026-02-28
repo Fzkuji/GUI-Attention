@@ -124,8 +124,32 @@ def identify_attended_image(
     return len(visual_ranges) - 1, global_argmax - cumulative
 
 
-def token_to_spatial(local_token_idx: int, n_width: int, n_height: int):
-    """Convert a flat visual token index to normalised (x, y) coordinates."""
+def token_to_spatial(local_token_idx: int, n_width: int, n_height: int,
+                     attn_weights=None):
+    """Convert a flat visual token index to normalised (x, y) coordinates.
+
+    If *attn_weights* (1-D tensor of length n_width*n_height) is provided,
+    use a 3×3 neighbourhood around the argmax token to compute a
+    weighted-average position for sub-patch precision.
+    """
     col = local_token_idx % n_width
     row = local_token_idx // n_width
+
+    if attn_weights is not None:
+        # 3×3 weighted refinement
+        attn_2d = attn_weights.detach().float().view(n_height, n_width)
+        w_col = 0.0
+        w_row = 0.0
+        total = 0.0
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                r, c = row + dr, col + dc
+                if 0 <= r < n_height and 0 <= c < n_width:
+                    w = attn_2d[r, c].item()
+                    w_row += w * (r + 0.5)
+                    w_col += w * (c + 0.5)
+                    total += w
+        if total > 0:
+            return w_col / total / n_width, w_row / total / n_height
+
     return (col + 0.5) / n_width, (row + 0.5) / n_height

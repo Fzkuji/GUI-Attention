@@ -160,6 +160,7 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
             image, image_path, example["instruction"],
             model, tokenizer, builder,
             max_rounds=args.rounds, crop_ratio=args.crop_ratio,
+            crop_upsample_pixels=args.crop_upsample_pixels,
             device=str(device),
         )
         t_elapsed = time.time() - t_start
@@ -215,7 +216,9 @@ def main():
 
     # Saccade
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.3)
+    parser.add_argument("--crop_ratio", type=float, default=0.2)
+    parser.add_argument("--crop_upsample_pixels", type=int, default=1003520,
+                        help="Upsample crop to this many pixels (0=disabled)")
 
     # Resolution
     parser.add_argument("--low_res_max_pixels", type=int, default=LOW_RES_MAX_PIXELS)

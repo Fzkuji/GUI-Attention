@@ -287,7 +287,8 @@ else
         --min_pixels 3136 \
         --low_res_max_pixels 1003520 \
         --high_res_max_pixels 5720064 \
-        --crop_ratio 0.3 \
+        --crop_ratio 0.2 \
+        --crop_upsample_pixels 1003520 \
         --crop_jitter 0.05 \
         --max_saccade_rounds 3 \
         --lora_r 32 \
@@ -336,7 +337,7 @@ else
             --checkpoint "$CHECKPOINT" \
             --base_model "$BASE_MODEL" \
             --data_path "$DATA_DIR/ScreenSpot-Pro" \
-            --rounds 3 --crop_ratio 0.3 --device cuda:0 \
+            --rounds 3 --crop_ratio 0.2 --device cuda:0 \
             2>&1 | tee "$LOG_DIR/eval_screenspot_pro.txt"
     fi
 
@@ -345,7 +346,7 @@ else
     python eval/eval_screenspot.py \
         --checkpoint "$CHECKPOINT" \
         --base_model "$BASE_MODEL" \
-        --rounds 3 --crop_ratio 0.3 --device cuda:0 \
+        --rounds 3 --crop_ratio 0.2 --device cuda:0 \
         2>&1 | tee "$LOG_DIR/eval_screenspot_v1.txt"
 
     # ScreenSpot v2
@@ -353,7 +354,7 @@ else
     python eval/eval_screenspot_v2.py \
         --checkpoint "$CHECKPOINT" \
         --base_model "$BASE_MODEL" \
-        --rounds 3 --crop_ratio 0.3 --device cuda:0 \
+        --rounds 3 --crop_ratio 0.2 --device cuda:0 \
         2>&1 | tee "$LOG_DIR/eval_screenspot_v2.txt"
 fi
 

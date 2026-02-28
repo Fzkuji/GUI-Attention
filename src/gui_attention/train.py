@@ -78,7 +78,8 @@ class ScriptArgs:
     min_pixels: int = field(default=3136)
     low_res_max_pixels: int = field(default=LOW_RES_MAX_PIXELS)
     high_res_max_pixels: int = field(default=HIGH_RES_MAX_PIXELS)
-    crop_ratio: float = field(default=0.3)
+    crop_ratio: float = field(default=0.2)
+    crop_upsample_pixels: int = field(default=1003520, metadata={"help": "Upsample crop to this many pixels (0=disabled). Default matches low_res_max_pixels."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     max_saccade_rounds: int = field(default=3, metadata={"help": "Max rounds per sample (round 0 + up to N-1 saccades)"})
     # LoRA
@@ -306,7 +307,9 @@ class SaccadeTrainer:
         # Model's round-0 prediction (used as crop center for round 1)
         with torch.no_grad():
             _, local_idx0 = identify_attended_image(attn0.squeeze(0), vis_ranges0)
-            pred_x, pred_y = token_to_spatial(local_idx0, nw0, nh0)
+            # 3×3 weighted refinement: extract low-res attention slice
+            low_attn = attn0.squeeze(0)[vis_ranges0[0][0]:vis_ranges0[0][0]+vis_ranges0[0][1]]
+            pred_x, pred_y = token_to_spatial(local_idx0, nw0, nh0, attn_weights=low_attn)
             round_preds.append((pred_x, pred_y))
 
         # ===== Subsequent rounds: saccade with model's own predictions =====
@@ -314,7 +317,8 @@ class SaccadeTrainer:
         # considers unmasked low-res + latest crop; old crops are masked out.
         for round_n in range(1, self.sa.max_saccade_rounds):
             # Crop at model's prediction from previous round
-            cropped, crop_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio)
+            cropped, crop_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio,
+                                              upsample_pixels=self.sa.crop_upsample_pixels)
 
             # Check if GT center is findable in this crop
             gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
@@ -392,7 +396,9 @@ class SaccadeTrainer:
                         attn.squeeze(0), vis_ranges)
                     if img_idx < len(grid_dims):
                         nh_a, nw_a = grid_dims[img_idx]
-                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a)
+                        off_a, n_a = vis_ranges[img_idx]
+                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
                         info = self.builder.image_infos[img_idx]
                         bx1, by1, bx2, by2 = info.global_bbox
                         round_preds.append((
@@ -431,7 +437,9 @@ class SaccadeTrainer:
                         attn.squeeze(0), vis_ranges)
                     if img_idx < len(grid_dims):
                         nh_a, nw_a = grid_dims[img_idx]
-                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a)
+                        off_a, n_a = vis_ranges[img_idx]
+                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
                         info = self.builder.image_infos[img_idx]
                         bx1, by1, bx2, by2 = info.global_bbox
                         pred_x = bx1 + lx * (bx2 - bx1)
