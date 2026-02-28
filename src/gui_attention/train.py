@@ -261,7 +261,9 @@ class SaccadeTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
-        merge = self.model.backbone.base_model.model.visual.spatial_merge_size
+        _base = self.model.backbone.base_model.model
+        _visual = getattr(_base, 'visual', None) or getattr(_base, 'vision_model', None) or _base.model.visual
+        merge = _visual.spatial_merge_size
 
         self.builder.reset()
         self.model.train()
