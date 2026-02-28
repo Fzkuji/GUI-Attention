@@ -78,7 +78,7 @@ def build_model(
     backbone.print_trainable_parameters()
 
     # Build action head (match backbone dtype)
-    d_model = backbone.config.hidden_size
+    d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
     action_head = ActionHead(d_model=d_model, projection_dim=d_model)
     action_head = action_head.to(torch_dtype)
 
@@ -210,7 +210,7 @@ class Qwen25VLWithActionHead(nn.Module):
         backbone = PeftModel.from_pretrained(backbone, path)
 
         # Load action head
-        d_model = backbone.config.hidden_size
+        d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
         action_head = ActionHead(d_model=d_model, projection_dim=d_model)
         head_path = os.path.join(path, "action_head.pt")
         if os.path.exists(head_path):
