@@ -81,6 +81,8 @@ class ScriptArgs:
     crop_ratio: float = field(default=0.2)
     crop_upsample_pixels: int = field(default=1003520, metadata={"help": "Upsample crop to this many pixels (0=disabled). Default matches low_res_max_pixels."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
+    soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
+    soft_label_sigma: float = field(default=2.0, metadata={"help": "Sigma in grid-cell units for soft label Gaussian"})
     max_saccade_rounds: int = field(default=3, metadata={"help": "Max rounds per sample (round 0 + up to N-1 saccades)"})
     # LoRA
     lora_r: int = field(default=32)
@@ -297,7 +299,9 @@ class SaccadeTrainer:
         grid_dims0 = self.builder.get_image_grid_dims(inp0["image_grid_thw"], merge)
         nh0, nw0 = grid_dims0[0]
 
-        labels0 = compute_binary_labels(nh0, nw0, bbox_gt).to(device).unsqueeze(0)
+        labels0 = compute_binary_labels(nh0, nw0, bbox_gt,
+                                         soft=self.sa.soft_labels,
+                                         sigma_scale=self.sa.soft_label_sigma).to(device).unsqueeze(0)
         attn0, loss0 = self.model.action_head(vis_hidden0, anchor0, labels=labels0)
 
         if loss0 is not None:
@@ -376,7 +380,9 @@ class SaccadeTrainer:
                         max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
                         max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
                     )
-                    high_labels = compute_binary_labels(nh_high, nw_high, local_gt)
+                    high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
+                                                        soft=self.sa.soft_labels,
+                                                        sigma_scale=self.sa.soft_label_sigma)
                 else:
                     high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
 
@@ -411,7 +417,9 @@ class SaccadeTrainer:
 
             else:
                 # --- Saccade: GT not in crop, redirect to unmasked low-res ---
-                low_labels = compute_binary_labels(nh0, nw0, bbox_gt)
+                low_labels = compute_binary_labels(nh0, nw0, bbox_gt,
+                                                    soft=self.sa.soft_labels,
+                                                    sigma_scale=self.sa.soft_label_sigma)
                 low_labels[this_crop_mask] = 0.0  # zero out current crop's patches
 
                 if low_labels.sum() > 0:

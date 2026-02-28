@@ -1,26 +1,40 @@
-"""Binary overlap label generation for action head supervision.
+"""Label generation for action head supervision.
 
-Replaces the v3 IoU x Gaussian soft labels with simple binary overlap masks
-matching GUI-Actor's label scheme: any patch overlapping with GT bbox = 1.
+Supports binary overlap labels (v4) and Gaussian-weighted soft labels (v5).
+Soft labels encode sub-patch positional information: patches closer to the
+GT bbox centre receive higher weights, encouraging the model to concentrate
+attention precisely on the target rather than spreading it uniformly across
+all overlapping patches.
 """
 
+import math
 import torch
 
 
-def compute_binary_labels(n_height: int, n_width: int, gt_bbox: tuple) -> torch.Tensor:
-    """Generate binary overlap labels over a visual token grid.
+def compute_binary_labels(n_height: int, n_width: int, gt_bbox: tuple,
+                          soft: bool = True, sigma_scale: float = 2.0) -> torch.Tensor:
+    """Generate labels over a visual token grid.
 
-    A patch is positive (1) if it has ANY overlap with gt_bbox, else 0.
+    When *soft=False* (legacy): binary labels — any patch overlapping GT = 1.
+    When *soft=True* (default): Gaussian-weighted labels centred on the GT
+    bbox centre.  Overlapping patches get weight ∝ exp(-d²/2σ²) where d is
+    the distance from the patch centre to the GT centre (in grid units) and
+    σ = sigma_scale (default 2.0 grid cells).  Non-overlapping patches = 0.
+    The result is normalised so max = 1.
 
     Args:
         n_height: number of rows in the visual token grid.
         n_width: number of columns in the visual token grid.
         gt_bbox: (x1, y1, x2, y2) normalised ground-truth bounding box.
+        soft: if True, use Gaussian weighting; otherwise binary.
+        sigma_scale: σ in grid-cell units for the Gaussian (only if soft=True).
 
     Returns:
-        (n_height * n_width,) binary tensor.
+        (n_height * n_width,) float tensor.
     """
     x1, y1, x2, y2 = gt_bbox
+    gt_cx = (x1 + x2) / 2
+    gt_cy = (y1 + y2) / 2
     patch_w = 1.0 / n_width
     patch_h = 1.0 / n_height
 
@@ -35,15 +49,29 @@ def compute_binary_labels(n_height: int, n_width: int, gt_bbox: tuple) -> torch.
             px2 = px1 + patch_w
             if px2 <= x1 or px1 >= x2:
                 continue
-            labels[row * n_width + col] = 1.0
 
-    # Fallback: if no overlap, set closest patch to 1
+            if soft:
+                # Patch centre in normalised coords
+                pcx = (col + 0.5) / n_width
+                pcy = (row + 0.5) / n_height
+                # Distance in grid-cell units
+                dx = (pcx - gt_cx) / patch_w
+                dy = (pcy - gt_cy) / patch_h
+                dist_sq = dx * dx + dy * dy
+                labels[row * n_width + col] = math.exp(-dist_sq / (2.0 * sigma_scale * sigma_scale))
+            else:
+                labels[row * n_width + col] = 1.0
+
+    # Fallback: if no overlap, set closest patch
     if labels.sum() == 0:
-        gt_cx = (x1 + x2) / 2
-        gt_cy = (y1 + y2) / 2
         closest_col = min(max(int(gt_cx * n_width), 0), n_width - 1)
         closest_row = min(max(int(gt_cy * n_height), 0), n_height - 1)
         labels[closest_row * n_width + closest_col] = 1.0
+
+    # Normalise so max = 1
+    max_val = labels.max()
+    if max_val > 0:
+        labels = labels / max_val
 
     return labels
 
