@@ -19,7 +19,7 @@ def build_model(
     lora_alpha: int = 64,
     lora_target_modules: str = "q_proj,v_proj",
     torch_dtype=None,
-    attn_implementation: str = "sdpa",
+    attn_implementation: str = "flash_attention_2",
     gradient_checkpointing: bool = True,
 ):
     """Build Qwen2.5-VL with LoRA and ActionHead.
