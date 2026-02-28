@@ -143,7 +143,7 @@ print('  Download complete.')
     cd "$DATA_DIR"
 
     # GUIAct (4 GB)
-    if [ -f "GUIAct_images.zip" ] && [ ! -d "GUIAct/web_imgs" ]; then
+    if [ -f "GUIAct_images.zip" ] && [ ! -d "GUIAct/GUIAct/web_imgs" ]; then
         echo "  Extracting GUIAct..."
         unzip -q -o GUIAct_images.zip -d GUIAct/
         rm -f GUIAct_images.zip
@@ -158,7 +158,7 @@ print('  Download complete.')
     fi
 
     # Wave-UI (24.4 GB)
-    if [ -f "Wave-UI_images.zip" ] && [ ! -d "Wave-UI/images_fixed" ]; then
+    if [ -f "Wave-UI_images.zip" ] && [ ! -d "Wave-UI/Wave-UI/images_fixed" ]; then
         echo "  Extracting Wave-UI..."
         mkdir -p Wave-UI
         unzip -q -o Wave-UI_images.zip -d Wave-UI/
@@ -166,7 +166,7 @@ print('  Download complete.')
     fi
 
     # AndroidControl (49.3 GB)
-    if [ -f "AndroidControl_images.zip" ] && [ ! -d "AndroidControl/tfrecord/images" ]; then
+    if [ -f "AndroidControl_images.zip" ] && [ ! -d "AndroidControl/AndroidControl/tfrecord/images" ]; then
         echo "  Extracting AndroidControl..."
         mkdir -p AndroidControl
         unzip -q -o AndroidControl_images.zip -d AndroidControl/
@@ -184,7 +184,7 @@ print('  Download complete.')
 
     # UGround (256 GB, 6 zip split volumes: .zip + .z01-.z05)
     # Use 7z directly on the main volume — do NOT cat/merge
-    if [ -f "Uground_images_split.zip" ] && [ ! -d "Uground/images" ]; then
+    if [ -f "Uground_images_split.zip" ] && [ ! -d "Uground/Uground/images" ]; then
         echo "  Extracting UGround (6-part zip split volume)..."
         mkdir -p Uground
         7z x Uground_images_split.zip -aoa -oUground/
