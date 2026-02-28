@@ -242,13 +242,12 @@ class SaccadeTrainer:
     # -- multi-round saccade forward ----------------------------------------
 
     def _forward_sample(self, sample):
-        """Multi-round saccade with model's own predictions for crop locations.
+        """Single-round training with random scenario selection.
 
-        Round 0: low-res → predict → loss
-        Round 1+:
-          - Crop at MODEL's prediction (not GT)
-          - GT in crop → supervise high-res localization, stop
-          - GT not in crop → supervise saccade (unmasked low-res GT patches)
+        With 50% probability:
+          - LOW-RES: low-res full image → action head → loss
+          - CROP: no_grad low-res → get model's crop prediction →
+                  low-res + crop (with grad) → action head → loss
 
         Returns (total_loss, num_valid_rounds, round_preds).
         """
@@ -274,66 +273,102 @@ class SaccadeTrainer:
         n_valid = 0
         round_preds = []
 
-        # ===== Round 0: low-res full image =====
-        r0_inputs, cur_text, cur_images = self.builder.build_round0(
-            sample, sample["instruction"],
-        )
-        inp0 = {k: v.to(device) for k, v in r0_inputs.items()}
+        use_crop = random.random() < 0.5
 
-        outputs0 = self.model(
-            input_ids=inp0["input_ids"],
-            attention_mask=inp0.get("attention_mask"),
-            pixel_values=inp0.get("pixel_values"),
-            image_grid_thw=inp0.get("image_grid_thw"),
-        )
-        last_hs0 = outputs0.hidden_states[-1]
+        if not use_crop:
+            # ===== LOW-RES SCENARIO: single low-res image =====
+            r0_inputs, cur_text, cur_images = self.builder.build_round0(
+                sample, sample["instruction"],
+            )
+            inp0 = {k: v.to(device) for k, v in r0_inputs.items()}
 
-        vis_hidden0, vis_ranges0 = extract_visual_hidden_states(
-            last_hs0, inp0["input_ids"], img_tok)
-        anchor0 = extract_anchor_hidden_states(
-            last_hs0, inp0["input_ids"], pp_id, n=0)
+            outputs0 = self.model(
+                input_ids=inp0["input_ids"],
+                attention_mask=inp0.get("attention_mask"),
+                pixel_values=inp0.get("pixel_values"),
+                image_grid_thw=inp0.get("image_grid_thw"),
+            )
+            last_hs0 = outputs0.hidden_states[-1]
 
-        if vis_hidden0 is None or anchor0 is None:
-            return total_loss, 0, []
+            vis_hidden0, vis_ranges0 = extract_visual_hidden_states(
+                last_hs0, inp0["input_ids"], img_tok)
+            anchor0 = extract_anchor_hidden_states(
+                last_hs0, inp0["input_ids"], pp_id, n=0)
 
-        grid_dims0 = self.builder.get_image_grid_dims(inp0["image_grid_thw"], merge)
-        nh0, nw0 = grid_dims0[0]
+            if vis_hidden0 is None or anchor0 is None:
+                return total_loss, 0, []
 
-        labels0 = compute_binary_labels(nh0, nw0, bbox_gt,
-                                         soft=self.sa.soft_labels,
-                                         sigma_scale=self.sa.soft_label_sigma).to(device).unsqueeze(0)
-        attn0, loss0 = self.model.action_head(vis_hidden0, anchor0, labels=labels0)
+            grid_dims0 = self.builder.get_image_grid_dims(inp0["image_grid_thw"], merge)
+            nh0, nw0 = grid_dims0[0]
 
-        if loss0 is not None:
-            total_loss = total_loss + loss0
-            n_valid += 1
+            labels0 = compute_binary_labels(nh0, nw0, bbox_gt,
+                                             soft=self.sa.soft_labels,
+                                             sigma_scale=self.sa.soft_label_sigma).to(device).unsqueeze(0)
+            attn0, loss0 = self.model.action_head(vis_hidden0, anchor0, labels=labels0)
 
-        # Model's round-0 prediction (used as crop center for round 1)
-        with torch.no_grad():
-            _, local_idx0 = identify_attended_image(attn0.squeeze(0), vis_ranges0)
-            # 3×3 weighted refinement: extract low-res attention slice
-            low_attn = attn0.squeeze(0)[vis_ranges0[0][0]:vis_ranges0[0][0]+vis_ranges0[0][1]]
-            pred_x, pred_y = token_to_spatial(local_idx0, nw0, nh0, attn_weights=low_attn)
-            round_preds.append((pred_x, pred_y))
+            if loss0 is not None:
+                total_loss = total_loss + loss0
+                n_valid += 1
 
-        # ===== Subsequent rounds: saccade with model's own predictions =====
-        # LLM sees full history (all crops accumulated). Action head only
-        # considers unmasked low-res + latest crop; old crops are masked out.
-        for round_n in range(1, self.sa.max_saccade_rounds):
-            # Crop at model's prediction from previous round
+            with torch.no_grad():
+                _, local_idx0 = identify_attended_image(attn0.squeeze(0), vis_ranges0)
+                low_attn = attn0.squeeze(0)[vis_ranges0[0][0]:vis_ranges0[0][0]+vis_ranges0[0][1]]
+                pred_x, pred_y = token_to_spatial(local_idx0, nw0, nh0, attn_weights=low_attn)
+                round_preds.append((pred_x, pred_y))
+
+        else:
+            # ===== CROP SCENARIO: no_grad low-res → crop → train on crop =====
+
+            # Step 1: no_grad forward on low-res to get crop position
+            self.model.eval()
+            with torch.no_grad():
+                r0_inputs, cur_text, cur_images = self.builder.build_round0(
+                    sample, sample["instruction"],
+                )
+                inp0 = {k: v.to(device) for k, v in r0_inputs.items()}
+
+                outputs0 = self.model(
+                    input_ids=inp0["input_ids"],
+                    attention_mask=inp0.get("attention_mask"),
+                    pixel_values=inp0.get("pixel_values"),
+                    image_grid_thw=inp0.get("image_grid_thw"),
+                )
+                last_hs0 = outputs0.hidden_states[-1]
+
+                vis_hidden0, vis_ranges0 = extract_visual_hidden_states(
+                    last_hs0, inp0["input_ids"], img_tok)
+                anchor0 = extract_anchor_hidden_states(
+                    last_hs0, inp0["input_ids"], pp_id, n=0)
+
+                if vis_hidden0 is None or anchor0 is None:
+                    return total_loss, 0, []
+
+                grid_dims0 = self.builder.get_image_grid_dims(inp0["image_grid_thw"], merge)
+                nh0, nw0 = grid_dims0[0]
+
+                attn0, _ = self.model.action_head(vis_hidden0, anchor0)
+                _, local_idx0 = identify_attended_image(attn0.squeeze(0), vis_ranges0)
+                low_attn = attn0.squeeze(0)[vis_ranges0[0][0]:vis_ranges0[0][0]+vis_ranges0[0][1]]
+                pred_x, pred_y = token_to_spatial(local_idx0, nw0, nh0, attn_weights=low_attn)
+                round_preds.append((pred_x, pred_y))
+
+            # Step 2: Crop and forward with gradients
+            self.model.train()
             cropped, crop_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio,
                                               upsample_pixels=self.sa.crop_upsample_pixels)
-
-            # Check if GT center is findable in this crop
             gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
 
-            # Extend context (accumulate all crops for LLM context)
+            # Re-build context: low-res + crop
+            self.builder.reset()
+            r0_inputs, cur_text, cur_images = self.builder.build_round0(
+                sample, sample["instruction"],
+            )
             try:
                 r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                     cur_text, cur_images, cropped, crop_bbox,
                 )
             except Exception:
-                break
+                return total_loss, 0, round_preds
 
             inp = {k: v.to(device) for k, v in r_inputs.items()}
 
@@ -348,29 +383,24 @@ class SaccadeTrainer:
             vis_hidden, vis_ranges = extract_visual_hidden_states(
                 last_hs, inp["input_ids"], img_tok)
             anchor = extract_anchor_hidden_states(
-                last_hs, inp["input_ids"], pp_id, n=round_n)
+                last_hs, inp["input_ids"], pp_id, n=1)
 
             if vis_hidden is None or anchor is None or len(vis_ranges) < 2:
-                break
+                return total_loss, 0, round_preds
 
             grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
             n_low = vis_ranges[0][1]
             n_total = vis_hidden.shape[0]
             latest_img_idx = len(vis_ranges) - 1
 
-            # Action head mask: current crop masks low-res + ALL old crops masked out
+            # Mask: crop area in low-res is masked
             this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
             full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
             full_mask[:n_low] = this_crop_mask.to(device)
-            # Mask all previous crop tokens (indices 1 to latest-1)
-            for prev_i in range(1, latest_img_idx):
-                off, ntok = vis_ranges[prev_i]
-                full_mask[off:off + ntok] = True
 
             if gt_in_crop:
-                # --- Target found in crop: supervise high-res localization ---
+                # Supervise on high-res crop
                 nh_high, nw_high = grid_dims[latest_img_idx]
-
                 cbx1, cby1, cbx2, cby2 = crop_bbox
                 cbw, cbh = cbx2 - cbx1, cby2 - cby1
                 if cbw > 0 and cbh > 0:
@@ -396,31 +426,14 @@ class SaccadeTrainer:
                     total_loss = total_loss + loss
                     n_valid += 1
 
-                # Record final prediction
-                with torch.no_grad():
-                    img_idx, local_idx = identify_attended_image(
-                        attn.squeeze(0), vis_ranges)
-                    if img_idx < len(grid_dims):
-                        nh_a, nw_a = grid_dims[img_idx]
-                        off_a, n_a = vis_ranges[img_idx]
-                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
-                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-                        info = self.builder.image_infos[img_idx]
-                        bx1, by1, bx2, by2 = info.global_bbox
-                        round_preds.append((
-                            bx1 + lx * (bx2 - bx1),
-                            by1 + ly * (by2 - by1),
-                        ))
-
                 self.metrics["crop_hit"].append(1)
-                break  # Target found in crop, stop saccade
 
             else:
-                # --- Saccade: GT not in crop, redirect to unmasked low-res ---
+                # Saccade: GT not in crop, supervise on unmasked low-res
                 low_labels = compute_binary_labels(nh0, nw0, bbox_gt,
                                                     soft=self.sa.soft_labels,
                                                     sigma_scale=self.sa.soft_label_sigma)
-                low_labels[this_crop_mask] = 0.0  # zero out current crop's patches
+                low_labels[this_crop_mask] = 0.0
 
                 if low_labels.sum() > 0:
                     full_labels = torch.zeros(1, n_total, device=device)
@@ -432,29 +445,27 @@ class SaccadeTrainer:
                         total_loss = total_loss + loss
                         n_valid += 1
                 else:
-                    # All GT-overlapping patches are masked — skip loss
                     with torch.no_grad():
                         attn, _ = self.model.action_head(
                             vis_hidden, anchor, mask=full_mask)
 
                 self.metrics["crop_hit"].append(0)
 
-                # Get prediction for next round's crop center
-                with torch.no_grad():
-                    img_idx, local_idx = identify_attended_image(
-                        attn.squeeze(0), vis_ranges)
-                    if img_idx < len(grid_dims):
-                        nh_a, nw_a = grid_dims[img_idx]
-                        off_a, n_a = vis_ranges[img_idx]
-                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
-                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-                        info = self.builder.image_infos[img_idx]
-                        bx1, by1, bx2, by2 = info.global_bbox
-                        pred_x = bx1 + lx * (bx2 - bx1)
-                        pred_y = by1 + ly * (by2 - by1)
-                        round_preds.append((pred_x, pred_y))
-                    else:
-                        break  # Can't determine prediction
+            # Record final prediction
+            with torch.no_grad():
+                img_idx, local_idx = identify_attended_image(
+                    attn.squeeze(0), vis_ranges)
+                if img_idx < len(grid_dims):
+                    nh_a, nw_a = grid_dims[img_idx]
+                    off_a, n_a = vis_ranges[img_idx]
+                    img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                    lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                    info = self.builder.image_infos[img_idx]
+                    bx1, by1, bx2, by2 = info.global_bbox
+                    round_preds.append((
+                        bx1 + lx * (bx2 - bx1),
+                        by1 + ly * (by2 - by1),
+                    ))
 
         if n_valid > 0:
             total_loss = total_loss / n_valid
