@@ -551,6 +551,68 @@ class SaccadeTrainer:
                 traceback.print_exc()
         return acc_loss, acc_n
 
+    # -- debug ----------------------------------------------------------------
+
+    def _print_sample_debug(self, sample):
+        """Print a complete training sample for debugging the data pipeline."""
+        print("\n" + "=" * 70)
+        print("  DEBUG: First training sample")
+        print("=" * 70)
+        print(f"  image_path: {sample['image_path']}")
+        print(f"  instruction: {sample['instruction']}")
+        print(f"  bbox_gt: {sample['bbox_gt']}")
+        gt_cx = (sample['bbox_gt'][0] + sample['bbox_gt'][2]) / 2
+        gt_cy = (sample['bbox_gt'][1] + sample['bbox_gt'][3]) / 2
+        print(f"  gt_center: ({gt_cx:.4f}, {gt_cy:.4f})")
+
+        # Build round0 inputs to show the actual model input
+        try:
+            from PIL import Image
+            img = Image.open(sample["image_path"]).convert("RGB")
+            print(f"  image_size: {img.size} (w×h)")
+
+            self.builder.reset()
+            r0_inputs, cur_text, cur_images = self.builder.build_round0(
+                sample, sample["instruction"],
+            )
+
+            input_ids = r0_inputs["input_ids"][0]
+            print(f"  input_ids shape: {r0_inputs['input_ids'].shape}")
+            print(f"  pixel_values shape: {r0_inputs['pixel_values'].shape}")
+            print(f"  image_grid_thw: {r0_inputs['image_grid_thw']}")
+
+            # Decode the text tokens (skip image tokens for readability)
+            img_tok_id = self.model.config.image_token_id
+            non_img_ids = input_ids[input_ids != img_tok_id]
+            n_img_tokens = (input_ids == img_tok_id).sum().item()
+            decoded = self.tokenizer.decode(non_img_ids, skip_special_tokens=False)
+            print(f"  n_visual_tokens: {n_img_tokens}")
+            print(f"  text (without img tokens):")
+            # Print first/last part to keep it readable
+            if len(decoded) > 500:
+                print(f"    {decoded[:250]}")
+                print(f"    ... ({len(decoded)} chars total) ...")
+                print(f"    {decoded[-250:]}")
+            else:
+                print(f"    {decoded}")
+
+            # Show special token positions
+            pp_id = self.model.config.pointer_pad_token_id
+            ps_id = self.model.config.pointer_start_token_id
+            pe_id = self.model.config.pointer_end_token_id
+            pp_pos = (input_ids == pp_id).nonzero(as_tuple=True)[0].tolist()
+            ps_pos = (input_ids == ps_id).nonzero(as_tuple=True)[0].tolist()
+            pe_pos = (input_ids == pe_id).nonzero(as_tuple=True)[0].tolist()
+            print(f"  pointer_start positions: {ps_pos}")
+            print(f"  pointer_pad (anchor) positions: {pp_pos}")
+            print(f"  pointer_end positions: {pe_pos}")
+
+            self.builder.reset()  # Clean up
+        except Exception as e:
+            print(f"  (debug failed: {e})")
+
+        print("=" * 70 + "\n")
+
     # -- main train loop ------------------------------------------------------
 
     def train(self):
@@ -570,6 +632,10 @@ class SaccadeTrainer:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
                 print(f"  lora_targets={self.sa.lora_target_modules}")
             print(f"  world_size={self.world_size}  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
+
+        # Print a complete training sample for debugging
+        if self.rank == 0:
+            self._print_sample_debug(self.train_data[0])
 
         if not self.use_deepspeed:
             self.optimizer.zero_grad()
