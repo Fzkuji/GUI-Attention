@@ -40,8 +40,10 @@ def build_model(
     )
     backbone.config.use_cache = False
 
-    if gradient_checkpointing and hasattr(backbone, "enable_input_require_grads"):
-        backbone.enable_input_require_grads()
+    if gradient_checkpointing:
+        backbone.gradient_checkpointing_enable()
+        if hasattr(backbone, "enable_input_require_grads"):
+            backbone.enable_input_require_grads()
 
     # Add pointer special tokens
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
