@@ -1,10 +1,13 @@
 """Label generation for action head supervision.
 
-Supports binary overlap labels (v4) and Gaussian-weighted soft labels (v5).
-Soft labels encode sub-patch positional information: patches closer to the
-GT bbox centre receive higher weights, encouraging the model to concentrate
-attention precisely on the target rather than spreading it uniformly across
-all overlapping patches.
+Supports binary overlap labels (v4) and pixel-integrated Gaussian soft
+labels (v5).  Soft labels are computed by:
+  1. Creating a pixel-level Gaussian heatmap centred on the GT point.
+  2. Averaging the pixel values within each patch's spatial extent.
+This encodes sub-patch positional information: the relative weights of
+neighbouring patches implicitly represent where within the patch grid
+the GT target lies, enabling blur+argmax at inference to recover
+pixel-level coordinates.
 """
 
 import math
@@ -12,22 +15,24 @@ import torch
 
 
 def compute_binary_labels(n_height: int, n_width: int, gt_bbox: tuple,
-                          soft: bool = True, sigma_scale: float = 2.0) -> torch.Tensor:
+                          soft: bool = True, sigma_scale: float = 2.0,
+                          pixel_size: int = 56) -> torch.Tensor:
     """Generate labels over a visual token grid.
 
     When *soft=False* (legacy): binary labels — any patch overlapping GT = 1.
-    When *soft=True* (default): Gaussian-weighted labels centred on the GT
-    bbox centre.  Overlapping patches get weight ∝ exp(-d²/2σ²) where d is
-    the distance from the patch centre to the GT centre (in grid units) and
-    σ = sigma_scale (default 2.0 grid cells).  Non-overlapping patches = 0.
-    The result is normalised so max = 1.
+    When *soft=True* (default): pixel-integrated Gaussian labels.
+      1. Build a pixel-level Gaussian heatmap (n_height*pixel_size,
+         n_width*pixel_size) centred on the GT bbox centre.
+      2. Average-pool each patch region to get the patch weight.
+    σ is defined in pixel space as sigma_scale * pixel_size.
 
     Args:
         n_height: number of rows in the visual token grid.
         n_width: number of columns in the visual token grid.
         gt_bbox: (x1, y1, x2, y2) normalised ground-truth bounding box.
-        soft: if True, use Gaussian weighting; otherwise binary.
-        sigma_scale: σ in grid-cell units for the Gaussian (only if soft=True).
+        soft: if True, use pixel-integrated Gaussian; otherwise binary.
+        sigma_scale: σ multiplier (σ_pixels = sigma_scale * pixel_size).
+        pixel_size: pixels per token (spatial_merge_size * patch_size).
 
     Returns:
         (n_height * n_width,) float tensor.
@@ -35,43 +40,63 @@ def compute_binary_labels(n_height: int, n_width: int, gt_bbox: tuple,
     x1, y1, x2, y2 = gt_bbox
     gt_cx = (x1 + x2) / 2
     gt_cy = (y1 + y2) / 2
-    patch_w = 1.0 / n_width
-    patch_h = 1.0 / n_height
 
-    labels = torch.zeros(n_height * n_width)
-    for row in range(n_height):
-        py1 = row * patch_h
-        py2 = py1 + patch_h
-        if py2 <= y1 or py1 >= y2:
-            continue
-        for col in range(n_width):
-            px1 = col * patch_w
-            px2 = px1 + patch_w
-            if px2 <= x1 or px1 >= x2:
+    if not soft:
+        # Legacy binary labels
+        patch_w = 1.0 / n_width
+        patch_h = 1.0 / n_height
+        labels = torch.zeros(n_height * n_width)
+        for row in range(n_height):
+            py1 = row * patch_h
+            py2 = py1 + patch_h
+            if py2 <= y1 or py1 >= y2:
                 continue
-
-            if soft:
-                # Patch centre in normalised coords
-                pcx = (col + 0.5) / n_width
-                pcy = (row + 0.5) / n_height
-                # Distance in grid-cell units
-                dx = (pcx - gt_cx) / patch_w
-                dy = (pcy - gt_cy) / patch_h
-                dist_sq = dx * dx + dy * dy
-                labels[row * n_width + col] = math.exp(-dist_sq / (2.0 * sigma_scale * sigma_scale))
-            else:
+            for col in range(n_width):
+                px1 = col * patch_w
+                px2 = px1 + patch_w
+                if px2 <= x1 or px1 >= x2:
+                    continue
                 labels[row * n_width + col] = 1.0
 
-    # Fallback: if no overlap, set closest patch
-    if labels.sum() == 0:
-        closest_col = min(max(int(gt_cx * n_width), 0), n_width - 1)
-        closest_row = min(max(int(gt_cy * n_height), 0), n_height - 1)
-        labels[closest_row * n_width + closest_col] = 1.0
+        if labels.sum() == 0:
+            closest_col = min(max(int(gt_cx * n_width), 0), n_width - 1)
+            closest_row = min(max(int(gt_cy * n_height), 0), n_height - 1)
+            labels[closest_row * n_width + closest_col] = 1.0
+        return labels
+
+    # --- Pixel-integrated Gaussian soft labels ---
+    h_px = n_height * pixel_size
+    w_px = n_width * pixel_size
+    sigma = sigma_scale * pixel_size
+
+    # GT centre in pixel coordinates
+    cx_px = gt_cx * w_px
+    cy_px = gt_cy * h_px
+
+    # Build 1D Gaussians (separable) for efficiency
+    xs = torch.arange(w_px, dtype=torch.float32) + 0.5  # pixel centres
+    ys = torch.arange(h_px, dtype=torch.float32) + 0.5
+    gx = torch.exp(-0.5 * ((xs - cx_px) / sigma) ** 2)
+    gy = torch.exp(-0.5 * ((ys - cy_px) / sigma) ** 2)
+
+    # 2D Gaussian via outer product: (h_px, w_px)
+    heatmap = gy.unsqueeze(1) * gx.unsqueeze(0)
+
+    # Average-pool into patch grid: reshape → (n_height, pixel_size, n_width, pixel_size) → mean
+    heatmap = heatmap.view(n_height, pixel_size, n_width, pixel_size)
+    labels = heatmap.mean(dim=(1, 3))  # (n_height, n_width)
+    labels = labels.reshape(-1)  # (n_height * n_width,)
 
     # Normalise so max = 1
     max_val = labels.max()
     if max_val > 0:
         labels = labels / max_val
+
+    # Fallback: if all zeros (shouldn't happen with Gaussian, but safety)
+    if labels.sum() == 0:
+        closest_col = min(max(int(gt_cx * n_width), 0), n_width - 1)
+        closest_row = min(max(int(gt_cy * n_height), 0), n_height - 1)
+        labels[closest_row * n_width + closest_col] = 1.0
 
     return labels
 
