@@ -281,6 +281,7 @@ else
     torchrun --nproc_per_node=$NUM_GPUS \
         src/gui_attention/train.py \
         --model_name_or_path "$MODEL_DIR/Qwen2.5-VL-3B-Instruct" \
+        --attn_implementation sdpa \
         --data_path "$DATA_PATHS" \
         --image_folder "$IMAGE_FOLDERS" \
         --output_dir "$RESULT_DIR/$OUTPUT_NAME" \
