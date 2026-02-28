@@ -84,13 +84,19 @@ class ScriptArgs:
     soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
     soft_label_sigma: float = field(default=2.0, metadata={"help": "Sigma in grid-cell units for soft label Gaussian"})
     max_saccade_rounds: int = field(default=3, metadata={"help": "Max rounds per sample (round 0 + up to N-1 saccades)"})
-    # LoRA
+    # LoRA (ignored when use_lora=False)
+    use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=64)
     lora_target_modules: str = field(default="q_proj,v_proj")
-    # Dual LR
+    # Dual LR (when use_lora=True: action_head_lr for head, lora_lr for backbone)
+    # When use_lora=False: action_head_lr for head, lora_lr for backbone (all params)
     action_head_lr: float = field(default=1e-4)
-    lora_lr: float = field(default=5e-5)
+    lora_lr: float = field(default=5e-5, metadata={"help": "LR for backbone params (LoRA or full)"})
+    # Per-dataset sample limits
+    max_samples_per_dataset: Optional[str] = field(default=None, metadata={
+        "help": "Comma-separated per-dataset max samples, e.g. '0,0,0,60000,0'. 0=no limit."
+    })
     # Resume
     resume_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
 
@@ -130,8 +136,13 @@ def load_single_dataset(data_path, image_folder):
     return samples
 
 
-def load_dataset(data_path, image_folder, max_samples=None):
-    """Load one or more datasets. Comma-separated paths for multiple datasets."""
+def load_dataset(data_path, image_folder, max_samples=None, max_samples_per_dataset=None):
+    """Load one or more datasets. Comma-separated paths for multiple datasets.
+
+    Args:
+        max_samples_per_dataset: comma-separated per-dataset limits, e.g. "0,0,0,60000,0".
+            0 means no limit. Must match number of datasets if provided.
+    """
     data_paths = [p.strip() for p in data_path.split(",")]
     image_folders = [p.strip() for p in image_folder.split(",")]
     if len(image_folders) == 1 and len(data_paths) > 1:
@@ -139,10 +150,22 @@ def load_dataset(data_path, image_folder, max_samples=None):
     assert len(data_paths) == len(image_folders), \
         f"Mismatch: {len(data_paths)} data_paths vs {len(image_folders)} image_folders"
 
+    # Parse per-dataset limits
+    per_ds_limits = None
+    if max_samples_per_dataset:
+        per_ds_limits = [int(x.strip()) for x in max_samples_per_dataset.split(",")]
+        assert len(per_ds_limits) == len(data_paths), \
+            f"max_samples_per_dataset has {len(per_ds_limits)} entries but {len(data_paths)} datasets"
+
     samples = []
-    for dp, imf in zip(data_paths, image_folders):
+    for i, (dp, imf) in enumerate(zip(data_paths, image_folders)):
         s = load_single_dataset(dp, imf)
-        print(f"  {os.path.basename(dp)}: {len(s)} samples")
+        limit = per_ds_limits[i] if per_ds_limits else 0
+        if limit > 0 and len(s) > limit:
+            s = s[:limit]  # take first N (like GUI-AIMA's "first:60000")
+            print(f"  {os.path.basename(dp)}: {len(s)} samples (limited to {limit})")
+        else:
+            print(f"  {os.path.basename(dp)}: {len(s)} samples")
         samples.extend(s)
 
     if max_samples:
@@ -517,13 +540,15 @@ class SaccadeTrainer:
         max_steps = getattr(self.args, 'max_steps', -1) or -1
 
         if self.rank == 0:
-            print("=== Saccade Foveation Training (v4: LoRA + ActionHead) ===")
+            mode = "Full-param" if not self.sa.use_lora else "LoRA"
+            print(f"=== Saccade Foveation Training (v5: {mode} + ActionHead) ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  low_res={self.sa.low_res_max_pixels}  high_res={self.sa.high_res_max_pixels}")
             print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
-            print(f"  action_head_lr={self.sa.action_head_lr}  lora_lr={self.sa.lora_lr}")
-            print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
-            print(f"  lora_targets={self.sa.lora_target_modules}")
+            print(f"  action_head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
+            if self.sa.use_lora:
+                print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
+                print(f"  lora_targets={self.sa.lora_target_modules}")
             print(f"  world_size={self.world_size}  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
 
         if not self.use_deepspeed:
@@ -604,22 +629,43 @@ class SaccadeTrainer:
     def _save(self, name):
         if self.world_size > 1:
             dist.barrier()
-        if self.rank != 0:
-            return
         p = os.path.join(self.args.output_dir, name)
-        os.makedirs(p, exist_ok=True)
-        self.model.save_pretrained(p)
-        self.tokenizer.save_pretrained(p)
-        with open(os.path.join(p, "metrics.json"), "w") as f:
-            json.dump({k: v[-100:] for k, v in self.metrics.items()}, f)
-        # Save training state for resume
-        if not self.use_deepspeed:
+
+        if self.use_deepspeed:
+            # ZeRO-3: use DeepSpeed's save which gathers sharded params
+            # Save full model checkpoint via DeepSpeed
+            self.model_engine.save_checkpoint(p, tag="ds_ckpt")
+            if self.rank == 0:
+                # Also save action head separately
+                os.makedirs(p, exist_ok=True)
+                torch.save(self.model.action_head.state_dict(), os.path.join(p, "action_head.pt"))
+                self.tokenizer.save_pretrained(p)
+                # Try to save consolidated model via zero_to_fp32
+                try:
+                    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+                    state_dict = get_fp32_state_dict_from_zero_checkpoint(os.path.join(p, "ds_ckpt"))
+                    # Save backbone
+                    self.model.backbone.save_pretrained(p, state_dict=state_dict)
+                except Exception as e:
+                    print(f"  Warning: could not consolidate ZeRO-3 weights: {e}")
+                    print(f"  Use `deepspeed.utils.zero_to_fp32` to convert later.")
+        else:
+            if self.rank != 0:
+                return
+            os.makedirs(p, exist_ok=True)
+            self.model.save_pretrained(p)
+            self.tokenizer.save_pretrained(p)
+            # Save training state for resume
             torch.save({
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
                 "global_step": self.global_step,
             }, os.path.join(p, "training_state.pt"))
-        print(f"  Saved: {p}")
+
+        if self.rank == 0:
+            with open(os.path.join(p, "metrics.json"), "w") as f:
+                json.dump({k: v[-100:] for k, v in self.metrics.items()}, f)
+            print(f"  Saved: {p}")
 
 
 # -- Main --------------------------------------------------------------------
@@ -645,6 +691,7 @@ def main():
         lora_target_modules=sa.lora_target_modules,
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
         gradient_checkpointing=ta.gradient_checkpointing,
+        use_lora=sa.use_lora,
     )
 
     # Load model weights from checkpoint if resuming
@@ -652,16 +699,24 @@ def main():
         ckpt = sa.resume_ckpt
         if rank == 0:
             print(f"Loading model weights from checkpoint: {ckpt}")
-        # Load LoRA adapter weights
-        from peft import set_peft_model_state_dict
-        adapter_file = os.path.join(ckpt, "adapter_model.safetensors")
-        if os.path.exists(adapter_file):
-            from safetensors.torch import load_file
-            adapter_state = load_file(adapter_file)
+        if sa.use_lora:
+            # Load LoRA adapter weights
+            from peft import set_peft_model_state_dict
+            adapter_file = os.path.join(ckpt, "adapter_model.safetensors")
+            if os.path.exists(adapter_file):
+                from safetensors.torch import load_file
+                adapter_state = load_file(adapter_file)
+            else:
+                adapter_state = torch.load(os.path.join(ckpt, "adapter_model.bin"),
+                                           map_location="cpu", weights_only=True)
+            set_peft_model_state_dict(model.backbone, adapter_state)
         else:
-            adapter_state = torch.load(os.path.join(ckpt, "adapter_model.bin"),
-                                       map_location="cpu", weights_only=True)
-        set_peft_model_state_dict(model.backbone, adapter_state)
+            # Full model: load backbone state dict
+            model_file = os.path.join(ckpt, "model.safetensors")
+            if os.path.exists(model_file):
+                from safetensors.torch import load_file
+                state = load_file(model_file)
+                model.backbone.load_state_dict(state, strict=False)
         # Load action head weights
         head_path = os.path.join(ckpt, "action_head.pt")
         if os.path.exists(head_path):
@@ -673,7 +728,7 @@ def main():
     if not (HAS_DEEPSPEED and ta.deepspeed):
         model.to(f"cuda:{local_rank}")
 
-    train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples)
+    train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples, sa.max_samples_per_dataset)
     os.makedirs(ta.output_dir, exist_ok=True)
 
     trainer = SaccadeTrainer(model, tokenizer, train_data, ta, sa)

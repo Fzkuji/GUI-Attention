@@ -21,8 +21,12 @@ def build_model(
     torch_dtype=None,
     attn_implementation: str = "flash_attention_2",
     gradient_checkpointing: bool = True,
+    use_lora: bool = True,
 ):
-    """Build Qwen2.5-VL with LoRA and ActionHead.
+    """Build Qwen2.5-VL with optional LoRA and ActionHead.
+
+    Args:
+        use_lora: If True, apply LoRA (default). If False, full parameter fine-tuning.
 
     Returns:
         model: Qwen25VLWithActionHead (the wrapper).
@@ -66,18 +70,26 @@ def build_model(
         ADDITIONAL_SPECIAL_TOKENS[2]
     )
 
-    # Apply LoRA
-    target_modules = [m.strip() for m in lora_target_modules.split(",")]
-    lora_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=target_modules,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    backbone = get_peft_model(backbone, lora_config)
-    backbone.print_trainable_parameters()
+    if use_lora:
+        # Apply LoRA
+        target_modules = [m.strip() for m in lora_target_modules.split(",")]
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        backbone = get_peft_model(backbone, lora_config)
+        backbone.print_trainable_parameters()
+    else:
+        # Full parameter fine-tuning: all parameters trainable
+        for param in backbone.parameters():
+            param.requires_grad = True
+        total = sum(p.numel() for p in backbone.parameters())
+        trainable = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+        print(f"Full fine-tuning: {trainable:,} / {total:,} params ({100*trainable/total:.1f}%)")
 
     # Build action head (match backbone dtype)
     d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
@@ -89,6 +101,7 @@ def build_model(
     processor.tokenizer = tokenizer
 
     model = Qwen25VLWithActionHead(backbone, action_head)
+    model._use_lora = use_lora
     return model, tokenizer, processor
 
 
@@ -158,10 +171,10 @@ class Qwen25VLWithActionHead(nn.Module):
         return hs[0][mask]  # (n_anchor, d_model)
 
     def save_pretrained(self, path):
-        """Save LoRA adapter + action head."""
+        """Save model weights + action head."""
         import os
         os.makedirs(path, exist_ok=True)
-        # Save LoRA adapter weights
+        # Save backbone (LoRA adapter or full model)
         self.backbone.save_pretrained(path)
         # Save action head separately
         torch.save(self.action_head.state_dict(), os.path.join(path, "action_head.pt"))
