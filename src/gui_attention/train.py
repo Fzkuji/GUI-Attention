@@ -534,6 +534,13 @@ class SaccadeTrainer:
                     else:
                         break  # can't continue without a valid prediction
 
+        # Track total visual tokens from the last round's input
+        try:
+            n_img_tokens = (inp["input_ids"][0] == img_tok).sum().item()
+            self.metrics["vis_tokens"].append(n_img_tokens)
+        except Exception:
+            pass
+
         if n_valid > 0:
             total_loss = total_loss / n_valid
         return total_loss, n_valid, round_preds
@@ -720,7 +727,8 @@ class SaccadeTrainer:
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
-                              f"crop_hit={ar('crop_hit'):.1%} head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
+                              f"crop_hit={ar('crop_hit'):.1%} tokens={ar('vis_tokens'):.0f} "
+                              f"head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
                                 self.metrics[key] = self.metrics[key][-500:]
