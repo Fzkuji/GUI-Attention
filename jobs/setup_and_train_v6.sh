@@ -110,7 +110,7 @@ else
         --crop_ratio 0.3 \
         --crop_target_pixels 200704 \
         --crop_jitter 0.05 \
-        --max_saccade_rounds 3 \
+        --max_saccade_rounds 4 \
         --no_use_lora \
         --action_head_lr 5e-5 \
         --lora_lr 5e-6 \

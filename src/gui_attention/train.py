@@ -85,7 +85,7 @@ class ScriptArgs:
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
     soft_label_sigma: float = field(default=2.0, metadata={"help": "Sigma in grid-cell units for soft label Gaussian"})
-    max_saccade_rounds: int = field(default=3, metadata={"help": "Max rounds per sample (round 0 + up to N-1 saccades)"})
+    max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
     # LoRA (ignored when use_lora=False)
     use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
     lora_r: int = field(default=32)
@@ -475,6 +475,24 @@ class SaccadeTrainer:
                         n_valid += 1
 
                     self.metrics["crop_hit"].append(1)
+
+                    # Early stop: GT is in crop, no need for more rounds
+                    # Record prediction and break
+                    with torch.no_grad():
+                        img_idx, local_idx = identify_attended_image(
+                            attn.squeeze(0), vis_ranges)
+                        if img_idx < len(grid_dims):
+                            nh_a, nw_a = grid_dims[img_idx]
+                            off_a, n_a = vis_ranges[img_idx]
+                            img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                            info = self.builder.image_infos[img_idx]
+                            bx1, by1, bx2, by2 = info.global_bbox
+                            round_preds.append((
+                                bx1 + lx * (bx2 - bx1),
+                                by1 + ly * (by2 - by1),
+                            ))
+                    break
 
                 else:
                     # GT not in crop, supervise on unmasked low-res
