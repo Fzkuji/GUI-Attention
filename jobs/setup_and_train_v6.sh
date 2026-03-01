@@ -105,7 +105,7 @@ else
         --max_samples_per_dataset "$MAX_PER_DS" \
         --output_dir "$RESULT_DIR/$OUTPUT_NAME" \
         --min_pixels 3136 \
-        --low_res_max_pixels 200704 \
+        --low_res_max_pixels 400000 \
         --high_res_max_pixels 5720064 \
         --crop_ratio 0.3 \
         --crop_target_pixels 200704 \
