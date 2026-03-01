@@ -84,6 +84,7 @@ class ScriptArgs:
     crop_upsample_pixels: int = field(default=0, metadata={"help": "(Legacy) Upsample crop to this many pixels. Overridden by crop_target_pixels."})
     crop_target_pixels: int = field(default=200704, metadata={"help": "Resize crop to exactly this pixel budget (both enlarge and shrink). 0=disabled."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
+    align_crop_mrope: bool = field(default=True, metadata={"help": "Align crop M-RoPE position_ids to low-res spatial grid. False = default sequential positions."})
     soft_labels: bool = field(default=False, metadata={"help": "Use Gaussian soft labels (default: binary overlap labels)"})
     soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
@@ -409,23 +410,26 @@ class SaccadeTrainer:
 
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
 
-                # Adjust M-RoPE position_ids for crop spatial alignment
-                position_ids, _ = _backbone_for_rope.get_rope_index(
-                    input_ids=inp["input_ids"],
-                    image_grid_thw=inp.get("image_grid_thw"),
-                    attention_mask=inp.get("attention_mask"),
-                )
-                position_ids = adjust_crop_position_ids(
-                    position_ids, inp["input_ids"], inp["image_grid_thw"],
-                    merge, crop_bbox, img_tok,
-                )
+                # Optionally align crop M-RoPE position_ids to low-res spatial grid
+                extra_kwargs = {}
+                if self.sa.align_crop_mrope:
+                    position_ids, _ = _backbone_for_rope.get_rope_index(
+                        input_ids=inp["input_ids"],
+                        image_grid_thw=inp.get("image_grid_thw"),
+                        attention_mask=inp.get("attention_mask"),
+                    )
+                    position_ids = adjust_crop_position_ids(
+                        position_ids, inp["input_ids"], inp["image_grid_thw"],
+                        merge, crop_bbox, img_tok,
+                    )
+                    extra_kwargs["position_ids"] = position_ids
 
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp.get("pixel_values"),
                     image_grid_thw=inp.get("image_grid_thw"),
-                    position_ids=position_ids,
+                    **extra_kwargs,
                 )
                 last_hs = outputs.hidden_states[-1]
 
