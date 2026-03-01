@@ -17,7 +17,9 @@
 
 set -e
 
-WORK_DIR="${WORK_DIR:-$HOME/GUI-Attention-Workspace}"
+# Auto-detect: script is at WORK_DIR/GUI-Attention/jobs/setup_and_train_v6.sh
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORK_DIR="${WORK_DIR:-$(dirname $(dirname "$SCRIPT_DIR"))}"
 NUM_GPUS="${NUM_GPUS:-8}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-1}"
 SKIP_TRAIN="${SKIP_TRAIN:-0}"
