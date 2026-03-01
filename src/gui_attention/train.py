@@ -84,7 +84,7 @@ class ScriptArgs:
     crop_target_pixels: int = field(default=200704, metadata={"help": "Resize crop to exactly this pixel budget (both enlarge and shrink). 0=disabled."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
-    soft_label_sigma: float = field(default=2.0, metadata={"help": "Sigma in grid-cell units for soft label Gaussian"})
+    soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
     # LoRA (ignored when use_lora=False)
     use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
@@ -713,12 +713,14 @@ class SaccadeTrainer:
                         def ar(k, n=100):
                             vals = self.metrics[k][-n:]
                             return sum(vals) / max(len(vals), 1)
-                        lr_val = (self.model_engine.get_lr()[0] if self.use_deepspeed
-                                  else self.scheduler.get_last_lr()[0])
+                        all_lrs = (self.model_engine.get_lr() if self.use_deepspeed
+                                   else self.scheduler.get_last_lr())
+                        lr_val = all_lrs[0]  # action_head lr
+                        bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val  # backbone lr
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
-                              f"crop_hit={ar('crop_hit'):.1%} lr={lr_val:.2e}")
+                              f"crop_hit={ar('crop_hit'):.1%} head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
                                 self.metrics[key] = self.metrics[key][-500:]
