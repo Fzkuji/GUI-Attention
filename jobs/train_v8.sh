@@ -97,7 +97,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --weight_decay 0.0 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.01 \
     --logging_steps 10 \
     --save_strategy steps \
     --save_steps 5000 \
