@@ -320,14 +320,16 @@ class SaccadeTrainer:
         n_valid = 0
         round_preds = []
 
-        # Get backbone for rope index computation
+        # Get backbone for rope index computation — unwrap LoRA/PEFT layers
         _backbone_for_rope = self.model.backbone
-        if hasattr(_backbone_for_rope, 'get_rope_index'):
-            pass
-        elif hasattr(_backbone_for_rope, 'base_model'):
-            _backbone_for_rope = _backbone_for_rope.base_model
-            if hasattr(_backbone_for_rope, 'model') and hasattr(_backbone_for_rope.model, 'get_rope_index'):
-                _backbone_for_rope = _backbone_for_rope.model
+        # Walk through possible wrapping: PeftModel -> LoraModel -> Qwen2_5_VLForConditionalGeneration -> Qwen2_5_VLModel
+        for _attr in ('base_model', 'model', 'model'):
+            if hasattr(_backbone_for_rope, 'get_rope_index'):
+                break
+            if hasattr(_backbone_for_rope, _attr):
+                _backbone_for_rope = getattr(_backbone_for_rope, _attr)
+        if not hasattr(_backbone_for_rope, 'get_rope_index'):
+            raise AttributeError(f"Cannot find get_rope_index on backbone. Final type: {type(_backbone_for_rope)}")
 
         max_rounds = self.sa.max_saccade_rounds  # e.g. 3
         pred_x, pred_y = gt_cx, gt_cy  # will be overwritten by round 0
