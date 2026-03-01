@@ -166,7 +166,7 @@ def run_saccade_inference(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _ = model.action_head(vis_hidden, anchor)
+    attn0, _, _ = model.action_head(vis_hidden, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Use BFS prediction for round 0
@@ -251,7 +251,7 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        attn_ri, _ = model.action_head(vis_hidden, anchor, mask=full_mask)
+        attn_ri, _, _ = model.action_head(vis_hidden, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         # Identify which image has argmax

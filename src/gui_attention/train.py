@@ -43,6 +43,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import transformers
 from PIL import Image, ImageFile
 from tqdm import tqdm
@@ -357,10 +358,10 @@ class SaccadeTrainer:
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 nh0, nw0 = grid_dims[0]
 
+                # Round 0: binary labels (coarse navigation, not final positioning)
                 labels = compute_binary_labels(nh0, nw0, bbox_gt,
-                                               soft=self.sa.soft_labels,
-                                               sigma_scale=self.sa.soft_label_sigma).to(device).unsqueeze(0)
-                attn, loss = self.model.action_head(vis_hidden, anchor, labels=labels)
+                                               soft=False).to(device).unsqueeze(0)
+                attn, loss, _ = self.model.action_head(vis_hidden, anchor, labels=labels)
 
                 if loss is not None:
                     total_loss = total_loss + loss
@@ -446,41 +447,65 @@ class SaccadeTrainer:
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
 
-                if gt_in_crop:
-                    # Supervise on latest crop
-                    nh_high, nw_high = grid_dims[latest_img_idx]
-                    cbx1, cby1, cbx2, cby2 = crop_bbox
-                    cbw, cbh = cbx2 - cbx1, cby2 - cby1
-                    if cbw > 0 and cbh > 0:
-                        local_gt = (
-                            max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
-                            max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
-                            max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
-                            max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
-                        )
-                        high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
-                                                            soft=self.sa.soft_labels,
-                                                            sigma_scale=self.sa.soft_label_sigma)
+                # --- Single forward through action head (with gradient) ---
+                attn, _, logits = self.model.action_head(
+                    vis_hidden, anchor, mask=full_mask)
+
+                # Determine which image the model attends to
+                with torch.no_grad():
+                    img_idx, local_idx = identify_attended_image(
+                        attn.squeeze(0), vis_ranges)
+                    attended_crop = (img_idx == latest_img_idx)
+
+                # --- Build labels based on model's attention decision ---
+                if attended_crop:
+                    # Model chose to look at the crop → FINAL round
+                    self.metrics["crop_hit"].append(1 if gt_in_crop else 0)
+
+                    if gt_in_crop:
+                        # Correct crop: soft label on crop for precise positioning
+                        nh_high, nw_high = grid_dims[latest_img_idx]
+                        cbx1, cby1, cbx2, cby2 = crop_bbox
+                        cbw, cbh = cbx2 - cbx1, cby2 - cby1
+                        if cbw > 0 and cbh > 0:
+                            local_gt = (
+                                max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
+                                max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
+                                max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
+                                max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
+                            )
+                            high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
+                                                                soft=self.sa.soft_labels,
+                                                                sigma_scale=self.sa.soft_label_sigma)
+                        else:
+                            high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
+
+                        full_labels = torch.zeros(1, n_total, device=device)
+                        offset_hi, n_hi = vis_ranges[latest_img_idx]
+                        full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
                     else:
-                        high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
+                        # Wrong crop: label on low-res correct patch (binary)
+                        low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
+                        low_labels[this_crop_mask] = 0.0
+                        full_labels = torch.zeros(1, n_total, device=device)
+                        if low_labels.sum() > 0:
+                            full_labels[0, :n_low] = low_labels.to(device)
+                        else:
+                            low_labels_full = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
+                            full_labels[0, :n_low] = low_labels_full.to(device)
 
-                    full_labels = torch.zeros(1, n_total, device=device)
-                    offset_hi, n_hi = vis_ranges[latest_img_idx]
-                    full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
+                    # Compute KL loss from existing logits (no second forward)
+                    eps = 1e-8
+                    target_dist = full_labels.float()
+                    row_sums = target_dist.sum(dim=-1, keepdim=True)
+                    target_dist = target_dist / (row_sums + eps)
+                    pred_log = F.log_softmax(logits, dim=-1)
+                    loss = F.kl_div(pred_log, target_dist, reduction="batchmean")
+                    total_loss = total_loss + loss
+                    n_valid += 1
 
-                    attn, loss = self.model.action_head(
-                        vis_hidden, anchor, labels=full_labels, mask=full_mask)
-                    if loss is not None:
-                        total_loss = total_loss + loss
-                        n_valid += 1
-
-                    self.metrics["crop_hit"].append(1)
-
-                    # Early stop: GT is in crop, no need for more rounds
-                    # Record prediction and break
+                    # Record prediction and BREAK
                     with torch.no_grad():
-                        img_idx, local_idx = identify_attended_image(
-                            attn.squeeze(0), vis_ranges)
                         if img_idx < len(grid_dims):
                             nh_a, nw_a = grid_dims[img_idx]
                             off_a, n_a = vis_ranges[img_idx]
@@ -495,32 +520,28 @@ class SaccadeTrainer:
                     break
 
                 else:
-                    # GT not in crop, supervise on unmasked low-res
-                    low_labels = compute_binary_labels(nh0, nw0, bbox_gt,
-                                                        soft=self.sa.soft_labels,
-                                                        sigma_scale=self.sa.soft_label_sigma)
+                    # Model chose low-res → saccade, continue
+                    low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
                     low_labels[this_crop_mask] = 0.0
 
                     if low_labels.sum() > 0:
                         full_labels = torch.zeros(1, n_total, device=device)
                         full_labels[0, :n_low] = low_labels.to(device)
 
-                        attn, loss = self.model.action_head(
-                            vis_hidden, anchor, labels=full_labels, mask=full_mask)
-                        if loss is not None:
-                            total_loss = total_loss + loss
-                            n_valid += 1
-                    else:
-                        with torch.no_grad():
-                            attn, _ = self.model.action_head(
-                                vis_hidden, anchor, mask=full_mask)
+                        # Compute KL loss from existing logits
+                        eps = 1e-8
+                        target_dist = full_labels.float()
+                        row_sums = target_dist.sum(dim=-1, keepdim=True)
+                        target_dist = target_dist / (row_sums + eps)
+                        pred_log = F.log_softmax(logits, dim=-1)
+                        loss = F.kl_div(pred_log, target_dist, reduction="batchmean")
+                        total_loss = total_loss + loss
+                        n_valid += 1
 
                     self.metrics["crop_hit"].append(0)
 
-                # Record prediction for this round
+                # Record prediction for saccade rounds
                 with torch.no_grad():
-                    img_idx, local_idx = identify_attended_image(
-                        attn.squeeze(0), vis_ranges)
                     if img_idx < len(grid_dims):
                         nh_a, nw_a = grid_dims[img_idx]
                         off_a, n_a = vis_ranges[img_idx]
@@ -532,7 +553,7 @@ class SaccadeTrainer:
                         pred_y = by1 + ly * (by2 - by1)
                         round_preds.append((pred_x, pred_y))
                     else:
-                        break  # can't continue without a valid prediction
+                        break
 
         # Track total visual tokens from the last round's input
         try:

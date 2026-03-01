@@ -81,4 +81,4 @@ class ActionHead(nn.Module):
             pred_log = F.log_softmax(logits, dim=-1)
             loss = F.kl_div(pred_log, target_dist, reduction="batchmean")
 
-        return attn_weights, loss
+        return attn_weights, loss, logits
