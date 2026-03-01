@@ -447,11 +447,6 @@ class SaccadeTrainer:
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
 
-                # --- Single forward through action head (with gradient) ---
-                attn, _, logits = self.model.action_head(
-                    vis_hidden, anchor, mask=full_mask)
-
-                # --- GT-based decision: break if GT is in crop (Phase 1) ---
                 if gt_in_crop:
                     # GT in crop → FINAL round, binary label on crop
                     nh_high, nw_high = grid_dims[latest_img_idx]
@@ -473,15 +468,11 @@ class SaccadeTrainer:
                     offset_hi, n_hi = vis_ranges[latest_img_idx]
                     full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
-                    # KL loss from cached logits
-                    eps = 1e-8
-                    target_dist = full_labels.float()
-                    row_sums = target_dist.sum(dim=-1, keepdim=True)
-                    target_dist = target_dist / (row_sums + eps)
-                    pred_log = F.log_softmax(logits, dim=-1)
-                    loss = F.kl_div(pred_log, target_dist, reduction="batchmean")
-                    total_loss = total_loss + loss
-                    n_valid += 1
+                    attn, loss, _ = self.model.action_head(
+                        vis_hidden, anchor, labels=full_labels, mask=full_mask)
+                    if loss is not None:
+                        total_loss = total_loss + loss
+                        n_valid += 1
 
                     self.metrics["crop_hit"].append(1)
 
@@ -511,14 +502,15 @@ class SaccadeTrainer:
                         full_labels = torch.zeros(1, n_total, device=device)
                         full_labels[0, :n_low] = low_labels.to(device)
 
-                        eps = 1e-8
-                        target_dist = full_labels.float()
-                        row_sums = target_dist.sum(dim=-1, keepdim=True)
-                        target_dist = target_dist / (row_sums + eps)
-                        pred_log = F.log_softmax(logits, dim=-1)
-                        loss = F.kl_div(pred_log, target_dist, reduction="batchmean")
-                        total_loss = total_loss + loss
-                        n_valid += 1
+                        attn, loss, _ = self.model.action_head(
+                            vis_hidden, anchor, labels=full_labels, mask=full_mask)
+                        if loss is not None:
+                            total_loss = total_loss + loss
+                            n_valid += 1
+                    else:
+                        with torch.no_grad():
+                            attn, _, _ = self.model.action_head(
+                                vis_hidden, anchor, mask=full_mask)
 
                     self.metrics["crop_hit"].append(0)
 
