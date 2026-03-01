@@ -16,3 +16,4 @@ wandb/
 data/
 configs/
 *.bak
+soft_labels_comparison.png
