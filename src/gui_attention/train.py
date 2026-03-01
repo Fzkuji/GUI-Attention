@@ -725,9 +725,9 @@ class SaccadeTrainer:
                         lr_val = all_lrs[0]  # action_head lr
                         bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val  # backbone lr
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
-                              f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
+                              f"hit={ar('hit_rate'):.1%} final_dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
-                              f"crop_hit={ar('crop_hit'):.1%} tokens={ar('vis_tokens'):.0f} "
+                              f"crop_hit={ar('crop_hit'):.1%} vis_tokens={ar('vis_tokens'):.0f} "
                               f"head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
