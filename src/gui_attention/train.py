@@ -419,10 +419,16 @@ class SaccadeTrainer:
             inp = {k: v.to(device) for k, v in r_inputs.items()}
 
             # Adjust M-RoPE position_ids so crop spatial positions map to low-res grid
-            _backbone_inner = self.model.backbone
-            if hasattr(_backbone_inner, 'base_model'):
-                _backbone_inner = _backbone_inner.base_model.model
-            position_ids, _ = _backbone_inner.get_rope_index(
+            # get_rope_index lives on Qwen2_5_VLForConditionalGeneration directly
+            # For PEFT: backbone.base_model.model; for plain: backbone itself
+            _backbone_for_rope = self.model.backbone
+            if hasattr(_backbone_for_rope, 'get_rope_index'):
+                pass  # already the right level
+            elif hasattr(_backbone_for_rope, 'base_model'):
+                _backbone_for_rope = _backbone_for_rope.base_model
+                if hasattr(_backbone_for_rope, 'model') and hasattr(_backbone_for_rope.model, 'get_rope_index'):
+                    _backbone_for_rope = _backbone_for_rope.model
+            position_ids, _ = _backbone_for_rope.get_rope_index(
                 input_ids=inp["input_ids"],
                 image_grid_thw=inp.get("image_grid_thw"),
                 attention_mask=inp.get("attention_mask"),
