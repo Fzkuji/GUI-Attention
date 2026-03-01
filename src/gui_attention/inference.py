@@ -9,6 +9,7 @@ from typing import List, Tuple
 import torch
 
 from gui_attention.attention import (
+    adjust_crop_position_ids,
     extract_anchor_hidden_states,
     extract_visual_hidden_states,
     identify_attended_image,
@@ -198,12 +199,28 @@ def run_saccade_inference(
             break
 
         inp = {k: v.to(device) for k, v in ri_inputs.items()}
+
+        # Adjust M-RoPE position_ids for crop spatial alignment
+        _backbone_inner = model.backbone
+        if hasattr(_backbone_inner, 'base_model'):
+            _backbone_inner = _backbone_inner.base_model.model
+        position_ids, _ = _backbone_inner.get_rope_index(
+            input_ids=inp["input_ids"],
+            image_grid_thw=inp.get("image_grid_thw"),
+            attention_mask=inp.get("attention_mask"),
+        )
+        position_ids = adjust_crop_position_ids(
+            position_ids, inp["input_ids"], inp["image_grid_thw"],
+            merge, crop_bbox, img_tok,
+        )
+
         with torch.no_grad():
             outputs = model(
                 input_ids=inp["input_ids"],
                 attention_mask=inp.get("attention_mask"),
                 pixel_values=inp.get("pixel_values"),
                 image_grid_thw=inp.get("image_grid_thw"),
+                position_ids=position_ids,
             )
 
         last_hs = outputs.hidden_states[-1]

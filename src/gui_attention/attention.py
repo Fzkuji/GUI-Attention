@@ -1,9 +1,10 @@
 """Attention utilities for action head (v4, no gui_aima dependency).
 
 Extracts LLM last-layer hidden states and feeds them through the ActionHead.
+Includes M-RoPE position adjustment for crop images.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -179,3 +180,82 @@ def token_to_spatial(local_token_idx: int, n_width: int, n_height: int,
         return (peak_col + 0.5) / w_px, (peak_row + 0.5) / h_px
 
     return (col + 0.5) / n_width, (row + 0.5) / n_height
+
+
+# ---------------------------------------------------------------------------
+# M-RoPE position adjustment for crop images
+# ---------------------------------------------------------------------------
+
+def adjust_crop_position_ids(
+    position_ids: torch.Tensor,
+    input_ids: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    merge_size: int,
+    crop_bbox: Tuple[float, float, float, float],
+    image_token_id: int,
+) -> torch.Tensor:
+    """Adjust M-RoPE position_ids so crop image's spatial positions map to
+    the corresponding positions in the low-res image's coordinate space.
+
+    The crop's h/w positions are remapped from [0, nh1) to [y1*nh0, y2*nh0)
+    and [x1*nw0, x2*nw0) respectively, where (nh0, nw0) is the low-res grid
+    and (x1, y1, x2, y2) is the crop bbox in normalised coordinates.
+
+    Args:
+        position_ids: (3, B, seq_len) — temporal, height, width.
+        input_ids: (B, seq_len) or (seq_len,).
+        image_grid_thw: (num_images, 3) — grid dims for each image.
+        merge_size: spatial merge size (typically 2).
+        crop_bbox: (x1, y1, x2, y2) normalised crop region in original image.
+        image_token_id: token id for image padding tokens.
+
+    Returns:
+        Modified position_ids with crop spatial positions adjusted.
+    """
+    if image_grid_thw.shape[0] < 2:
+        return position_ids  # No crop image, nothing to adjust
+
+    # Get grid dims for low-res (image 0) and crop (image 1)
+    nh0 = (image_grid_thw[0][1] // merge_size).item()
+    nw0 = (image_grid_thw[0][2] // merge_size).item()
+    nh1 = (image_grid_thw[1][1] // merge_size).item()
+    nw1 = (image_grid_thw[1][2] // merge_size).item()
+
+    x1, y1, x2, y2 = crop_bbox
+
+    # Find the crop image's token range (second contiguous block of image tokens)
+    ids = input_ids[0] if input_ids.dim() == 2 else input_ids
+    ranges = find_image_visual_ranges(ids, image_token_id)
+    if len(ranges) < 2:
+        return position_ids  # No second image found
+
+    crop_start, crop_end = ranges[1]
+    n_crop_tokens = crop_end - crop_start
+    expected = nh1 * nw1
+    if n_crop_tokens != expected:
+        return position_ids  # Mismatch, skip adjustment
+
+    # Get the base offset: the position value at the start of crop tokens
+    # position_ids shape: (3, B, seq_len)
+    base_h = position_ids[1, 0, crop_start].item()
+    base_w = position_ids[2, 0, crop_start].item()
+
+    # Original h positions for crop: base_h + [0, 0, ..., 1, 1, ..., nh1-1]
+    # Original w positions for crop: base_w + [0, 1, ..., nw1-1, 0, 1, ...]
+    # New h positions: base_h + linspace(y1*nh0, y2*nh0, nh1)
+    # New w positions: base_w + linspace(x1*nw0, x2*nw0, nw1)
+
+    h_mapped = torch.linspace(y1 * nh0, y2 * nh0, nh1).round().long()
+    w_mapped = torch.linspace(x1 * nw0, x2 * nw0, nw1).round().long()
+
+    # Build full grid: h_mapped repeated for each column, w_mapped tiled for each row
+    # Layout: row-major, token[r * nw1 + c] = grid position (r, c)
+    h_grid = h_mapped.unsqueeze(1).expand(nh1, nw1).flatten()  # (nh1*nw1,)
+    w_grid = w_mapped.unsqueeze(0).expand(nh1, nw1).flatten()  # (nh1*nw1,)
+
+    # Apply with base offset
+    position_ids = position_ids.clone()
+    position_ids[1, 0, crop_start:crop_end] = h_grid.to(position_ids.device) + base_h
+    position_ids[2, 0, crop_start:crop_end] = w_grid.to(position_ids.device) + base_w
+
+    return position_ids
