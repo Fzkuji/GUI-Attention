@@ -104,8 +104,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --save_total_limit 3 \
     --bf16 true \
     --gradient_checkpointing true \
-    --soft_labels true \
-    --soft_label_sigma 2.0 \
+    --soft_labels false \
     --report_to none \
     $RESUME_ARG \
     2>&1 | tee "$LOG_DIR/train_v8.txt"
