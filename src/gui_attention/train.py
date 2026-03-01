@@ -83,7 +83,7 @@ class ScriptArgs:
     crop_upsample_pixels: int = field(default=0, metadata={"help": "(Legacy) Upsample crop to this many pixels. Overridden by crop_target_pixels."})
     crop_target_pixels: int = field(default=200704, metadata={"help": "Resize crop to exactly this pixel budget (both enlarge and shrink). 0=disabled."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
-    soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
+    soft_labels: bool = field(default=False, metadata={"help": "Use Gaussian soft labels (default: binary overlap labels)"})
     soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
     # LoRA (ignored when use_lora=False)
