@@ -103,10 +103,10 @@ else
         --max_samples_per_dataset "$MAX_PER_DS" \
         --output_dir "$RESULT_DIR/$OUTPUT_NAME" \
         --min_pixels 3136 \
-        --low_res_max_pixels 1003520 \
+        --low_res_max_pixels 200704 \
         --high_res_max_pixels 5720064 \
-        --crop_ratio 0.2 \
-        --crop_upsample_pixels 1003520 \
+        --crop_ratio 0.3 \
+        --crop_target_pixels 200704 \
         --crop_jitter 0.05 \
         --max_saccade_rounds 3 \
         --no_use_lora \
@@ -148,7 +148,7 @@ else
             --checkpoint "$CHECKPOINT" \
             --base_model "$BASE_MODEL" \
             --data_path "$DATA_DIR/ScreenSpot-Pro" \
-            --rounds 3 --crop_ratio 0.2 --device cuda:0 \
+            --rounds 3 --crop_ratio 0.3 --crop_target_pixels 200704 --device cuda:0 \
             2>&1 | tee "$LOG_DIR/eval_screenspot_pro_v6.txt"
     fi
 
@@ -156,7 +156,7 @@ else
     python eval/eval_screenspot_v2.py \
         --checkpoint "$CHECKPOINT" \
         --base_model "$BASE_MODEL" \
-        --rounds 3 --crop_ratio 0.2 --device cuda:0 \
+        --rounds 3 --crop_ratio 0.3 --crop_target_pixels 200704 --device cuda:0 \
         2>&1 | tee "$LOG_DIR/eval_screenspot_v2_v6.txt"
 fi
 

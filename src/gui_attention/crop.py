@@ -7,17 +7,16 @@ from qwen_vl_utils import smart_resize
 
 
 def crop_image(image: Image.Image, cx_norm, cy_norm, crop_ratio,
-               upsample_pixels: int = 0):
-    """Crop around normalised centre and optionally upsample.
+               upsample_pixels: int = 0, crop_target_pixels: int = 0):
+    """Crop around normalised centre and resize to target pixel budget.
 
     Args:
         image: source PIL image.
         cx_norm, cy_norm: normalised crop centre.
-        crop_ratio: fraction of width/height to crop (e.g. 0.2 = 20%).
-        upsample_pixels: if > 0, resize the crop so its total pixels ≈ this
-            value (using smart_resize alignment to factor=28).  This enables
-            the foveation benefit: a small crop is enlarged to produce a
-            denser visual-token grid than the original low-res full image.
+        crop_ratio: fraction of width/height to crop (e.g. 0.3 = 30%).
+        upsample_pixels: (legacy) if > 0, only enlarge small crops to this size.
+        crop_target_pixels: if > 0, resize crop to exactly this pixel budget
+            (both enlarge and shrink). Overrides upsample_pixels.
 
     Returns:
         (cropped_pil, (x1, y1, x2, y2) normalised bbox in original coords).
@@ -36,8 +35,17 @@ def crop_image(image: Image.Image, cx_norm, cy_norm, crop_ratio,
 
     cropped = image.crop((x1, y1, x2, y2))
 
-    # Upsample: enlarge the crop so the visual-token grid is much denser.
-    if upsample_pixels > 0:
+    # Resize crop to target pixel budget (both enlarge and shrink)
+    if crop_target_pixels > 0:
+        cur_w, cur_h = cropped.size
+        new_h, new_w = smart_resize(
+            cur_h, cur_w, factor=28,
+            min_pixels=crop_target_pixels, max_pixels=crop_target_pixels,
+        )
+        if (new_w, new_h) != (cur_w, cur_h):
+            cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
+    elif upsample_pixels > 0:
+        # Legacy: only enlarge small crops
         cur_w, cur_h = cropped.size
         cur_pixels = cur_w * cur_h
         if cur_pixels < upsample_pixels:

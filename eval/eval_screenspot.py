@@ -157,7 +157,8 @@ def evaluate_all(model, tokenizer, dataset, args, builder):
             image, tmp_path, example["instruction"],
             model, tokenizer, builder,
             max_rounds=args.rounds, crop_ratio=args.crop_ratio,
-            crop_upsample_pixels=args.crop_upsample_pixels,
+            crop_upsample_pixels=args.crop_upsample_pixels, crop_target_pixels=args.crop_target_pixels,
+    parser.add_argument("--crop_target_pixels", type=int, default=200704)
             device=str(device),
         )
         t_elapsed = time.time() - t_start
@@ -208,8 +209,9 @@ def main():
     parser.add_argument("--save_path", type=str, default=None)
 
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.2)
-    parser.add_argument("--crop_upsample_pixels", type=int, default=1003520)
+    parser.add_argument("--crop_ratio", type=float, default=0.3)
+    parser.add_argument("--crop_upsample_pixels", type=int, default=0)
+    parser.add_argument("--crop_target_pixels", type=int, default=200704)
 
     parser.add_argument("--low_res_max_pixels", type=int, default=LOW_RES_MAX_PIXELS)
     parser.add_argument("--high_res_max_pixels", type=int, default=HIGH_RES_MAX_PIXELS)

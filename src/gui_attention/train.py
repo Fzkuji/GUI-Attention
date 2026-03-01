@@ -79,7 +79,8 @@ class ScriptArgs:
     low_res_max_pixels: int = field(default=LOW_RES_MAX_PIXELS)
     high_res_max_pixels: int = field(default=HIGH_RES_MAX_PIXELS)
     crop_ratio: float = field(default=0.2)
-    crop_upsample_pixels: int = field(default=1003520, metadata={"help": "Upsample crop to this many pixels (0=disabled). Default matches low_res_max_pixels."})
+    crop_upsample_pixels: int = field(default=0, metadata={"help": "(Legacy) Upsample crop to this many pixels. Overridden by crop_target_pixels."})
+    crop_target_pixels: int = field(default=200704, metadata={"help": "Resize crop to exactly this pixel budget (both enlarge and shrink). 0=disabled."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     soft_labels: bool = field(default=True, metadata={"help": "Use Gaussian-weighted soft labels (sub-patch precision signal)"})
     soft_label_sigma: float = field(default=2.0, metadata={"help": "Sigma in grid-cell units for soft label Gaussian"})
@@ -398,7 +399,8 @@ class SaccadeTrainer:
             # Step 2: Crop and forward with gradients
             self.model.train()
             cropped, crop_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio,
-                                              upsample_pixels=self.sa.crop_upsample_pixels)
+                                              upsample_pixels=self.sa.crop_upsample_pixels,
+                                              crop_target_pixels=self.sa.crop_target_pixels)
             gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
 
             # Re-build context: low-res + crop

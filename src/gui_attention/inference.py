@@ -108,8 +108,9 @@ def run_saccade_inference(
     tokenizer,
     builder: MultiRoundInputBuilder,
     max_rounds: int = 3,
-    crop_ratio: float = 0.2,
-    crop_upsample_pixels: int = 1003520,
+    crop_ratio: float = 0.3,
+    crop_upsample_pixels: int = 0,
+    crop_target_pixels: int = 200704,
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
 ) -> dict:
@@ -185,7 +186,8 @@ def run_saccade_inference(
 
         # Crop around current focus
         cropped, crop_bbox = crop_image(image, focus_x, focus_y, crop_ratio,
-                                        upsample_pixels=crop_upsample_pixels)
+                                        upsample_pixels=crop_upsample_pixels,
+                                        crop_target_pixels=crop_target_pixels)
 
         # Extend context (accumulate all crops for LLM context)
         try:
