@@ -28,10 +28,41 @@ cd "$CODE_DIR"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=src:$PYTHONPATH
 
-# 4 datasets: GUIAct + AndroidControl + Wave-UI + UGround(60K)
-DATA_PATHS="$DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json"
-IMAGE_FOLDERS="$DATA_DIR/GUIAct/GUIAct/web_imgs,$DATA_DIR/AndroidControl/AndroidControl/tfrecord/images,$DATA_DIR/Wave-UI/Wave-UI/images_fixed,$DATA_DIR/Uground/Uground/images"
-PER_DS_LIMITS="0,0,0,60000"
+# All candidate datasets: json_file:image_folder:max_samples (0=no limit)
+declare -a ALL_DATASETS=(
+    "guiact_bbox.json:GUIAct/GUIAct/web_imgs:0"
+    "androidcontrol_bbox.json:AndroidControl/AndroidControl/tfrecord/images:0"
+    "wave_ui_bbox.json:Wave-UI/Wave-UI/images_fixed:0"
+    "uground_bbox.json:Uground/Uground/images:60000"
+    "gta_bbox.json:gta/gta_data/images:60000"
+)
+
+# Auto-detect: only include datasets whose json exists
+DATA_PATHS=""
+IMAGE_FOLDERS=""
+PER_DS_LIMITS=""
+for entry in "${ALL_DATASETS[@]}"; do
+    IFS=':' read -r json_file img_dir limit <<< "$entry"
+    if [ -f "$DATA_DIR/$json_file" ]; then
+        if [ -n "$DATA_PATHS" ]; then
+            DATA_PATHS="$DATA_PATHS,$DATA_DIR/$json_file"
+            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$img_dir"
+            PER_DS_LIMITS="$PER_DS_LIMITS,$limit"
+        else
+            DATA_PATHS="$DATA_DIR/$json_file"
+            IMAGE_FOLDERS="$DATA_DIR/$img_dir"
+            PER_DS_LIMITS="$limit"
+        fi
+        echo "  ✓ $json_file (limit=$limit)"
+    else
+        echo "  ✗ $json_file (not found, skipping)"
+    fi
+done
+
+if [ -z "$DATA_PATHS" ]; then
+    echo "ERROR: No datasets found in $DATA_DIR"
+    exit 1
+fi
 
 # Resume
 RESUME_ARG=""
