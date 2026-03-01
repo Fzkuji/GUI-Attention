@@ -487,7 +487,15 @@ class SaccadeTrainer:
                         total_loss = total_loss + loss
                         n_valid += 1
 
-                    self.metrics["crop_hit"].append(1)
+                    # crop_hit: in teacher forcing mode, evaluate using model's
+                    # round-0 prediction to track actual saccade quality
+                    if self.sa.teacher_forcing_crop and len(round_preds) > 0:
+                        r0_px, r0_py = round_preds[0]
+                        _, virtual_crop_bbox = crop_image(img, r0_px, r0_py, self.sa.crop_ratio)
+                        self.metrics["crop_hit"].append(
+                            1 if point_in_bbox(gt_cx, gt_cy, virtual_crop_bbox) else 0)
+                    else:
+                        self.metrics["crop_hit"].append(1)
 
                     # Record prediction and break
                     with torch.no_grad():
