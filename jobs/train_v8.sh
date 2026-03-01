@@ -28,10 +28,10 @@ cd "$CODE_DIR"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=src:$PYTHONPATH
 
-# 5 datasets (matching v7): GUIAct + AndroidControl + Wave-UI + UGround(60K) + GTA(60K)
-DATA_PATHS="$DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json,$DATA_DIR/gta_bbox.json"
-IMAGE_FOLDERS="$DATA_DIR/GUIAct/GUIAct/web_imgs,$DATA_DIR/AndroidControl/AndroidControl/tfrecord/images,$DATA_DIR/Wave-UI/Wave-UI/images_fixed,$DATA_DIR/Uground/Uground/images,$DATA_DIR/GTA/images"
-PER_DS_LIMITS="0,0,0,60000,60000"
+# 4 datasets: GUIAct + AndroidControl + Wave-UI + UGround(60K)
+DATA_PATHS="$DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json"
+IMAGE_FOLDERS="$DATA_DIR/GUIAct/GUIAct/web_imgs,$DATA_DIR/AndroidControl/AndroidControl/tfrecord/images,$DATA_DIR/Wave-UI/Wave-UI/images_fixed,$DATA_DIR/Uground/Uground/images"
+PER_DS_LIMITS="0,0,0,60000"
 
 # Resume
 RESUME_ARG=""
