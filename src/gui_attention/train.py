@@ -451,50 +451,29 @@ class SaccadeTrainer:
                 attn, _, logits = self.model.action_head(
                     vis_hidden, anchor, mask=full_mask)
 
-                # Determine which image the model attends to
-                with torch.no_grad():
-                    img_idx, local_idx = identify_attended_image(
-                        attn.squeeze(0), vis_ranges)
-                    attended_crop = (img_idx == latest_img_idx)
-
-                # --- Build labels based on model's attention decision ---
-                if attended_crop:
-                    # Model chose to look at the crop → FINAL round
-                    self.metrics["crop_hit"].append(1 if gt_in_crop else 0)
-
-                    if gt_in_crop:
-                        # Correct crop: soft label on crop for precise positioning
-                        nh_high, nw_high = grid_dims[latest_img_idx]
-                        cbx1, cby1, cbx2, cby2 = crop_bbox
-                        cbw, cbh = cbx2 - cbx1, cby2 - cby1
-                        if cbw > 0 and cbh > 0:
-                            local_gt = (
-                                max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
-                                max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
-                                max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
-                                max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
-                            )
-                            high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
-                                                                soft=self.sa.soft_labels,
-                                                                sigma_scale=self.sa.soft_label_sigma)
-                        else:
-                            high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
-
-                        full_labels = torch.zeros(1, n_total, device=device)
-                        offset_hi, n_hi = vis_ranges[latest_img_idx]
-                        full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
+                # --- GT-based decision: break if GT is in crop (Phase 1) ---
+                if gt_in_crop:
+                    # GT in crop → FINAL round, binary label on crop
+                    nh_high, nw_high = grid_dims[latest_img_idx]
+                    cbx1, cby1, cbx2, cby2 = crop_bbox
+                    cbw, cbh = cbx2 - cbx1, cby2 - cby1
+                    if cbw > 0 and cbh > 0:
+                        local_gt = (
+                            max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
+                            max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
+                            max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
+                            max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
+                        )
+                        high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
+                                                            soft=False)
                     else:
-                        # Wrong crop: label on low-res correct patch (binary)
-                        low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
-                        low_labels[this_crop_mask] = 0.0
-                        full_labels = torch.zeros(1, n_total, device=device)
-                        if low_labels.sum() > 0:
-                            full_labels[0, :n_low] = low_labels.to(device)
-                        else:
-                            low_labels_full = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
-                            full_labels[0, :n_low] = low_labels_full.to(device)
+                        high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
 
-                    # Compute KL loss from existing logits (no second forward)
+                    full_labels = torch.zeros(1, n_total, device=device)
+                    offset_hi, n_hi = vis_ranges[latest_img_idx]
+                    full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
+
+                    # KL loss from cached logits
                     eps = 1e-8
                     target_dist = full_labels.float()
                     row_sums = target_dist.sum(dim=-1, keepdim=True)
@@ -504,8 +483,12 @@ class SaccadeTrainer:
                     total_loss = total_loss + loss
                     n_valid += 1
 
-                    # Record prediction and BREAK
+                    self.metrics["crop_hit"].append(1)
+
+                    # Record prediction and break
                     with torch.no_grad():
+                        img_idx, local_idx = identify_attended_image(
+                            attn.squeeze(0), vis_ranges)
                         if img_idx < len(grid_dims):
                             nh_a, nw_a = grid_dims[img_idx]
                             off_a, n_a = vis_ranges[img_idx]
@@ -520,7 +503,7 @@ class SaccadeTrainer:
                     break
 
                 else:
-                    # Model chose low-res → saccade, continue
+                    # GT not in crop → saccade, binary label on low-res
                     low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
                     low_labels[this_crop_mask] = 0.0
 
@@ -528,7 +511,6 @@ class SaccadeTrainer:
                         full_labels = torch.zeros(1, n_total, device=device)
                         full_labels[0, :n_low] = low_labels.to(device)
 
-                        # Compute KL loss from existing logits
                         eps = 1e-8
                         target_dist = full_labels.float()
                         row_sums = target_dist.sum(dim=-1, keepdim=True)
@@ -542,6 +524,8 @@ class SaccadeTrainer:
 
                 # Record prediction for saccade rounds
                 with torch.no_grad():
+                    img_idx, local_idx = identify_attended_image(
+                        attn.squeeze(0), vis_ranges)
                     if img_idx < len(grid_dims):
                         nh_a, nw_a = grid_dims[img_idx]
                         off_a, n_a = vis_ranges[img_idx]
