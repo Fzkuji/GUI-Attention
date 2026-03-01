@@ -126,7 +126,7 @@ def identify_attended_image(
 
 
 def token_to_spatial(local_token_idx: int, n_width: int, n_height: int,
-                     attn_weights=None, blur_sigma: float = 1.0,
+                     attn_weights=None, blur_sigma: float = 0.0,
                      pixel_size: int = 56):
     """Convert a flat visual token index to normalised (x, y) coordinates.
 
