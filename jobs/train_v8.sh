@@ -34,7 +34,7 @@ declare -a ALL_DATASETS=(
     "androidcontrol_bbox.json:AndroidControl/AndroidControl/tfrecord/images:0"
     "wave_ui_bbox.json:Wave-UI/Wave-UI/images_fixed:0"
     "uground_bbox.json:Uground/Uground/images:60000"
-    "gta_bbox.json:gta/gta_data/images:60000"
+    "gta/gta_data/gta_data_wo_web.json:gta/gta_data/image:60000"
 )
 
 # Auto-detect: only include datasets whose json exists
