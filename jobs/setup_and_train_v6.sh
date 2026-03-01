@@ -95,7 +95,7 @@ else
 
     OUTPUT_NAME="ours_v6_fullparam_aima_aligned"
 
-    GA_STEPS=8  # 8 GPUs × 1 × GA8 = effective batch 64
+    GA_STEPS=1  # 8 GPUs × 1 × GA1 = effective batch 8
 
     torchrun --nproc_per_node=$NUM_GPUS \
         src/gui_attention/train.py \
