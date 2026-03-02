@@ -216,7 +216,16 @@ def main():
                         help="Base model for loading backbone")
 
     # Data
-    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data/ScreenSpot-Pro")
+    # Auto-detect data path: check common locations
+    _default_data_path = None
+    for _p in [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "ScreenSpot-Pro-data"),
+        "/root/autodl-tmp/data/ScreenSpot-Pro",
+    ]:
+        if os.path.isdir(os.path.join(_p, "annotations")):
+            _default_data_path = _p
+            break
+    parser.add_argument("--data_path", type=str, default=_default_data_path)
     parser.add_argument("--save_path", type=str, default=None)
 
     # Saccade
@@ -251,11 +260,17 @@ def main():
     print()
 
     # Load data — try local annotations dir, then download from HuggingFace
+    if args.data_path is None:
+        # Auto-detect: download next to the code repo
+        args.data_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..", "data", "ScreenSpot-Pro-data")
+        os.makedirs(args.data_path, exist_ok=True)
+
     annotations_dir = os.path.join(args.data_path, "annotations")
     image_dir = os.path.join(args.data_path, "images")
 
     if not os.path.isdir(annotations_dir):
-        # Try downloading from HuggingFace
         print(f"Local annotations not found: {annotations_dir}")
         print(f"Downloading from HuggingFace: likaixin/ScreenSpot-Pro ...")
         from huggingface_hub import snapshot_download
