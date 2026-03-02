@@ -259,9 +259,9 @@ def main():
         image_dir = os.path.join(args.data_path, "images")
     else:
         print(f"Local path not found: {data_fn}")
-        print(f"Loading from HuggingFace: liuzhch/ScreenSpot-Pro ...")
+        print(f"Loading from HuggingFace: likaixin2000/ScreenSpot-Pro ...")
         from datasets import load_dataset
-        ds = load_dataset("liuzhch/ScreenSpot-Pro", split="test")
+        ds = load_dataset("likaixin2000/ScreenSpot-Pro", split="test")
         data = list(ds)
         # HF dataset stores images as PIL objects directly
         image_dir = None  # images come from dataset
