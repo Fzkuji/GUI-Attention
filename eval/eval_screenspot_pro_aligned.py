@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from PIL import Image
 from tqdm import tqdm
 
@@ -206,6 +207,46 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def setup_distributed():
+    """Initialize DDP if launched with torchrun. Returns (rank, world_size, is_distributed)."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, True, f"cuda:{local_rank}"
+    return 0, 1, False, None
+
+
+def gather_results(local_results, rank, world_size):
+    """Gather list of dicts from all ranks to rank 0."""
+    import pickle
+    local_bytes = pickle.dumps(local_results)
+    local_tensor = torch.ByteTensor(list(local_bytes)).cuda()
+    size_tensor = torch.tensor([len(local_bytes)], dtype=torch.long, device="cuda")
+
+    # Gather sizes
+    all_sizes = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(world_size)]
+    dist.all_gather(all_sizes, size_tensor)
+
+    max_size = max(s.item() for s in all_sizes)
+    padded = torch.zeros(max_size, dtype=torch.uint8, device="cuda")
+    padded[:len(local_bytes)] = local_tensor
+
+    all_padded = [torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
+    dist.all_gather(all_padded, padded)
+
+    if rank == 0:
+        all_results = []
+        for i in range(world_size):
+            sz = all_sizes[i].item()
+            data = bytes(all_padded[i][:sz].cpu().tolist())
+            all_results.extend(pickle.loads(data))
+        return all_results
+    return []
+
+
 def main():
     parser = argparse.ArgumentParser(description="ScreenSpot-Pro eval (saccade foveation v4)")
 
@@ -237,26 +278,37 @@ def main():
 
     args = parser.parse_args()
 
+    # DDP setup
+    rank, world_size, is_distributed, ddp_device = setup_distributed()
+    if ddp_device is not None:
+        args.device = ddp_device
+    is_main = (rank == 0)
+
     # Auto save path
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
         tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
         args.save_path = f"results/screenspot_pro/{ckpt_name}/{tag}"
 
-    print("=== Config ===")
-    print(f"  checkpoint:  {args.checkpoint}")
-    print(f"  base_model:  {args.base_model}")
-    print(f"  rounds:      {args.rounds}")
-    print(f"  crop_ratio:  {args.crop_ratio}")
-    print(f"  device:      {args.device}")
-    print()
+    if is_main:
+        print("=== Config ===")
+        print(f"  checkpoint:  {args.checkpoint}")
+        print(f"  base_model:  {args.base_model}")
+        print(f"  rounds:      {args.rounds}")
+        print(f"  crop_ratio:  {args.crop_ratio}")
+        print(f"  device:      {args.device}")
+        if is_distributed:
+            print(f"  DDP:         {world_size} GPUs")
+        print()
 
     # Load data — use local path or download to HF cache
     if args.data_path is None:
         from huggingface_hub import snapshot_download
-        print("Downloading likaixin/ScreenSpot-Pro to HF cache ...")
+        if is_main:
+            print("Downloading likaixin/ScreenSpot-Pro to HF cache ...")
         args.data_path = snapshot_download("likaixin/ScreenSpot-Pro", repo_type="dataset")
-        print(f"Using: {args.data_path}")
+        if is_main:
+            print(f"Using: {args.data_path}")
 
     annotations_dir = os.path.join(args.data_path, "annotations")
     image_dir = os.path.join(args.data_path, "images")
@@ -268,15 +320,25 @@ def main():
             with open(os.path.join(annotations_dir, fn), "r") as f:
                 file_data = json.load(f)
                 data.extend(file_data)
-                print(f"  Loaded {len(file_data)} from {fn}")
-    print(f"Total: {len(data)} examples from {annotations_dir}")
+                if is_main:
+                    print(f"  Loaded {len(file_data)} from {fn}")
+    if is_main:
+        print(f"Total: {len(data)} examples from {annotations_dir}")
 
     if args.max_samples is not None:
         data = data[:args.max_samples]
-        print(f"Limiting to {len(data)} samples")
+        if is_main:
+            print(f"Limiting to {len(data)} samples")
+
+    # Shard data across ranks
+    if is_distributed:
+        data = data[rank::world_size]
+        if is_main:
+            print(f"Rank 0 processing {len(data)} samples (total split across {world_size} GPUs)")
 
     # Load model
-    print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
+    if is_main:
+        print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
     model, tokenizer = Qwen25VLWithActionHead.load_pretrained(
         args.checkpoint,
         base_model_name_or_path=args.base_model,
@@ -292,12 +354,13 @@ def main():
     )
 
     # Check cache
-    os.makedirs(args.save_path, exist_ok=True)
+    if is_main:
+        os.makedirs(args.save_path, exist_ok=True)
     ckpt_name = Path(args.checkpoint).name
     pred_path = os.path.join(args.save_path, f"{ckpt_name}_preds.json")
     metric_path = os.path.join(args.save_path, f"{ckpt_name}_metric.txt")
 
-    if os.path.exists(pred_path):
+    if os.path.exists(pred_path) and is_main:
         print(f"Loading cached predictions from {pred_path}")
         with open(pred_path, "r") as f:
             results = json.load(f)
@@ -305,43 +368,56 @@ def main():
         t0 = time.time()
         with torch.no_grad():
             results = evaluate_all(model, tokenizer, data, image_dir, args, builder)
-        elapsed = time.time() - t0
-        print(f"Evaluation took {elapsed:.1f}s ({elapsed / len(results):.2f}s/sample)")
 
-        with open(pred_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Saved {len(results)} predictions to {pred_path}")
+        # Gather results from all ranks
+        if is_distributed:
+            if is_main:
+                print(f"Rank 0 done, gathering results from {world_size} GPUs ...")
+            dist.barrier()
+            results = gather_results(results, rank, world_size)
 
-        round_counts = {}
-        for r in results:
-            nr = r.get("num_rounds", 1)
-            round_counts[nr] = round_counts.get(nr, 0) + 1
-        print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+        if is_main:
+            elapsed = time.time() - t0
+            print(f"Evaluation took {elapsed:.1f}s ({elapsed / len(results):.2f}s/sample)")
 
-        # Token usage stats
-        token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
-        if token_counts:
-            avg_tokens = sum(token_counts) / len(token_counts)
-            print(f"Avg visual tokens (final round): {avg_tokens:.0f}")
+            with open(pred_path, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"Saved {len(results)} predictions to {pred_path}")
 
-        # Inference time stats
-        times = [r.get("inference_time", 0) for r in results if r.get("inference_time", 0) > 0]
-        if times:
-            avg_time = sum(times) / len(times)
-            print(f"Avg inference time: {avg_time:.3f}s/sample")
-            print(f"Min/Max inference time: {min(times):.3f}s / {max(times):.3f}s")
+            round_counts = {}
+            for r in results:
+                nr = r.get("num_rounds", 1)
+                round_counts[nr] = round_counts.get(nr, 0) + 1
+            print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+
+            # Token usage stats
+            token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
+            if token_counts:
+                avg_tokens = sum(token_counts) / len(token_counts)
+                print(f"Avg visual tokens (final round): {avg_tokens:.0f}")
+
+            # Inference time stats
+            times = [r.get("inference_time", 0) for r in results if r.get("inference_time", 0) > 0]
+            if times:
+                avg_time = sum(times) / len(times)
+                print(f"Avg inference time: {avg_time:.3f}s/sample")
+                print(f"Min/Max inference time: {min(times):.3f}s / {max(times):.3f}s")
 
     # Compute metrics
-    if not os.path.exists(metric_path):
-        print("\n=== Metrics ===")
-        metric_info = get_metric(results)
-        with open(metric_path, "w") as f:
-            f.write(metric_info)
-        print(f"Saved metrics to {metric_path}")
-    else:
-        print(f"Metrics already exist at {metric_path}")
-        with open(metric_path, "r") as f:
-            print(f.read())
+    if is_main:
+        if not os.path.exists(metric_path):
+            print("\n=== Metrics ===")
+            metric_info = get_metric(results)
+            with open(metric_path, "w") as f:
+                f.write(metric_info)
+            print(f"Saved metrics to {metric_path}")
+        else:
+            print(f"Metrics already exist at {metric_path}")
+            with open(metric_path, "r") as f:
+                print(f.read())
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
