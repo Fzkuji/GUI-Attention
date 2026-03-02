@@ -216,16 +216,8 @@ def main():
                         help="Base model for loading backbone")
 
     # Data
-    # Auto-detect data path: check common locations
-    _default_data_path = None
-    for _p in [
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "ScreenSpot-Pro-data"),
-        "/root/autodl-tmp/data/ScreenSpot-Pro",
-    ]:
-        if os.path.isdir(os.path.join(_p, "annotations")):
-            _default_data_path = _p
-            break
-    parser.add_argument("--data_path", type=str, default=_default_data_path)
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Local path with annotations/ and images/. If not set, downloads likaixin/ScreenSpot-Pro to HF cache.")
     parser.add_argument("--save_path", type=str, default=None)
 
     # Saccade
@@ -259,24 +251,15 @@ def main():
     print(f"  device:      {args.device}")
     print()
 
-    # Load data — try local annotations dir, then download from HuggingFace
+    # Load data — use local path or download to HF cache
     if args.data_path is None:
-        # Auto-detect: download next to the code repo
-        args.data_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "..", "data", "ScreenSpot-Pro-data")
-        os.makedirs(args.data_path, exist_ok=True)
+        from huggingface_hub import snapshot_download
+        print("Downloading likaixin/ScreenSpot-Pro to HF cache ...")
+        args.data_path = snapshot_download("likaixin/ScreenSpot-Pro", repo_type="dataset")
+        print(f"Using: {args.data_path}")
 
     annotations_dir = os.path.join(args.data_path, "annotations")
     image_dir = os.path.join(args.data_path, "images")
-
-    if not os.path.isdir(annotations_dir):
-        print(f"Local annotations not found: {annotations_dir}")
-        print(f"Downloading from HuggingFace: likaixin/ScreenSpot-Pro ...")
-        from huggingface_hub import snapshot_download
-        snapshot_download("likaixin/ScreenSpot-Pro", repo_type="dataset",
-                          local_dir=args.data_path)
-        print(f"Downloaded to {args.data_path}")
 
     # Load all annotation JSON files
     data = []
