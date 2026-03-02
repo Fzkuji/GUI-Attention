@@ -78,16 +78,17 @@ echo "============================================================"
 echo "  GUI-Attention v9 Training"
 echo "  Config: LoRA + 1M pixels + M-RoPE alignment"
 echo "  GPUs: $NUM_GPUS"
-echo "  Output: $RESULT_DIR/ours_v9_no_tf"
+echo "  Base model: ${BASE_MODEL:-smz8599/GUI-AIMA-3B}"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v9_aima}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
     src/gui_attention/train.py \
-    --model_name_or_path "$MODEL_DIR/Qwen2.5-VL-3B-Instruct" \
+    --model_name_or_path "${BASE_MODEL:-smz8599/GUI-AIMA-3B}" \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "$RESULT_DIR/ours_v9_no_tf" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v9_aima}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1003520 \
     --crop_target_pixels 1003520 \
@@ -116,4 +117,4 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --soft_labels false \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v9_no_tf.txt"
+    2>&1 | tee "$LOG_DIR/train_v9_aima.txt"
