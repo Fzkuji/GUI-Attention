@@ -98,7 +98,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_r 32 \
     --lora_alpha 64 \
     --lora_target_modules "q_proj,v_proj" \
-    --action_head_lr 1e-4 \
+    --action_head_lr 5e-5 \
     --lora_lr 5e-5 \
     --align_crop_mrope true \
     --teacher_forcing_crop false \
@@ -106,7 +106,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --weight_decay 0.0 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
     --save_steps 5000 \
