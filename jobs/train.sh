@@ -101,8 +101,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
     --align_crop_mrope true \
-    --teacher_forcing_crop true \
-    --teacher_forcing_ratio 1.0 \
+    --teacher_forcing_crop false \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
