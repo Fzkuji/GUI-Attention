@@ -208,7 +208,8 @@ class Qwen25VLWithActionHead(nn.Module):
         # but we still need to resize embeddings to match)
         tokenizer = AutoTokenizer.from_pretrained(path)
         tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
-        if len(tokenizer) != backbone.config.vocab_size:
+        _vocab_size = getattr(backbone.config, 'vocab_size', None) or getattr(backbone.config.text_config, 'vocab_size', None)
+        if _vocab_size is not None and len(tokenizer) != _vocab_size:
             backbone.resize_token_embeddings(len(tokenizer))
 
         backbone.config.pointer_start_token_id = tokenizer.convert_tokens_to_ids(
