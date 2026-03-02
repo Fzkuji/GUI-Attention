@@ -250,22 +250,28 @@ def main():
     print(f"  device:      {args.device}")
     print()
 
-    # Load data — try local path first, then HuggingFace datasets
-    data_fn = os.path.join(args.data_path, "annotations/all.json")
-    if os.path.exists(data_fn):
-        with open(data_fn, "r") as f:
-            data = json.load(f)
-        print(f"Loaded {len(data)} examples from {data_fn}")
-        image_dir = os.path.join(args.data_path, "images")
-    else:
-        print(f"Local path not found: {data_fn}")
-        print(f"Loading from HuggingFace: likaixin/ScreenSpot-Pro ...")
-        from datasets import load_dataset
-        ds = load_dataset("likaixin/ScreenSpot-Pro", split="train")
-        data = list(ds)
-        # HF dataset stores images as PIL objects directly
-        image_dir = None  # images come from dataset
-        print(f"Loaded {len(data)} examples from HuggingFace")
+    # Load data — try local annotations dir, then download from HuggingFace
+    annotations_dir = os.path.join(args.data_path, "annotations")
+    image_dir = os.path.join(args.data_path, "images")
+
+    if not os.path.isdir(annotations_dir):
+        # Try downloading from HuggingFace
+        print(f"Local annotations not found: {annotations_dir}")
+        print(f"Downloading from HuggingFace: likaixin/ScreenSpot-Pro ...")
+        from huggingface_hub import snapshot_download
+        snapshot_download("likaixin/ScreenSpot-Pro", repo_type="dataset",
+                          local_dir=args.data_path)
+        print(f"Downloaded to {args.data_path}")
+
+    # Load all annotation JSON files
+    data = []
+    for fn in sorted(os.listdir(annotations_dir)):
+        if fn.endswith(".json"):
+            with open(os.path.join(annotations_dir, fn), "r") as f:
+                file_data = json.load(f)
+                data.extend(file_data)
+                print(f"  Loaded {len(file_data)} from {fn}")
+    print(f"Total: {len(data)} examples from {annotations_dir}")
 
     if args.max_samples is not None:
         data = data[:args.max_samples]
