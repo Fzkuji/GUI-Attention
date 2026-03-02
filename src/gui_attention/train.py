@@ -86,6 +86,7 @@ class ScriptArgs:
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     align_crop_mrope: bool = field(default=True, metadata={"help": "Align crop M-RoPE position_ids to low-res spatial grid. False = default sequential positions."})
     teacher_forcing_crop: bool = field(default=False, metadata={"help": "Use GT center as crop location (teacher forcing). False = use model's own prediction."})
+    teacher_forcing_ratio: float = field(default=1.0, metadata={"help": "Probability of using GT crop when teacher_forcing_crop=true. 0.0=always model prediction, 1.0=always GT. Allows scheduled mixing."})
     soft_labels: bool = field(default=False, metadata={"help": "Use Gaussian soft labels (default: binary overlap labels)"})
     soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
@@ -379,9 +380,11 @@ class SaccadeTrainer:
 
             else:
                 # ===== Round ri: Crop =====
-                # Teacher forcing: use GT center; otherwise use model's prediction
-                crop_cx = gt_cx if self.sa.teacher_forcing_crop else pred_x
-                crop_cy = gt_cy if self.sa.teacher_forcing_crop else pred_y
+                # Teacher forcing with ratio: randomly choose GT or model prediction
+                use_tf = (self.sa.teacher_forcing_crop
+                          and random.random() < self.sa.teacher_forcing_ratio)
+                crop_cx = gt_cx if use_tf else pred_x
+                crop_cy = gt_cy if use_tf else pred_y
                 cropped, crop_bbox = crop_image(img, crop_cx, crop_cy, self.sa.crop_ratio,
                                                   upsample_pixels=self.sa.crop_upsample_pixels,
                                                   crop_target_pixels=self.sa.crop_target_pixels)
@@ -396,7 +399,7 @@ class SaccadeTrainer:
                 # (for simplicity, we only add the current crop since builder
                 # doesn't store previous crops; re-crop from round_preds)
                 for prev_ri in range(1, ri):
-                    if self.sa.teacher_forcing_crop:
+                    if use_tf:
                         prev_px, prev_py = gt_cx, gt_cy
                     else:
                         prev_px, prev_py = round_preds[prev_ri - 1]
