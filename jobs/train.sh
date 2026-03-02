@@ -78,7 +78,7 @@ echo "============================================================"
 echo "  GUI-Attention v9 Training"
 echo "  Config: LoRA + 1M pixels + M-RoPE alignment"
 echo "  GPUs: $NUM_GPUS"
-echo "  Output: $RESULT_DIR/ours_v9"
+echo "  Output: $RESULT_DIR/ours_v9_no_tf"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -87,7 +87,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "$RESULT_DIR/ours_v9" \
+    --output_dir "$RESULT_DIR/ours_v9_no_tf" \
     --min_pixels 3136 \
     --low_res_max_pixels 1003520 \
     --crop_target_pixels 1003520 \
@@ -116,4 +116,4 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --soft_labels false \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v9.txt"
+    2>&1 | tee "$LOG_DIR/train_v9_no_tf.txt"
