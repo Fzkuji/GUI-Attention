@@ -151,8 +151,13 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
             "overlap_top1": 0,
         }
 
-        image_path = os.path.join(image_dir, example["img_filename"])
-        image = Image.open(image_path).convert("RGB")
+        if image_dir is not None:
+            image_path = os.path.join(image_dir, example["img_filename"])
+            image = Image.open(image_path).convert("RGB")
+        else:
+            # HF dataset: image is already a PIL Image
+            image = example["image"].convert("RGB")
+            image_path = example.get("img_filename", f"sample_{i}.png")
         gt_bbox = ele["bbox_x1y1x2y2"]
 
         t_start = time.time()
@@ -245,17 +250,26 @@ def main():
     print(f"  device:      {args.device}")
     print()
 
-    # Load data
+    # Load data — try local path first, then HuggingFace datasets
     data_fn = os.path.join(args.data_path, "annotations/all.json")
-    with open(data_fn, "r") as f:
-        data = json.load(f)
-    print(f"Loaded {len(data)} examples from {data_fn}")
+    if os.path.exists(data_fn):
+        with open(data_fn, "r") as f:
+            data = json.load(f)
+        print(f"Loaded {len(data)} examples from {data_fn}")
+        image_dir = os.path.join(args.data_path, "images")
+    else:
+        print(f"Local path not found: {data_fn}")
+        print(f"Loading from HuggingFace: liuzhch/ScreenSpot-Pro ...")
+        from datasets import load_dataset
+        ds = load_dataset("liuzhch/ScreenSpot-Pro", split="test")
+        data = list(ds)
+        # HF dataset stores images as PIL objects directly
+        image_dir = None  # images come from dataset
+        print(f"Loaded {len(data)} examples from HuggingFace")
 
     if args.max_samples is not None:
         data = data[:args.max_samples]
         print(f"Limiting to {len(data)} samples")
-
-    image_dir = os.path.join(args.data_path, "images")
 
     # Load model
     print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
