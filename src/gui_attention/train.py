@@ -352,12 +352,16 @@ class SaccadeTrainer:
                 )
                 last_hs = outputs.hidden_states[-1]
 
-                vis_hidden, vis_ranges = extract_visual_hidden_states(
+                # Visual input: use visual embeds (pre-LLM) for spatial info
+                vis_embeds = self.model.extract_visual_embeds(
+                    inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+                _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
+                # Anchor: use last-layer hidden states (post-LLM, has text context)
                 anchor = extract_anchor_hidden_states(
                     last_hs, inp["input_ids"], pp_id, n=0)
 
-                if vis_hidden is None or anchor is None:
+                if vis_embeds is None or anchor is None:
                     break
 
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
@@ -366,7 +370,7 @@ class SaccadeTrainer:
                 # Round 0: binary labels (coarse navigation, not final positioning)
                 labels = compute_binary_labels(nh0, nw0, bbox_gt,
                                                soft=False).to(device).unsqueeze(0)
-                attn, loss, _ = self.model.action_head(vis_hidden, anchor, labels=labels)
+                attn, loss, _ = self.model.action_head(vis_embeds, anchor, labels=labels)
 
                 if loss is not None:
                     total_loss = total_loss + loss
@@ -445,17 +449,21 @@ class SaccadeTrainer:
                 )
                 last_hs = outputs.hidden_states[-1]
 
-                vis_hidden, vis_ranges = extract_visual_hidden_states(
+                # Visual input: use visual embeds (pre-LLM)
+                vis_embeds = self.model.extract_visual_embeds(
+                    inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+                _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
+                # Anchor: use last-layer hidden states (post-LLM)
                 anchor = extract_anchor_hidden_states(
                     last_hs, inp["input_ids"], pp_id, n=ri)
 
-                if vis_hidden is None or anchor is None or len(vis_ranges) < ri + 1:
+                if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
                     break
 
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 n_low = vis_ranges[0][1]
-                n_total = vis_hidden.shape[0]
+                n_total = vis_embeds.shape[0]
                 latest_img_idx = len(vis_ranges) - 1
 
                 # Mask: all crop areas in low-res are masked
@@ -485,7 +493,7 @@ class SaccadeTrainer:
                     full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
                     attn, loss, _ = self.model.action_head(
-                        vis_hidden, anchor, labels=full_labels, mask=full_mask)
+                        vis_embeds, anchor, labels=full_labels, mask=full_mask)
                     if loss is not None:
                         total_loss = total_loss + loss
                         n_valid += 1
@@ -527,14 +535,14 @@ class SaccadeTrainer:
                         full_labels[0, :n_low] = low_labels.to(device)
 
                         attn, loss, _ = self.model.action_head(
-                            vis_hidden, anchor, labels=full_labels, mask=full_mask)
+                            vis_embeds, anchor, labels=full_labels, mask=full_mask)
                         if loss is not None:
                             total_loss = total_loss + loss
                             n_valid += 1
                     else:
                         with torch.no_grad():
                             attn, _, _ = self.model.action_head(
-                                vis_hidden, anchor, mask=full_mask)
+                                vis_embeds, anchor, mask=full_mask)
 
                     self.metrics["crop_hit"].append(0)
 

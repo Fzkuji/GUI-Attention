@@ -101,7 +101,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_target_modules "q_proj,v_proj" \
     --action_head_lr 5e-5 \
     --lora_lr 5e-5 \
-    --align_crop_mrope true \
+    --align_crop_mrope false \
     --teacher_forcing_crop false \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \

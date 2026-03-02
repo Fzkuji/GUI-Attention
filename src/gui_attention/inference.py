@@ -157,16 +157,18 @@ def run_saccade_inference(
         )
 
     last_hs = outputs.hidden_states[-1]
-    vis_hidden, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
+    vis_embeds = model.extract_visual_embeds(
+        inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+    _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
     anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=0)
 
-    if vis_hidden is None or anchor is None:
+    if vis_embeds is None or anchor is None:
         return {"topk_points": [(0.5, 0.5)], "n_width": 1, "n_height": 1, "num_rounds": 0}
 
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _, _ = model.action_head(vis_hidden, anchor)
+    attn0, _, _ = model.action_head(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Use BFS prediction for round 0
@@ -179,7 +181,7 @@ def run_saccade_inference(
 
     # Subsequent rounds: LLM sees full history (all crops accumulated).
     # Action head only considers unmasked low-res + latest crop; old crops masked.
-    total_vis_tokens = vis_hidden.shape[0] if vis_hidden is not None else 0
+    total_vis_tokens = vis_embeds.shape[0] if vis_embeds is not None else 0
 
     for ri in range(1, max_rounds):
         if not saccade.should_continue(state, ri):
@@ -200,37 +202,21 @@ def run_saccade_inference(
 
         inp = {k: v.to(device) for k, v in ri_inputs.items()}
 
-        # Adjust M-RoPE position_ids for crop spatial alignment
-        _backbone_for_rope = model.backbone
-        for _attr in ('base_model', 'model', 'model'):
-            if hasattr(_backbone_for_rope, 'get_rope_index'):
-                break
-            if hasattr(_backbone_for_rope, _attr):
-                _backbone_for_rope = getattr(_backbone_for_rope, _attr)
-        position_ids, _ = _backbone_for_rope.get_rope_index(
-            input_ids=inp["input_ids"],
-            image_grid_thw=inp.get("image_grid_thw"),
-            attention_mask=inp.get("attention_mask"),
-        )
-        position_ids = adjust_crop_position_ids(
-            position_ids, inp["input_ids"], inp["image_grid_thw"],
-            merge, crop_bbox, img_tok,
-        )
-
         with torch.no_grad():
             outputs = model(
                 input_ids=inp["input_ids"],
                 attention_mask=inp.get("attention_mask"),
                 pixel_values=inp.get("pixel_values"),
                 image_grid_thw=inp.get("image_grid_thw"),
-                position_ids=position_ids,
             )
 
         last_hs = outputs.hidden_states[-1]
-        vis_hidden, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
+        vis_embeds = model.extract_visual_embeds(
+            inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+        _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
         anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=ri)
 
-        if vis_hidden is None or anchor is None or len(vis_ranges) < 2:
+        if vis_embeds is None or anchor is None or len(vis_ranges) < 2:
             break
 
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
@@ -250,7 +236,7 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        attn_ri, _, _ = model.action_head(vis_hidden, anchor, mask=full_mask)
+        attn_ri, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         # Identify which image has argmax

@@ -1,7 +1,10 @@
-"""ActionHead: MLP_V + MLP_T + scaled dot product + KL loss.
+"""ActionHead: self-attention + MLP_V + MLP_T + scaled dot product + KL loss.
 
-Simplified from GUI-Actor's VisionHead_MultiPatch by removing self-attention,
-since LLM last-layer hidden states already have cross-token context.
+Modeled after GUI-Actor's VisionHead_MultiPatch:
+  - Self-attention over visual tokens for cross-token context
+  - LayerNorm + residual connection
+  - MLP projections for visual and anchor tokens
+  - Scaled dot-product attention for localization
 """
 
 import torch
@@ -13,20 +16,28 @@ class ActionHead(nn.Module):
     """Action head that predicts click location via attention over visual patches.
 
     Architecture:
-        visual_hidden → MLP_V → proj_v   (n_vis, d_model)
-        anchor_hidden → MLP_T → proj_t   (n_anchor, d_model)
-        logits = (proj_t @ proj_v^T) / sqrt(d_model)   (n_anchor, n_vis)
+        visual_hidden → SelfAttention → LayerNorm+Residual → MLP_V → proj_v
+        anchor_hidden → MLP_T → proj_t
+        logits = (proj_t @ proj_v^T) / sqrt(d_model)
         attn_weights = softmax(logits, dim=-1)
-
-    No self-attention layer (unlike GUI-Actor), because we use LLM last-layer
-    hidden states which already incorporate cross-token context.
     """
 
-    def __init__(self, d_model: int, projection_dim: int = None):
+    def __init__(self, d_model: int, projection_dim: int = None,
+                 num_attention_heads: int = 8, dropout_rate: float = 0.1):
         super().__init__()
         if projection_dim is None:
             projection_dim = d_model
         self.d_model = d_model
+
+        # Self-attention for visual tokens (like GUI-Actor)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_attention_heads,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout_rate)
 
         # MLP_V: project visual hidden states
         self.mlp_v = nn.Sequential(
@@ -55,17 +66,27 @@ class ActionHead(nn.Module):
         Returns:
             attn_weights: (n_anchor, n_vis) attention weights (softmax).
             loss: scalar KL divergence loss if labels provided, else None.
+            logits: (n_anchor, n_vis) raw logits before softmax.
         """
-        proj_v = self.mlp_v(visual_hidden)   # (n_vis, d_model)
-        proj_t = self.mlp_t(anchor_hidden)   # (n_anchor, d_model)
+        # Self-attention over visual tokens (add batch dim)
+        enc_input = visual_hidden.unsqueeze(0)  # (1, n_vis, d_model)
+        attn_output, _ = self.self_attention(
+            query=enc_input, key=enc_input, value=enc_input,
+            need_weights=False,
+        )
+        # Residual + LayerNorm
+        visual_ctx = self.layer_norm(enc_input + self.dropout(attn_output))
+        visual_ctx = visual_ctx.squeeze(0)  # (n_vis, d_model)
+
+        # Project
+        proj_v = self.mlp_v(visual_ctx)    # (n_vis, d_model)
+        proj_t = self.mlp_t(anchor_hidden) # (n_anchor, d_model)
 
         # Scaled dot product
         scale = self.d_model ** 0.5
         logits = torch.matmul(proj_t, proj_v.t()) / scale  # (n_anchor, n_vis)
 
-        # Apply mask: set logits to large negative value for masked patches.
-        # Use -1e9 instead of -inf to avoid NaN in KL computation
-        # (0 * log_softmax(-inf) = 0 * (-inf) = NaN).
+        # Apply mask
         if mask is not None:
             logits = logits.masked_fill(mask.unsqueeze(0), -1e9)
 

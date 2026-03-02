@@ -1,7 +1,7 @@
 """Qwen2.5-VL + LoRA + ActionHead model wrapper.
 
-Key difference from GUI-Actor: uses LLM last-layer hidden states (post-LLM,
-fused text+visual context) rather than vision encoder embeddings (pre-LLM).
+Following GUI-Actor's design: visual encoder embeddings (pre-LLM) for the
+action head's visual input, LLM last-layer hidden states for anchor/pointer.
 """
 
 import torch
@@ -128,6 +128,41 @@ class Qwen25VLWithActionHead(nn.Module):
     def device(self):
         return next(self.backbone.parameters()).device
 
+    def _get_unwrapped_backbone(self):
+        """Unwrap PEFT layers to access base Qwen2.5-VL model."""
+        backbone = self.backbone
+        if hasattr(backbone, 'base_model'):
+            base = backbone.base_model
+            if hasattr(base, 'model'):
+                base = base.model
+        else:
+            base = backbone
+        return base
+
+    def compute_visual_embeds(self, input_ids, pixel_values, image_grid_thw):
+        """Compute visual embeddings (pre-LLM) at image token positions.
+
+        Returns inputs_embeds (B, seq_len, d_model) with visual features
+        scattered at image_token positions. Extract visual-only via:
+            visual_mask = (input_ids == image_token_id)
+            visual_embeds = inputs_embeds[0][visual_mask[0]]
+        """
+        base = self._get_unwrapped_backbone()
+        inputs_embeds = base.model.embed_tokens(input_ids)
+        if pixel_values is not None:
+            image_embeds = base.visual(
+                pixel_values.to(base.visual.dtype),
+                grid_thw=image_grid_thw,
+            )
+            image_mask = (
+                (input_ids == self.config.image_token_id)
+                .unsqueeze(-1)
+                .expand_as(inputs_embeds)
+            )
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        return inputs_embeds
+
     def forward(self, input_ids, attention_mask=None, pixel_values=None,
                 image_grid_thw=None, **kwargs):
         """Run backbone forward pass with hidden state output."""
@@ -140,6 +175,22 @@ class Qwen25VLWithActionHead(nn.Module):
             **kwargs,
         )
         return outputs
+
+    def extract_visual_embeds(self, input_ids, pixel_values, image_grid_thw):
+        """Extract visual embeddings at image token positions (no grad).
+
+        Returns (n_vis, d_model) tensor of visual features from the vision
+        encoder, preserving spatial information better than last-layer hidden
+        states. Runs visual encoder under no_grad (no extra memory cost).
+        """
+        base = self._get_unwrapped_backbone()
+        with torch.no_grad():
+            image_embeds = base.visual(
+                pixel_values.to(base.visual.dtype),
+                grid_thw=image_grid_thw,
+            )
+        # image_embeds is (n_total_vis_tokens, d_model), already flattened
+        return image_embeds.to(self.action_head.mlp_v[0].weight.dtype)
 
     def get_visual_hidden_states(self, outputs, input_ids, image_token_id):
         """Extract visual token hidden states from LLM last layer.
@@ -246,7 +297,10 @@ class Qwen25VLWithActionHead(nn.Module):
         action_head = ActionHead(d_model=d_model, projection_dim=d_model)
         head_path = os.path.join(path, "action_head.pt")
         if os.path.exists(head_path):
-            action_head.load_state_dict(torch.load(head_path, map_location=device, weights_only=True))
+            action_head.load_state_dict(
+                torch.load(head_path, map_location=device, weights_only=True),
+                strict=False,  # allow loading old checkpoints without self-attention
+            )
         action_head = action_head.to(device).to(torch_dtype)
 
         model = cls(backbone, action_head)
