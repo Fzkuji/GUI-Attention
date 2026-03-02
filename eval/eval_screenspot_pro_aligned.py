@@ -218,8 +218,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--crop_ratio", type=float, default=0.3)
     parser.add_argument("--crop_upsample_pixels", type=int, default=0,
-    parser.add_argument("--crop_target_pixels", type=int, default=200704)
                         help="Upsample crop to this many pixels (0=disabled)")
+    parser.add_argument("--crop_target_pixels", type=int, default=200704)
 
     # Resolution
     parser.add_argument("--low_res_max_pixels", type=int, default=LOW_RES_MAX_PIXELS)
