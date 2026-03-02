@@ -202,12 +202,11 @@ def run_saccade_inference(
 
         # Adjust M-RoPE position_ids for crop spatial alignment
         _backbone_for_rope = model.backbone
-        if hasattr(_backbone_for_rope, 'get_rope_index'):
-            pass
-        elif hasattr(_backbone_for_rope, 'base_model'):
-            _backbone_for_rope = _backbone_for_rope.base_model
-            if hasattr(_backbone_for_rope, 'model') and hasattr(_backbone_for_rope.model, 'get_rope_index'):
-                _backbone_for_rope = _backbone_for_rope.model
+        for _attr in ('base_model', 'model', 'model'):
+            if hasattr(_backbone_for_rope, 'get_rope_index'):
+                break
+            if hasattr(_backbone_for_rope, _attr):
+                _backbone_for_rope = getattr(_backbone_for_rope, _attr)
         position_ids, _ = _backbone_for_rope.get_rope_index(
             input_ids=inp["input_ids"],
             image_grid_thw=inp.get("image_grid_thw"),
