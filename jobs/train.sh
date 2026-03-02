@@ -93,7 +93,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_target_pixels 1003520 \
     --crop_ratio 0.3 \
     --crop_jitter 0.05 \
-    --max_saccade_rounds 3 \
+    --max_saccade_rounds 4 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
