@@ -161,7 +161,6 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
             model, tokenizer, builder,
             max_rounds=args.rounds, crop_ratio=args.crop_ratio,
             crop_upsample_pixels=args.crop_upsample_pixels, crop_target_pixels=args.crop_target_pixels,
-    parser.add_argument("--crop_target_pixels", type=int, default=200704)
             device=str(device),
         )
         t_elapsed = time.time() - t_start
