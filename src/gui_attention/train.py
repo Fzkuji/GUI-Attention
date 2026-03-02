@@ -738,7 +738,9 @@ class SaccadeTrainer:
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     should_log = self.use_deepspeed or (micro % ga == 0)
                     if should_log:
-                        def ar(k, n=100):
+                        # samples since last log = logging_steps * GA * world_size * batch_size
+                        n_since_last = self.args.logging_steps * ga * self.world_size * self.args.per_device_train_batch_size
+                        def ar(k, n=n_since_last):
                             vals = self.metrics[k][-n:]
                             return sum(vals) / max(len(vals), 1)
                         all_lrs = (self.model_engine.get_lr() if self.use_deepspeed
