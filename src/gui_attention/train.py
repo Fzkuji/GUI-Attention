@@ -363,6 +363,11 @@ class SaccadeTrainer:
                     pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
                     round_preds.append((pred_x, pred_y))
 
+                    # Virtual crop_hit: would GT be inside a crop around prediction?
+                    _, virtual_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio)
+                    self.metrics["crop_hit"].append(
+                        1 if point_in_bbox(gt_cx, gt_cy, virtual_bbox) else 0)
+
             else:
                 # ===== Round ri: Crop =====
                 # Teacher forcing with ratio: randomly choose GT or model prediction
