@@ -74,8 +74,10 @@ def run_saccade_with_recording(
     tokenizer,
     builder: MultiRoundInputBuilder,
     max_rounds: int = 4,
-    crop_ratio: float = 0.3,
-    crop_target_pixels: int = 1003520,
+    crop_ratio: float = 0.0,
+    crop_size: int = 168,
+    crop_upscale: int = 4,
+    crop_target_pixels: int = 0,
     device: str = "cuda:0",
 ) -> list:
     """Run saccade inference and record per-round details for visualization.
@@ -164,7 +166,10 @@ def run_saccade_with_recording(
         if not saccade.should_continue(state, ri):
             break
 
-        cropped, crop_bbox = crop_image(image, focus_x, focus_y, crop_ratio,
+        cropped, crop_bbox = crop_image(image, focus_x, focus_y,
+                                        crop_ratio=crop_ratio,
+                                        crop_size=crop_size,
+                                        crop_upscale=crop_upscale,
                                         crop_target_pixels=crop_target_pixels)
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(

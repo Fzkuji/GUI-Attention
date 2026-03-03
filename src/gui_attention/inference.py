@@ -109,9 +109,11 @@ def run_saccade_inference(
     tokenizer,
     builder: MultiRoundInputBuilder,
     max_rounds: int = 3,
-    crop_ratio: float = 0.3,
+    crop_ratio: float = 0.0,
+    crop_size: int = 168,
+    crop_upscale: int = 4,
     crop_upsample_pixels: int = 0,
-    crop_target_pixels: int = 200704,
+    crop_target_pixels: int = 0,
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
 ) -> dict:
@@ -124,7 +126,8 @@ def run_saccade_inference(
     Returns:
         dict with topk_points, n_width, n_height, num_rounds, attended_source.
     """
-    saccade = SaccadeLoop(max_rounds=max_rounds, crop_ratio=crop_ratio)
+    saccade = SaccadeLoop(max_rounds=max_rounds, crop_ratio=crop_ratio,
+                          crop_size=crop_size, crop_upscale=crop_upscale)
     state = saccade.new_state()
     builder.reset()
 
@@ -188,7 +191,10 @@ def run_saccade_inference(
             break
 
         # Crop around current focus
-        cropped, crop_bbox = crop_image(image, focus_x, focus_y, crop_ratio,
+        cropped, crop_bbox = crop_image(image, focus_x, focus_y,
+                                        crop_ratio=crop_ratio,
+                                        crop_size=crop_size,
+                                        crop_upscale=crop_upscale,
                                         upsample_pixels=crop_upsample_pixels,
                                         crop_target_pixels=crop_target_pixels)
 

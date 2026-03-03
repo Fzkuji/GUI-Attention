@@ -91,9 +91,9 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
     --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v9_qwen}" \
     --min_pixels 3136 \
-    --low_res_max_pixels 1003520 \
-    --crop_target_pixels 1003520 \
-    --crop_ratio 0.3 \
+    --low_res_max_pixels 400000 \
+    --crop_size 168 \
+    --crop_upscale 4 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 4 \
     --warmup_rounds_step 500 \

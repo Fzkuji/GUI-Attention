@@ -129,9 +129,11 @@ class ScriptArgs:
     min_pixels: int = field(default=3136)
     low_res_max_pixels: int = field(default=LOW_RES_MAX_PIXELS)
     high_res_max_pixels: int = field(default=HIGH_RES_MAX_PIXELS)
-    crop_ratio: float = field(default=0.2)
+    crop_ratio: float = field(default=0.0, metadata={"help": "(Legacy) Fraction of image to crop. 0=use crop_size instead."})
+    crop_size: int = field(default=168, metadata={"help": "Fixed crop side length in pixels (square crop). Must be divisible by 28. 0=use crop_ratio."})
+    crop_upscale: int = field(default=4, metadata={"help": "Integer upscale factor for fixed crop. E.g. 4 → 168px crop becomes 672px. crop_size*crop_upscale should be divisible by 28."})
     crop_upsample_pixels: int = field(default=0, metadata={"help": "(Legacy) Upsample crop to this many pixels. Overridden by crop_target_pixels."})
-    crop_target_pixels: int = field(default=200704, metadata={"help": "Resize crop to exactly this pixel budget (both enlarge and shrink). 0=disabled."})
+    crop_target_pixels: int = field(default=0, metadata={"help": "(Legacy) Resize crop to this pixel budget. 0=disabled. Only used with crop_ratio mode."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     align_crop_mrope: bool = field(default=True, metadata={"help": "Align crop M-RoPE position_ids to low-res spatial grid. False = default sequential positions."})
     teacher_forcing_crop: bool = field(default=False, metadata={"help": "Use GT center as crop location (teacher forcing). False = use model's own prediction."})
@@ -431,7 +433,10 @@ class SaccadeTrainer:
                     round_preds.append((pred_x, pred_y))
 
                     # Virtual crop_hit: would GT be inside a crop around prediction?
-                    _, virtual_bbox = crop_image(img, pred_x, pred_y, self.sa.crop_ratio)
+                    _, virtual_bbox = crop_image(img, pred_x, pred_y,
+                                                    crop_ratio=self.sa.crop_ratio,
+                                                    crop_size=self.sa.crop_size,
+                                                    crop_upscale=self.sa.crop_upscale)
                     self.metrics["crop_hit"].append(
                         1 if point_in_bbox(gt_cx, gt_cy, virtual_bbox) else 0)
 
@@ -442,7 +447,10 @@ class SaccadeTrainer:
                           and random.random() < self.sa.teacher_forcing_ratio)
                 crop_cx = gt_cx if use_tf else pred_x
                 crop_cy = gt_cy if use_tf else pred_y
-                cropped, crop_bbox = crop_image(img, crop_cx, crop_cy, self.sa.crop_ratio,
+                cropped, crop_bbox = crop_image(img, crop_cx, crop_cy,
+                                                  crop_ratio=self.sa.crop_ratio,
+                                                  crop_size=self.sa.crop_size,
+                                                  crop_upscale=self.sa.crop_upscale,
                                                   upsample_pixels=self.sa.crop_upsample_pixels,
                                                   crop_target_pixels=self.sa.crop_target_pixels)
                 gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
@@ -460,7 +468,10 @@ class SaccadeTrainer:
                         prev_px, prev_py = gt_cx, gt_cy
                     else:
                         prev_px, prev_py = round_preds[prev_ri - 1]
-                    prev_crop, prev_bbox = crop_image(img, prev_px, prev_py, self.sa.crop_ratio,
+                    prev_crop, prev_bbox = crop_image(img, prev_px, prev_py,
+                                                       crop_ratio=self.sa.crop_ratio,
+                                                       crop_size=self.sa.crop_size,
+                                                       crop_upscale=self.sa.crop_upscale,
                                                        upsample_pixels=self.sa.crop_upsample_pixels,
                                                        crop_target_pixels=self.sa.crop_target_pixels)
                     try:
@@ -566,7 +577,10 @@ class SaccadeTrainer:
                     # round-0 prediction to track actual saccade quality
                     if self.sa.teacher_forcing_crop and len(round_preds) > 0:
                         r0_px, r0_py = round_preds[0]
-                        _, virtual_crop_bbox = crop_image(img, r0_px, r0_py, self.sa.crop_ratio)
+                        _, virtual_crop_bbox = crop_image(img, r0_px, r0_py,
+                                                            crop_ratio=self.sa.crop_ratio,
+                                                            crop_size=self.sa.crop_size,
+                                                            crop_upscale=self.sa.crop_upscale)
                         self.metrics["crop_hit"].append(
                             1 if point_in_bbox(gt_cx, gt_cy, virtual_crop_bbox) else 0)
                     else:
@@ -747,7 +761,10 @@ class SaccadeTrainer:
             print(f"=== Saccade Foveation Training (v5: {mode} + ActionHead) ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  low_res={self.sa.low_res_max_pixels}  high_res={self.sa.high_res_max_pixels}")
-            print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
+            if self.sa.crop_size > 0:
+                print(f"  crop_size={self.sa.crop_size}x{self.sa.crop_size} x{self.sa.crop_upscale} -> {self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  max_saccade_rounds={self.sa.max_saccade_rounds}")
+            else:
+                print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
             if self.sa.warmup_rounds_step > 0:
                 print(f"  warmup_rounds_step={self.sa.warmup_rounds_step} (single-round until step {self.sa.warmup_rounds_step})")
             print(f"  lm_loss_weight={self.sa.lm_loss_weight}  pointer_loss_weight={self.sa.pointer_loss_weight}")

@@ -166,6 +166,7 @@ def evaluate_all(model, tokenizer, data, image_dir, args, builder):
             image, image_path, example["instruction"],
             model, tokenizer, builder,
             max_rounds=args.rounds, crop_ratio=args.crop_ratio,
+            crop_size=args.crop_size, crop_upscale=args.crop_upscale,
             crop_upsample_pixels=args.crop_upsample_pixels, crop_target_pixels=args.crop_target_pixels,
             device=str(device),
         )
@@ -263,10 +264,12 @@ def main():
 
     # Saccade
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.3)
+    parser.add_argument("--crop_ratio", type=float, default=0.0)
+    parser.add_argument("--crop_size", type=int, default=168, help="Fixed crop side length in pixels")
+    parser.add_argument("--crop_upscale", type=int, default=4, help="Integer upscale factor for crop")
     parser.add_argument("--crop_upsample_pixels", type=int, default=0,
-                        help="Upsample crop to this many pixels (0=disabled)")
-    parser.add_argument("--crop_target_pixels", type=int, default=200704)
+                        help="(Legacy) Upsample crop to this many pixels (0=disabled)")
+    parser.add_argument("--crop_target_pixels", type=int, default=0)
 
     # Resolution
     parser.add_argument("--low_res_max_pixels", type=int, default=LOW_RES_MAX_PIXELS)
@@ -287,7 +290,10 @@ def main():
     # Auto save path
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
-        tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
+        if args.crop_size > 0:
+            tag = f"saccade_r{args.rounds}_crop{args.crop_size}x{args.crop_upscale}"
+        else:
+            tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
         args.save_path = f"results/screenspot_pro/{ckpt_name}/{tag}"
 
     if is_main:
@@ -295,7 +301,10 @@ def main():
         print(f"  checkpoint:  {args.checkpoint}")
         print(f"  base_model:  {args.base_model}")
         print(f"  rounds:      {args.rounds}")
-        print(f"  crop_ratio:  {args.crop_ratio}")
+        if args.crop_size > 0:
+            print(f"  crop_size:   {args.crop_size}x{args.crop_size} x{args.crop_upscale} -> {args.crop_size*args.crop_upscale}x{args.crop_size*args.crop_upscale}")
+        else:
+            print(f"  crop_ratio:  {args.crop_ratio}")
         print(f"  device:      {args.device}")
         if is_distributed:
             print(f"  DDP:         {world_size} GPUs")

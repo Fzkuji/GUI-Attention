@@ -30,9 +30,12 @@ class SaccadeState:
 class SaccadeLoop:
     """Manages the saccade decision logic."""
 
-    def __init__(self, max_rounds: int = 3, crop_ratio: float = 0.3):
+    def __init__(self, max_rounds: int = 3, crop_ratio: float = 0.0,
+                 crop_size: int = 168, crop_upscale: int = 4):
         self.max_rounds = max_rounds
         self.crop_ratio = crop_ratio
+        self.crop_size = crop_size
+        self.crop_upscale = crop_upscale
 
     def new_state(self) -> SaccadeState:
         return SaccadeState()
