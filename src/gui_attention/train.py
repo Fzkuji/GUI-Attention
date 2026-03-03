@@ -86,6 +86,7 @@ class ScriptArgs:
     soft_labels: bool = field(default=False, metadata={"help": "Use Gaussian soft labels (default: binary overlap labels)"})
     soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
+    warmup_rounds_step: int = field(default=0, metadata={"help": "If > 0, use single-round (round 0 only) for the first N steps, then switch to max_saccade_rounds. 0=disabled."})
     # LoRA (ignored when use_lora=False)
     use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
     lora_r: int = field(default=32)
@@ -309,7 +310,11 @@ class SaccadeTrainer:
         if not hasattr(_backbone_for_rope, 'get_rope_index'):
             raise AttributeError(f"Cannot find get_rope_index on backbone. Final type: {type(_backbone_for_rope)}")
 
-        max_rounds = self.sa.max_saccade_rounds  # e.g. 3
+        # Warmup: single-round for first N steps, then full multi-round
+        if self.sa.warmup_rounds_step > 0 and self.global_step < self.sa.warmup_rounds_step:
+            max_rounds = 1
+        else:
+            max_rounds = self.sa.max_saccade_rounds
         pred_x, pred_y = gt_cx, gt_cy  # will be overwritten by round 0
 
         for ri in range(max_rounds):
@@ -660,6 +665,8 @@ class SaccadeTrainer:
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  low_res={self.sa.low_res_max_pixels}  high_res={self.sa.high_res_max_pixels}")
             print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
+            if self.sa.warmup_rounds_step > 0:
+                print(f"  warmup_rounds_step={self.sa.warmup_rounds_step} (single-round until step {self.sa.warmup_rounds_step})")
             print(f"  action_head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
             if self.sa.use_lora:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
@@ -710,6 +717,13 @@ class SaccadeTrainer:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
+
+                    # Log when switching from single-round warmup to multi-round
+                    if (self.rank == 0
+                            and self.sa.warmup_rounds_step > 0
+                            and self.global_step == self.sa.warmup_rounds_step):
+                        print(f"  *** Step {self.global_step}: switching from single-round to "
+                              f"max_saccade_rounds={self.sa.max_saccade_rounds} ***")
 
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:

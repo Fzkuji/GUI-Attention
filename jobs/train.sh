@@ -96,11 +96,12 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_ratio 0.3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 4 \
+    --warmup_rounds_step 500 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
     --lora_target_modules "q_proj,v_proj" \
-    --action_head_lr 5e-5 \
+    --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
     --align_crop_mrope false \
     --teacher_forcing_crop false \
