@@ -96,7 +96,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 4 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 4 \
-    --warmup_rounds_step 500 \
+    --warmup_rounds_step 1000 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
