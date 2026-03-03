@@ -1,4 +1,6 @@
-"""Shared constants for saccade foveation (v4, self-contained)."""
+"""Shared constants for saccade foveation."""
+
+IGNORE_INDEX = -100  # HuggingFace default for ignored labels in CrossEntropyLoss
 
 # ---------------------------------------------------------------------------
 # Pointer special tokens (from GUI-Actor, no gui_aima dependency)

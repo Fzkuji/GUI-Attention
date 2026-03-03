@@ -57,13 +57,66 @@ from gui_attention.attention import (
 )
 from gui_attention.builder import MultiRoundInputBuilder
 from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
+from gui_attention.constants import IGNORE_INDEX
 from gui_attention.crop import crop_image, point_in_bbox
 from gui_attention.labels import compute_binary_labels, compute_overlap_mask
 from gui_attention.model import Qwen25VLWithActionHead, build_model
 
 
-
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+# -- LM Labels ---------------------------------------------------------------
+
+def make_lm_labels(input_ids, tokenizer, round_idx=0):
+    """Create LM labels for a specific round's assistant response only.
+
+    Finds all assistant turns in the input sequence, and only supervises
+    the round_idx-th one (0-indexed). All other tokens get IGNORE_INDEX.
+
+    This prevents double-counting when multi-round training does separate
+    forward passes: each round only gets LM loss on its own assistant turn.
+
+    Args:
+        input_ids: (1, seq_len) tensor.
+        tokenizer: tokenizer with special tokens.
+        round_idx: which assistant turn to supervise (0-based).
+
+    Returns:
+        labels: (1, seq_len) tensor with IGNORE_INDEX for non-supervised tokens.
+    """
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    ids = input_ids[0].tolist()
+    seq_len = len(ids)
+
+    # Find all assistant turns: (content_start, content_end) positions
+    assistant_turns = []
+    i = 0
+    while i < seq_len:
+        if ids[i] == im_start_id:
+            # Decode next few tokens to check role
+            end_check = min(i + 4, seq_len)
+            role_text = tokenizer.decode(ids[i + 1:end_check], skip_special_tokens=False)
+            if role_text.lstrip().startswith("assistant"):
+                # Find end of this assistant turn: next <|im_start|> or end of sequence
+                content_start = i + 1  # supervise from token after <|im_start|>
+                j = i + 1
+                while j < seq_len and ids[j] != im_start_id:
+                    j += 1
+                content_end = j
+                assistant_turns.append((content_start, content_end))
+                i = j
+                continue
+        i += 1
+
+    # Only supervise the round_idx-th assistant turn
+    if round_idx < len(assistant_turns):
+        start, end = assistant_turns[round_idx]
+        labels[0, start:end] = input_ids[0, start:end]
+
+    return labels
+
 
 # -- Arguments ----------------------------------------------------------------
 
@@ -87,6 +140,9 @@ class ScriptArgs:
     soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
     max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
     warmup_rounds_step: int = field(default=0, metadata={"help": "If > 0, use single-round (round 0 only) for the first N steps, then switch to max_saccade_rounds. 0=disabled."})
+    # Loss weights
+    lm_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LM (next-token prediction) loss. 0 or negative to disable."})
+    pointer_loss_weight: float = field(default=1.0, metadata={"help": "Weight for pointer (ActionHead KL) loss."})
     # LoRA (ignored when use_lora=False)
     use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
     lora_r: int = field(default=32)
@@ -325,13 +381,24 @@ class SaccadeTrainer:
                 )
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
 
+                # LM labels for this round's assistant response
+                lm_labels = None
+                if self.sa.lm_loss_weight > 0:
+                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp.get("pixel_values"),
                     image_grid_thw=inp.get("image_grid_thw"),
+                    labels=lm_labels,
                 )
                 last_hs = outputs.hidden_states[-1]
+
+                # LM loss
+                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
+                    total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
+                    self.metrics["lm_loss"].append(outputs.loss.item())
 
                 # Visual input: use visual embeds (pre-LLM) for spatial info
                 vis_embeds = self.model.extract_visual_embeds(
@@ -349,12 +416,12 @@ class SaccadeTrainer:
                 nh0, nw0 = grid_dims[0]
 
                 # Round 0: binary labels (coarse navigation, not final positioning)
-                labels = compute_binary_labels(nh0, nw0, bbox_gt,
-                                               soft=False).to(device).unsqueeze(0)
-                attn, loss, _ = self.model.action_head(vis_embeds, anchor, labels=labels)
+                ptr_labels = compute_binary_labels(nh0, nw0, bbox_gt,
+                                                   soft=False).to(device).unsqueeze(0)
+                attn, ptr_loss, _ = self.model.action_head(vis_embeds, anchor, labels=ptr_labels)
 
-                if loss is not None:
-                    total_loss = total_loss + loss
+                if ptr_loss is not None:
+                    total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
                     n_valid += 1
 
                 with torch.no_grad():
@@ -412,6 +479,11 @@ class SaccadeTrainer:
 
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
 
+                # LM labels for this round's assistant response
+                lm_labels = None
+                if self.sa.lm_loss_weight > 0:
+                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+
                 # Optionally align crop M-RoPE position_ids to low-res spatial grid
                 extra_kwargs = {}
                 if self.sa.align_crop_mrope:
@@ -431,9 +503,15 @@ class SaccadeTrainer:
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp.get("pixel_values"),
                     image_grid_thw=inp.get("image_grid_thw"),
+                    labels=lm_labels,
                     **extra_kwargs,
                 )
                 last_hs = outputs.hidden_states[-1]
+
+                # LM loss
+                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
+                    total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
+                    self.metrics["lm_loss"].append(outputs.loss.item())
 
                 # Visual input: use visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
@@ -478,10 +556,10 @@ class SaccadeTrainer:
                     offset_hi, n_hi = vis_ranges[latest_img_idx]
                     full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
-                    attn, loss, _ = self.model.action_head(
+                    attn, ptr_loss, _ = self.model.action_head(
                         vis_embeds, anchor, labels=full_labels, mask=full_mask)
-                    if loss is not None:
-                        total_loss = total_loss + loss
+                    if ptr_loss is not None:
+                        total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
                         n_valid += 1
 
                     # crop_hit: in teacher forcing mode, evaluate using model's
@@ -520,10 +598,10 @@ class SaccadeTrainer:
                         full_labels = torch.zeros(1, n_total, device=device)
                         full_labels[0, :n_low] = low_labels.to(device)
 
-                        attn, loss, _ = self.model.action_head(
+                        attn, ptr_loss, _ = self.model.action_head(
                             vis_embeds, anchor, labels=full_labels, mask=full_mask)
-                        if loss is not None:
-                            total_loss = total_loss + loss
+                        if ptr_loss is not None:
+                            total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
                             n_valid += 1
                     else:
                         with torch.no_grad():
@@ -672,6 +750,7 @@ class SaccadeTrainer:
             print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
             if self.sa.warmup_rounds_step > 0:
                 print(f"  warmup_rounds_step={self.sa.warmup_rounds_step} (single-round until step {self.sa.warmup_rounds_step})")
+            print(f"  lm_loss_weight={self.sa.lm_loss_weight}  pointer_loss_weight={self.sa.pointer_loss_weight}")
             print(f"  action_head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
             if self.sa.use_lora:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
@@ -740,7 +819,8 @@ class SaccadeTrainer:
                         all_lrs = self.scheduler.get_last_lr()
                         lr_val = all_lrs[0]  # action_head lr
                         bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val  # backbone lr
-                        print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
+                        lm_loss_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
+                        print(f"  [Step {self.global_step}] loss={loss_val:.4f}{lm_loss_str} "
                               f"hit={ar('hit_rate'):.1%} final_dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
                               f"crop_hit={ar('crop_hit'):.1%} vis_tokens={ar('vis_tokens'):.0f} "
