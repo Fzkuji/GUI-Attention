@@ -30,6 +30,7 @@ mkdir -p "$LOG_DIR"
 cd "$CODE_DIR"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=src:$PYTHONPATH
+export HF_HUB_OFFLINE=1
 
 # All candidate datasets
 declare -a ALL_DATASETS=(
@@ -78,17 +79,17 @@ echo "============================================================"
 echo "  GUI-Attention v9 Training"
 echo "  Config: LoRA + 1M pixels + M-RoPE alignment"
 echo "  GPUs: $NUM_GPUS"
-echo "  Base model: ${BASE_MODEL:-smz8599/GUI-AIMA-3B}"
-echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v9_aima}"
+echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v9_qwen}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
     src/gui_attention/train.py \
-    --model_name_or_path "${BASE_MODEL:-smz8599/GUI-AIMA-3B}" \
+    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}" \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v9_aima}" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v9_qwen}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1003520 \
     --crop_target_pixels 1003520 \
@@ -117,4 +118,4 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --soft_labels false \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v9_aima.txt"
+    2>&1 | tee "$LOG_DIR/train_v9_qwen.txt"
