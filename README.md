@@ -6,230 +6,150 @@
 
 GUI-Attention introduces a **saccade foveation** mechanism for GUI element grounding, inspired by human eye movement. Instead of processing screenshots at uniform high resolution (expensive, ~7,000+ visual tokens), we use:
 
-- **Peripheral vision**: low-resolution full image (~1,300 patches) for coarse localization
-- **Foveal vision**: one high-resolution crop (~2,000 patches) at the attention focus
+- **Peripheral vision**: low-resolution full image (~500 patches) for coarse localization
+- **Foveal vision**: high-resolution crop (~1,300 patches) at the attention focus
 - **Saccade**: the focus point moves across rounds if the target isn't found
 
-This gives comparable accuracy to full-resolution methods while using **2-4x fewer visual tokens**.
-
-### Key Differences from GUI-Actor
-
-| | GUI-Actor | Ours |
-|---|---|---|
-| Visual features | Vision encoder embeddings (pre-LLM) | LLM last-layer hidden states (post-LLM, text-aware) |
-| Action head | Self-Attn + MLP_V + MLP_T | MLP_V + MLP_T (no self-attn needed) |
-| Backbone training | Full fine-tune (two-stage) | LoRA (single-stage) |
-| Inference | Single image, single round | Multi-round saccade foveation |
-| Resolution | Uniform high-res (~5.7M pixels) | Low-res full + high-res crop |
+This gives comparable accuracy to full-resolution methods while using **2-4× fewer visual tokens**.
 
 ## Architecture
 
 ```
-Round 0: [low-res full image ~1,300 patches] [instruction] [anchor]
-         -> LLM -> last-layer hidden states -> ActionHead -> attention
-         -> select focus point
+Round 0: [low-res full image ~500 patches] [instruction] [anchor]
+         → ActionHead → attention → select focus point
 
-Round 1: [low-res full (focus area masked)] + [high-res crop ~2,000 patches]
-         -> LLM -> ActionHead (with mask)
-         -> argmax in high-res patch -> CLICK (target found)
-         -> argmax in low-res patch -> SACCADE (move focus, next round)
+Round 1: [low-res full (focus area masked)] + [high-res crop ~1,300 patches]
+         → ActionHead (with mask)
+         → argmax in high-res → CLICK (target found)
+         → argmax in low-res → SACCADE (move focus, next round)
 
-Round 2: [low-res + new high-res crop] -> repeat...
+Round 2+: [low-res + new high-res crop] → repeat...
 
 Stop: argmax in high-res, or max_rounds reached
 ```
 
-Token budget stays constant: ~3,300-4,300 per round (vs GUI-Actor's ~7,000+).
+### ActionHead
 
-## Results
-
-### ScreenSpot-Pro (5K training subset)
-
-| Method | hit@1 | overlap@1 | Avg time | Visual tokens |
-|--------|-------|-----------|----------|---------------|
-| GUI-Actor 5K SFT | 20.75% | 27.07% | 1.80s | ~7,000 |
-| Ours single-round | 7.15% | 19.04% | 0.43s | ~1,300 |
-| **Ours saccade 3 rounds** | **21.13%** | **36.50%** | **0.72s** | **~1,900 avg** |
-
-### Full GUIAct Training (42K samples)
-
-| Benchmark | All-text | All-icon | All-avg (hit@1) |
-|-----------|---------|---------|-----------------|
-| ScreenSpot v1 | 90.24 | 64.87 | **78.77** |
-| ScreenSpot v2 | 97.29 | 77.49 | **80.97** |
-| ScreenSpot-Pro | 39.30 | 6.62 | **26.82** |
+- Visual encoder embeddings → Self-Attention → MLP_V → projected visual features
+- LLM last-layer hidden states at `<pointer_pad>` → MLP_T → anchor query
+- Scaled dot-product → softmax → attention weights over visual patches
+- Training: KL divergence loss against binary overlap labels
 
 ## Quick Start
 
-### One-Script Setup
-
-For a fresh server, the setup script handles everything — environment, model, data, training, and evaluation:
+### Setup
 
 ```bash
 git clone https://github.com/Fzkuji/GUI-Attention.git
 cd GUI-Attention
-bash jobs/setup_and_train.sh
-```
-
-Customize with environment variables:
-
-```bash
-# Use 4 GPUs, train on 5 datasets (skip UGround)
-NUM_GPUS=4 DATASETS="guiact,guienv,amex,androidcontrol,waveui" bash jobs/setup_and_train.sh
-
-# Custom workspace directory
-WORK_DIR=/mnt/data/workspace bash jobs/setup_and_train.sh
-
-# Only download data (skip training and eval)
-SKIP_TRAIN=1 SKIP_EVAL=1 bash jobs/setup_and_train.sh
-
-# Only train (data already downloaded)
-SKIP_DOWNLOAD=1 bash jobs/setup_and_train.sh
-```
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WORK_DIR` | `~/GUI-Attention-Workspace` | Root directory for data, models, results |
-| `NUM_GPUS` | `2` | Number of GPUs for training |
-| `DATASETS` | all 6 | Comma-separated: `guiact,guienv,amex,androidcontrol,waveui,uground` |
-| `MAX_EPOCHS` | `1` | Training epochs |
-| `CONDA_ENV` | `gui-attention` | Conda environment name |
-| `SKIP_DOWNLOAD` | `0` | Set to `1` to skip data download |
-| `SKIP_TRAIN` | `0` | Set to `1` to skip training |
-| `SKIP_EVAL` | `0` | Set to `1` to skip evaluation |
-
-### Manual Setup
-
-```bash
-conda create -n gui-attention python=3.10
-conda activate gui-attention
 pip install -e ".[train,eval]"
-pip install flash-attn --no-build-isolation  # optional
+pip install flash-attn --no-build-isolation  # recommended
 ```
 
-No external dependencies on GUI-AIMA or GUI-Actor source code (fully self-contained).
-
-## Training
-
-### Single Dataset
+### Training
 
 ```bash
-export PYTHONPATH=src:$PYTHONPATH
+# Single-script setup (fresh server: env + data + training)
+bash jobs/setup_and_train.sh
 
-python src/gui_attention/train.py \
-    --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-    --data_path /path/to/guiact_bbox.json \
-    --image_folder /path/to/GUIAct/web_imgs \
-    --output_dir /path/to/output \
-    --crop_ratio 0.3 --max_saccade_rounds 3 \
-    --lora_r 32 --lora_alpha 64 \
-    --action_head_lr 1e-4 --lora_lr 5e-5 \
-    --per_device_train_batch_size 1 --gradient_accumulation_steps 4 \
-    --num_train_epochs 1 --bf16 true
+# Or manual training with torchrun
+NUM_GPUS=8 bash jobs/train.sh
 ```
 
-### Multiple Datasets
+Key training arguments (configured in `jobs/train.sh`):
 
-Pass comma-separated paths for `--data_path` and `--image_folder`:
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `low_res_max_pixels` | 1,003,520 | Low-res resolution (~1,300 tokens) |
+| `crop_target_pixels` | 1,003,520 | Crop resolution after upsampling |
+| `crop_ratio` | 0.3 | Crop size as fraction of image |
+| `max_saccade_rounds` | 4 | Max rounds (1 low-res + 3 crops) |
+| `use_lora` | true | LoRA fine-tuning (false = full-param) |
+| `action_head_lr` | 5e-5 | Learning rate for action head |
+| `lora_lr` | 5e-5 | Learning rate for backbone (LoRA/full) |
 
-```bash
-torchrun --nproc_per_node=2 src/gui_attention/train.py \
-    --data_path "/data/guiact_bbox.json,/data/guienv_bbox.json,/data/amex_bbox.json" \
-    --image_folder "/data/GUIAct/web_imgs,/data/GUIEnv/guienvs/images,/data/AMEX/screenshots" \
-    --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
-    --output_dir /path/to/output \
-    ...
-```
-
-### Training Data
-
-We use the same 6 datasets as [GUI-Actor](https://huggingface.co/datasets/cckevinn/GUI-Actor-Data):
-
-| Dataset | Samples | Size | Content |
-|---------|---------|------|---------|
-| GUIAct | ~42K | 4 GB | Web screenshots |
-| GUIEnv | ~80K | 6 GB | Web environments |
-| Wave-UI | ~25K | 24 GB | Web UI grounding |
-| AndroidControl | ~50K | 49 GB | Mobile app automation |
-| AMEX | ~100K | 92 GB | Mobile apps (110 applications) |
-| UGround | ~775K | 256 GB | General GUI grounding |
-
-## Evaluation
-
-### All ScreenSpot Benchmarks
+### Evaluation
 
 ```bash
+# All ScreenSpot benchmarks
 bash jobs/eval_all_screenspot.sh /path/to/checkpoint /path/to/base_model 3 0.3 cuda:0
-```
 
-This runs ScreenSpot-Pro, v1, and v2 sequentially.
-
-### Individual Benchmarks
-
-```bash
-export PYTHONPATH=src:$PYTHONPATH
-
-# ScreenSpot-Pro (local data)
+# ScreenSpot-Pro only
 python eval/eval_screenspot_pro_aligned.py \
     --checkpoint /path/to/checkpoint \
     --base_model Qwen/Qwen2.5-VL-3B-Instruct \
     --data_path /path/to/ScreenSpot-Pro \
     --rounds 3 --crop_ratio 0.3
-
-# ScreenSpot v1 (auto-downloads from HuggingFace)
-python eval/eval_screenspot.py \
-    --checkpoint /path/to/checkpoint \
-    --base_model Qwen/Qwen2.5-VL-3B-Instruct \
-    --rounds 3 --crop_ratio 0.3
-
-# ScreenSpot v2 (auto-downloads from HuggingFace)
-python eval/eval_screenspot_v2.py \
-    --checkpoint /path/to/checkpoint \
-    --base_model Qwen/Qwen2.5-VL-3B-Instruct \
-    --rounds 3 --crop_ratio 0.3
 ```
 
-## Tests
+### Visualization
+
+Visualize the multi-round saccade process on any image:
 
 ```bash
-python -m pytest tests/ -v
+# From ScreenSpot-Pro dataset
+python eval/visualize_saccade.py \
+    --checkpoint /path/to/checkpoint \
+    --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+    --screenspot_dir /path/to/ScreenSpot-Pro \
+    --sample_index 42 \
+    --output viz_sample42.png
+
+# Custom image
+python eval/visualize_saccade.py \
+    --checkpoint /path/to/checkpoint \
+    --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+    --image screenshot.png \
+    --instruction "Click the search button" \
+    --gt_bbox 0.45,0.32,0.55,0.38 \
+    --output viz_output.png
 ```
 
-43 tests covering action head, labels, training logic, and integration.
+Output: one row per round showing attention heatmaps, crop regions, predicted clicks, and GT.
+
+### Training Data
+
+We use the same datasets as [GUI-Actor](https://huggingface.co/datasets/cckevinn/GUI-Actor-Data):
+
+| Dataset | Samples | Content |
+|---------|---------|---------|
+| GUIAct | ~42K | Web screenshots |
+| AndroidControl | ~50K | Mobile app automation |
+| Wave-UI | ~25K | Web UI grounding |
+| UGround | ~775K | General GUI grounding |
 
 ## Project Structure
 
 ```
 GUI-Attention/
 ├── src/gui_attention/
-│   ├── train.py           # SaccadeTrainer: multi-round teacher-forcing training
-│   ├── model.py           # Qwen25VLWithActionHead: backbone + LoRA + ActionHead
-│   ├── action_head.py     # ActionHead: MLP_V + MLP_T + scaled dot product + KL loss
-│   ├── inference.py       # BFS region prediction + multi-round saccade inference
-│   ├── builder.py         # MultiRoundInputBuilder: tokenizes multi-image conversations
-│   ├── foveation.py       # SaccadeLoop: round decisions (crop / saccade / stop)
-│   ├── attention.py       # Hidden state extraction from LLM last layer
-│   ├── labels.py          # Binary overlap labels + overlap masking
-│   ├── constants.py       # Pointer tokens, resolution levels, chat template
-│   ├── crop.py            # Image cropping utilities
-│   └── sampling.py        # Attention sampling / argmax prediction
+│   ├── train.py        # SaccadeTrainer: multi-round training loop
+│   ├── model.py        # Qwen25VLWithActionHead: backbone + LoRA + ActionHead
+│   ├── action_head.py  # Self-Attn + MLP_V + MLP_T + KL loss
+│   ├── inference.py    # BFS region prediction + multi-round saccade
+│   ├── builder.py      # MultiRoundInputBuilder: tokenizes multi-image conversations
+│   ├── foveation.py    # SaccadeLoop: round decisions (crop/saccade/stop)
+│   ├── attention.py    # Hidden state extraction + spatial utilities
+│   ├── labels.py       # Binary overlap labels + crop masking
+│   ├── constants.py    # Pointer tokens, resolution, chat template
+│   └── crop.py         # Image cropping + coordinate helpers
 ├── eval/
 │   ├── eval_screenspot_pro_aligned.py  # ScreenSpot-Pro evaluation
 │   ├── eval_screenspot.py              # ScreenSpot v1 evaluation
-│   └── eval_screenspot_v2.py           # ScreenSpot v2 evaluation
+│   ├── eval_screenspot_v2.py           # ScreenSpot v2 evaluation
+│   └── visualize_saccade.py            # Multi-round visualization tool
 ├── jobs/
-│   ├── setup_and_train.sh   # One-script setup for fresh servers
-│   ├── train_all_2gpu.sh    # Train on all 6 datasets (2 GPU)
-│   ├── train_guiact_2gpu.sh # Train on GUIAct only (2 GPU)
-│   ├── eval_all_screenspot.sh # Run all ScreenSpot evaluations
-│   └── ...
-├── tests/                   # Unit tests (43 tests)
+│   ├── train.sh              # Main training script
+│   ├── setup_and_train.sh    # One-script server setup
+│   ├── eval_all_screenspot.sh
+│   └── download_gui_actor_data.sh
+├── tests/                    # Unit tests
 └── pyproject.toml
 ```
 
 ## Related Projects
 
-- [GUI-Actor](https://github.com/microsoft/GUI-Actor) (NeurIPS 2025) — Action head architecture baseline
+- [GUI-Actor](https://github.com/microsoft/GUI-Actor) (NeurIPS 2025) — Action head architecture
 - [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) — Vision-language backbone
 
 ## License

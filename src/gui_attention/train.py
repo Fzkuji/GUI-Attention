@@ -1,7 +1,7 @@
 """
-Saccade Foveation Training (v4): LoRA + ActionHead, natural multi-round saccade.
+Saccade Foveation Training: LoRA/full-param + ActionHead, multi-round saccade.
 
-No gui_aima dependency. Uses transformers Qwen2.5-VL + peft LoRA + ActionHead.
+Uses transformers Qwen2.5-VL + peft LoRA + ActionHead. DDP via torchrun.
 
 Each sample trains up to max_saccade_rounds, using the model's OWN predictions
 to decide where to crop (not teacher forcing). Three scenarios per round:
@@ -61,11 +61,7 @@ from gui_attention.crop import crop_image, point_in_bbox
 from gui_attention.labels import compute_binary_labels, compute_overlap_mask
 from gui_attention.model import Qwen25VLWithActionHead, build_model
 
-try:
-    import deepspeed
-    HAS_DEEPSPEED = True
-except ImportError:
-    HAS_DEEPSPEED = False
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -198,68 +194,48 @@ class SaccadeTrainer:
         self.train_data = train_data
         self.args = args
         self.sa = script_args
-        self.use_deepspeed = HAS_DEEPSPEED and args.deepspeed is not None
-
         self.builder = MultiRoundInputBuilder(
             script_args.model_name_or_path, tokenizer, script_args.min_pixels,
             low_res_max_pixels=script_args.low_res_max_pixels,
             high_res_max_pixels=script_args.high_res_max_pixels,
         )
 
-        # Determine world_size early for total_steps calculation
-        ws = dist.get_world_size() if dist.is_initialized() else 1
+        self.model = model
+
+        # Detect distributed (torchrun)
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+        # Compute total steps for scheduler
         total_steps = (
             int(args.num_train_epochs) * len(train_data)
-            // ws
+            // self.world_size
             // max(args.per_device_train_batch_size, 1)
             // max(args.gradient_accumulation_steps, 1)
         )
         if args.max_steps and args.max_steps > 0:
             total_steps = min(total_steps, args.max_steps)
 
-        if self.use_deepspeed:
-            # Resolve deepspeed config (HF TrainingArguments may parse it)
-            ds_config = args.deepspeed
-            if isinstance(ds_config, str):
-                import json as _json
-                with open(ds_config) as _f:
-                    ds_config = _json.load(_f)
-
-            self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
-                model=model,
-                model_parameters=[p for p in model.parameters() if p.requires_grad],
-                config=ds_config,
-            )
-            self.model = self.model_engine.module
-            self.rank = dist.get_rank() if dist.is_initialized() else 0
-            self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        else:
-            self.model = model
-            self.model_engine = None
-            # Detect distributed (torchrun)
-            if dist.is_initialized():
-                self.rank = dist.get_rank()
-                self.world_size = dist.get_world_size()
-            else:
-                self.rank = 0
-                self.world_size = 1
-            # Dual LR: action_head gets higher LR, LoRA gets lower LR
-            action_head_params = list(model.action_head.parameters())
-            backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-            param_groups = [
-                {"params": action_head_params, "lr": script_args.action_head_lr},
-                {"params": backbone_params, "lr": script_args.lora_lr},
-            ]
-            self.optimizer = torch.optim.AdamW(
-                param_groups, weight_decay=args.weight_decay,
-            )
-            warmup_steps = int(total_steps * args.warmup_ratio) if args.warmup_ratio > 0 else 0
-            self.scheduler = transformers.get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=max(total_steps, 1),
-            )
-
+        # Dual LR: action_head gets higher LR, backbone gets lower LR
+        action_head_params = list(model.action_head.parameters())
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+        param_groups = [
+            {"params": action_head_params, "lr": script_args.action_head_lr},
+            {"params": backbone_params, "lr": script_args.lora_lr},
+        ]
+        self.optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=args.weight_decay,
+        )
+        warmup_steps = int(total_steps * args.warmup_ratio) if args.warmup_ratio > 0 else 0
+        self.scheduler = transformers.get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max(total_steps, 1),
+        )
 
         self.metrics = defaultdict(list)
         self.global_step = 0
@@ -267,7 +243,7 @@ class SaccadeTrainer:
         # Resume training state (optimizer, scheduler, step)
         if script_args.resume_ckpt:
             state_path = os.path.join(script_args.resume_ckpt, "training_state.pt")
-            if os.path.exists(state_path) and not self.use_deepspeed:
+            if os.path.exists(state_path):
                 state = torch.load(state_path, map_location="cpu")
                 self.optimizer.load_state_dict(state["optimizer"])
                 self.scheduler.load_state_dict(state["scheduler"])
@@ -579,10 +555,7 @@ class SaccadeTrainer:
     def _train_step(self, sample):
         loss, nv, round_preds = self._forward_sample(sample)
         if nv > 0 and loss.requires_grad:
-            if self.use_deepspeed:
-                self.model_engine.backward(loss)
-            else:
-                (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
+            (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
 
         # Metrics
         gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
@@ -691,14 +664,13 @@ class SaccadeTrainer:
             if self.sa.use_lora:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
                 print(f"  lora_targets={self.sa.lora_target_modules}")
-            print(f"  world_size={self.world_size}  deepspeed={self.use_deepspeed}  max_steps={max_steps}")
+            print(f"  world_size={self.world_size}  max_steps={max_steps}")
 
         # Print a complete training sample for debugging
         if self.rank == 0:
             self._print_sample_debug(self.train_data[0])
 
-        if not self.use_deepspeed:
-            self.optimizer.zero_grad()
+        self.optimizer.zero_grad()
         micro = self.global_step * ga  # correct micro count for resume
 
         for epoch in range(epochs):
@@ -726,10 +698,7 @@ class SaccadeTrainer:
             for i in pbar:
                 loss_val, nv = self.train_step(shard[i:i+bs])
                 micro += 1
-                if self.use_deepspeed:
-                    self.model_engine.step()
-                    self.global_step += 1
-                elif micro % ga == 0:
+                if micro % ga == 0:
                     # Sync gradients across GPUs before optimizer step
                     if self.world_size > 1:
                         for p in self.model.parameters():
@@ -744,15 +713,12 @@ class SaccadeTrainer:
 
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
-                    should_log = self.use_deepspeed or (micro % ga == 0)
-                    if should_log:
-                        # samples since last log = logging_steps * GA * world_size * batch_size
+                    if micro % ga == 0:
                         n_since_last = self.args.logging_steps * ga * self.world_size * self.args.per_device_train_batch_size
                         def ar(k, n=n_since_last):
                             vals = self.metrics[k][-n:]
                             return sum(vals) / max(len(vals), 1)
-                        all_lrs = (self.model_engine.get_lr() if self.use_deepspeed
-                                   else self.scheduler.get_last_lr())
+                        all_lrs = self.scheduler.get_last_lr()
                         lr_val = all_lrs[0]  # action_head lr
                         bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val  # backbone lr
                         print(f"  [Step {self.global_step}] loss={loss_val:.4f} "
@@ -782,36 +748,17 @@ class SaccadeTrainer:
             dist.barrier()
         p = os.path.join(self.args.output_dir, name)
 
-        if self.use_deepspeed:
-            # ZeRO-3: use DeepSpeed's save which gathers sharded params
-            # Save full model checkpoint via DeepSpeed
-            self.model_engine.save_checkpoint(p, tag="ds_ckpt")
-            if self.rank == 0:
-                # Also save action head separately
-                os.makedirs(p, exist_ok=True)
-                torch.save(self.model.action_head.state_dict(), os.path.join(p, "action_head.pt"))
-                self.tokenizer.save_pretrained(p)
-                # Try to save consolidated model via zero_to_fp32
-                try:
-                    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-                    state_dict = get_fp32_state_dict_from_zero_checkpoint(os.path.join(p, "ds_ckpt"))
-                    # Save backbone
-                    self.model.backbone.save_pretrained(p, state_dict=state_dict)
-                except Exception as e:
-                    print(f"  Warning: could not consolidate ZeRO-3 weights: {e}")
-                    print(f"  Use `deepspeed.utils.zero_to_fp32` to convert later.")
-        else:
-            if self.rank != 0:
-                return
-            os.makedirs(p, exist_ok=True)
-            self.model.save_pretrained(p)
-            self.tokenizer.save_pretrained(p)
-            # Save training state for resume
-            torch.save({
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
-                "global_step": self.global_step,
-            }, os.path.join(p, "training_state.pt"))
+        if self.rank != 0:
+            return
+        os.makedirs(p, exist_ok=True)
+        self.model.save_pretrained(p)
+        self.tokenizer.save_pretrained(p)
+        # Save training state for resume
+        torch.save({
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "global_step": self.global_step,
+        }, os.path.join(p, "training_state.pt"))
 
         if self.rank == 0:
             with open(os.path.join(p, "metrics.json"), "w") as f:
@@ -876,8 +823,7 @@ def main():
         if rank == 0:
             print(f"  Model weights loaded from {ckpt}")
 
-    if not (HAS_DEEPSPEED and ta.deepspeed):
-        model.to(f"cuda:{local_rank}")
+    model.to(f"cuda:{local_rank}")
 
     train_data = load_dataset(sa.data_path, sa.image_folder, sa.max_samples, sa.max_samples_per_dataset)
     os.makedirs(ta.output_dir, exist_ok=True)

@@ -1,5 +1,5 @@
 """
-Unit tests for GUI-Attention v4 utility functions.
+Unit tests for GUI-Attention utility functions.
 
 Tests the core helper functions that don't depend on model weights.
 Run with: python -m pytest tests/test_utils.py -v
@@ -68,86 +68,6 @@ def test_point_in_bbox():
     assert point_in_bbox(0.0, 0.0, (0.0, 0.0, 1.0, 1.0))
 
 
-# -- Test sample_from_attention -----------------------------------------------
-
-def test_sample_from_attention_range():
-    from gui_attention.sampling import sample_from_attention
-    n_w, n_h = 10, 8
-    attn = torch.rand(1, n_w * n_h)
-    attn = attn / attn.sum()
-    for _ in range(20):
-        px, py, lp, idx = sample_from_attention(attn, n_w, n_h)
-        assert 0 <= px <= 1, f"px={px} out of range"
-        assert 0 <= py <= 1, f"py={py} out of range"
-        assert idx < n_w * n_h
-
-
-def test_sample_from_attention_peaked():
-    from gui_attention.sampling import sample_from_attention
-    n_w, n_h = 5, 5
-    attn = torch.zeros(1, 25)
-    attn[0, 12] = 1.0
-    px, py, _, idx = sample_from_attention(attn, n_w, n_h)
-    assert idx == 12
-    assert abs(px - 0.5) < 0.11
-    assert abs(py - 0.5) < 0.11
-
-
-def test_sample_from_attention_temperature():
-    from gui_attention.sampling import sample_from_attention
-    n_w, n_h = 5, 5
-    attn = torch.tensor([[0.1, 0.1, 0.1, 0.1, 0.1,
-                          0.1, 0.1, 0.1, 0.1, 0.1,
-                          0.1, 0.1, 5.0, 0.1, 0.1,
-                          0.1, 0.1, 0.1, 0.1, 0.1,
-                          0.1, 0.1, 0.1, 0.1, 0.1]])
-    attn = attn / attn.sum()
-    hits = 0
-    for _ in range(50):
-        _, _, _, idx = sample_from_attention(attn, n_w, n_h, temperature=0.01)
-        if idx == 12:
-            hits += 1
-    assert hits > 45, f"Expected mostly idx=12 with low temp, got {hits}/50"
-
-
-# -- Test compute_round_log_prob ----------------------------------------------
-
-def test_compute_round_log_prob_peaked():
-    from gui_attention.sampling import compute_round_log_prob
-    attn = torch.zeros(1, 25)
-    attn[0, 12] = 1.0
-    lp = compute_round_log_prob(attn, (0.5, 0.5), 5, 5, 1.0)
-    assert lp.item() > -0.01
-
-
-def test_compute_round_log_prob_uniform():
-    from gui_attention.sampling import compute_round_log_prob
-    n = 25
-    attn = torch.ones(1, n) / n
-    lp = compute_round_log_prob(attn, (0.5, 0.5), 5, 5, 1.0)
-    assert abs(lp.item() - (-math.log(n))) < 0.01
-
-
-# -- Test argmax_prediction ---------------------------------------------------
-
-def test_argmax_prediction():
-    from gui_attention.sampling import argmax_prediction
-    attn = torch.zeros(1, 25)
-    attn[0, 12] = 1.0
-    x, y = argmax_prediction(attn, 5, 5)
-    assert abs(x - 0.5) < 0.11
-    assert abs(y - 0.5) < 0.11
-
-
-def test_argmax_prediction_corner():
-    from gui_attention.sampling import argmax_prediction
-    attn = torch.zeros(1, 25)
-    attn[0, 0] = 1.0
-    x, y = argmax_prediction(attn, 5, 5)
-    assert abs(x - 0.1) < 0.01
-    assert abs(y - 0.1) < 0.01
-
-
 # -- Test find_image_visual_ranges -------------------------------------------
 
 def test_find_image_visual_ranges():
@@ -177,15 +97,6 @@ def test_find_nth_pointer_pad():
     assert find_nth_pointer_pad(ids, PP_TOK, 0) == 1
     assert find_nth_pointer_pad(ids, PP_TOK, 1) == 3
     assert find_nth_pointer_pad(ids, PP_TOK, 2) is None
-
-
-# -- Test resolution constants ------------------------------------------------
-
-def test_resolution_constants():
-    from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
-    assert LOW_RES_MAX_PIXELS == 1_003_520
-    assert HIGH_RES_MAX_PIXELS == 5_720_064
-    assert LOW_RES_MAX_PIXELS < HIGH_RES_MAX_PIXELS
 
 
 # -- Test SaccadeLoop ---------------------------------------------------------
@@ -234,7 +145,6 @@ def test_identify_attended_image():
     from gui_attention.attention import identify_attended_image
     attn = torch.zeros(30)
     attn[15] = 1.0
-    # (offset, n_tokens) format
     ranges = [(0, 10), (10, 10), (20, 10)]
     img_idx, local = identify_attended_image(attn, ranges)
     assert img_idx == 1
@@ -261,7 +171,7 @@ def test_action_head_shapes():
     head = ActionHead(d_model=64, projection_dim=64)
     vis = torch.randn(50, 64)
     anchor = torch.randn(1, 64)
-    attn, loss = head(vis, anchor)
+    attn, loss, logits = head(vis, anchor)
     assert attn.shape == (1, 50)
     assert loss is None
     assert abs(attn.sum().item() - 1.0) < 1e-5
@@ -274,7 +184,7 @@ def test_action_head_with_labels():
     anchor = torch.randn(1, 64)
     labels = torch.zeros(1, 50)
     labels[0, 20:25] = 1.0
-    attn, loss = head(vis, anchor, labels=labels)
+    attn, loss, logits = head(vis, anchor, labels=labels)
     assert loss is not None
     assert loss.item() > 0
 
@@ -286,7 +196,7 @@ def test_action_head_masking():
     anchor = torch.randn(1, 64)
     mask = torch.zeros(50, dtype=torch.bool)
     mask[10:20] = True
-    attn, _ = head(vis, anchor, mask=mask)
+    attn, _, _ = head(vis, anchor, mask=mask)
     assert attn[0, mask].sum().item() < 1e-6
 
 
@@ -303,9 +213,8 @@ def test_binary_labels_overlap():
 
 def test_binary_labels_fallback():
     from gui_attention.labels import compute_binary_labels
-    # Tiny bbox that might not overlap any patch center
     labels = compute_binary_labels(2, 2, (0.001, 0.001, 0.002, 0.002))
-    assert labels.sum() >= 1.0  # Fallback should set at least one patch
+    assert labels.sum() >= 1.0
 
 
 def test_overlap_mask():

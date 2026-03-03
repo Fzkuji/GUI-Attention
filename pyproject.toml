@@ -25,7 +25,6 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
-    "deepspeed>=0.14.0",
     "wandb",
 ]
 flash-attn = [

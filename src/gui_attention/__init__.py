@@ -1,3 +1,3 @@
-"""GUI-Attention: Foveated Visual Attention for Efficient GUI Grounding."""
+"""GUI-Attention: Saccade Foveation for Efficient GUI Grounding."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
