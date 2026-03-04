@@ -265,8 +265,8 @@ def main():
     # Saccade
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--crop_ratio", type=float, default=0.0)
-    parser.add_argument("--crop_size", type=int, default=168, help="Fixed crop side length in pixels")
-    parser.add_argument("--crop_upscale", type=int, default=4, help="Integer upscale factor for crop")
+    parser.add_argument("--crop_size", type=int, default=252, help="Fixed crop side length in pixels")
+    parser.add_argument("--crop_upscale", type=int, default=3, help="Integer upscale factor for crop")
     parser.add_argument("--crop_upsample_pixels", type=int, default=0,
                         help="(Legacy) Upsample crop to this many pixels (0=disabled)")
     parser.add_argument("--crop_target_pixels", type=int, default=0)

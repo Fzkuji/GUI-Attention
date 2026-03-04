@@ -75,8 +75,8 @@ def run_saccade_with_recording(
     builder: MultiRoundInputBuilder,
     max_rounds: int = 4,
     crop_ratio: float = 0.0,
-    crop_size: int = 168,
-    crop_upscale: int = 4,
+    crop_size: int = 252,
+    crop_upscale: int = 3,
     crop_target_pixels: int = 0,
     device: str = "cuda:0",
 ) -> list:
