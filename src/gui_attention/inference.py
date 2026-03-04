@@ -171,12 +171,17 @@ def run_saccade_inference(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _, _ = model.action_head(vis_embeds, anchor)
+    grid_info_r0 = {"n_height": nh0, "n_width": nw0, "image_offset": 0}
+    attn0, _, _, pred_coords = model.action_head(vis_embeds, anchor, grid_info=grid_info_r0)
     attn_1d = attn0.squeeze(0)
 
-    # Use BFS prediction for round 0
-    best_pt, _, _ = get_prediction_region_point(attn_1d, nw0, nh0, activation_threshold)
-    focus_x, focus_y = best_pt
+    # Use soft-argmax prediction for sub-patch precision
+    if pred_coords is not None:
+        focus_x = pred_coords[0].item()
+        focus_y = pred_coords[1].item()
+    else:
+        best_pt, _, _ = get_prediction_region_point(attn_1d, nw0, nh0, activation_threshold)
+        focus_x, focus_y = best_pt
 
     decision = saccade.decide_round0(state, focus_x, focus_y)
     nw_final, nh_final = nw0, nh0
@@ -242,10 +247,19 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        attn_ri, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
+        # Use soft-argmax on the latest crop for sub-patch precision
+        latest_img_idx = len(vis_ranges) - 1
+        nh_latest, nw_latest = grid_dims[latest_img_idx]
+        off_latest, n_latest = vis_ranges[latest_img_idx]
+        grid_info_ri = {
+            "n_height": nh_latest, "n_width": nw_latest,
+            "image_offset": off_latest, "n_image_tokens": n_latest,
+        }
+        attn_ri, _, _, pred_coords_ri = model.action_head(
+            vis_embeds, anchor, mask=full_mask, grid_info=grid_info_ri)
         attn_1d = attn_ri.squeeze(0)
 
-        # Identify which image has argmax
+        # Identify which image has argmax (for attended_source detection)
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
         info = builder.image_infos[img_idx]
 
@@ -254,9 +268,15 @@ def run_saccade_inference(
         else:
             break
 
-        off_a, n_a = vis_ranges[img_idx]
-        img_attn = attn_1d[off_a:off_a+n_a]
-        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+        # Use soft-argmax coords if the model attends to the crop
+        if pred_coords_ri is not None and img_idx == latest_img_idx:
+            lx = pred_coords_ri[0].item()
+            ly = pred_coords_ri[1].item()
+        else:
+            off_a, n_a = vis_ranges[img_idx]
+            img_attn = attn_1d[off_a:off_a+n_a]
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+
         bx1, by1, bx2, by2 = info.global_bbox
         global_x = bx1 + lx * (bx2 - bx1)
         global_y = by1 + ly * (by2 - by1)

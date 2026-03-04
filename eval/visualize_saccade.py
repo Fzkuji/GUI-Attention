@@ -139,7 +139,7 @@ def run_saccade_with_recording(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _, _ = model.action_head(vis_embeds, anchor)
+    attn0, _, _, _ = model.action_head(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Low-res attention for round 0
@@ -210,7 +210,7 @@ def run_saccade_with_recording(
             off, ntok = vis_ranges[prev_i]
             full_mask[off:off + ntok] = True
 
-        attn_ri, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
+        attn_ri, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
