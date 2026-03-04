@@ -285,7 +285,7 @@ def main():
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
     # Data
-    parser.add_argument("--dataset_name", type=str, default="likaixin/ScreenSpot-v2")
+    parser.add_argument("--dataset_name", type=str, default="OS-Copilot/ScreenSpot-v2")
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--save_path", type=str, default=None)
 
