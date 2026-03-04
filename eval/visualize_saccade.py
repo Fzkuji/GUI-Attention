@@ -144,7 +144,7 @@ def run_saccade_with_recording(
 
     # Low-res attention for round 0
     n_low = vis_ranges[0][1]
-    low_attn = attn_1d[:n_low].detach().cpu().numpy().reshape(nh0, nw0)
+    low_attn = attn_1d[:n_low].detach().cpu().float().numpy().reshape(nh0, nw0)
     lx, ly = token_to_spatial(attn_1d[:n_low].argmax().item(), nw0, nh0,
                               attn_weights=attn_1d[:n_low])
 
@@ -232,12 +232,12 @@ def run_saccade_with_recording(
 
         # Build attention heatmap for this round
         # Low-res attention (unmasked patches)
-        low_attn_raw = attn_1d[:vis_ranges[0][1]].detach().cpu().numpy()
+        low_attn_raw = attn_1d[:vis_ranges[0][1]].detach().cpu().float().numpy()
         low_attn_2d = low_attn_raw.reshape(grid_dims[0])
 
         # Crop attention
         crop_off, crop_n = vis_ranges[latest_img_idx]
-        crop_attn_raw = attn_1d[crop_off:crop_off + crop_n].detach().cpu().numpy()
+        crop_attn_raw = attn_1d[crop_off:crop_off + crop_n].detach().cpu().float().numpy()
         crop_nh, crop_nw = grid_dims[latest_img_idx]
         crop_attn_2d = crop_attn_raw.reshape(crop_nh, crop_nw)
 
