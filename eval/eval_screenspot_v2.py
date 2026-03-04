@@ -342,7 +342,7 @@ def main():
     # Load data from HuggingFace
     if is_main:
         print(f"Loading dataset: {args.dataset_name} (split={args.split})")
-    dataset = load_dataset(args.dataset_name, split=args.split)
+    dataset = load_dataset(args.dataset_name, split=args.split, trust_remote_code=True)
     if is_main:
         print(f"Loaded {len(dataset)} examples")
         # Print column names for debugging
