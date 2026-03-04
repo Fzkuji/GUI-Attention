@@ -1,28 +1,35 @@
 """
-ScreenSpot (v1) evaluation using saccade foveation (v4).
+ScreenSpot (v1) evaluation using saccade foveation.
 
 Dataset: rootsautomation/ScreenSpot on HuggingFace
 1,272 samples across mobile/desktop/web × text/icon.
 
 Usage:
+  # Single GPU
   python eval/eval_screenspot.py \
       --checkpoint /path/to/checkpoint \
-      --base_model Qwen/Qwen2.5-VL-3B-Instruct \
-      --rounds 3 --crop_ratio 0.3
+      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+      --rounds 3
+
+  # Multi-GPU DDP
+  torchrun --nproc_per_node=8 eval/eval_screenspot.py \
+      --checkpoint /path/to/checkpoint \
+      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+      --rounds 3
 """
 
 import argparse
 import json
 import os
+import pickle
 import time
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+import torch.distributed as dist
 from tqdm import tqdm
 
 from gui_attention.builder import MultiRoundInputBuilder
-from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
 from gui_attention.inference import run_saccade_inference
 from gui_attention.model import Qwen25VLWithActionHead
 
@@ -40,6 +47,47 @@ DOMAIN_MAP = {
 def do_boxes_overlap(box1, box2):
     return not (box1[2] < box2[0] or box1[0] > box2[2] or
                 box1[3] < box2[1] or box1[1] > box2[3])
+
+
+# ---------------------------------------------------------------------------
+# DDP setup
+# ---------------------------------------------------------------------------
+
+def setup_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, True, f"cuda:{local_rank}"
+    return 0, 1, False, None
+
+
+def gather_results(local_results, rank, world_size):
+    """Gather list of dicts from all ranks to rank 0."""
+    local_bytes = pickle.dumps(local_results)
+    local_tensor = torch.ByteTensor(list(local_bytes)).cuda()
+    size_tensor = torch.tensor([len(local_bytes)], dtype=torch.long, device="cuda")
+
+    all_sizes = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(world_size)]
+    dist.all_gather(all_sizes, size_tensor)
+
+    max_size = max(s.item() for s in all_sizes)
+    padded = torch.zeros(max_size, dtype=torch.uint8, device="cuda")
+    padded[:len(local_bytes)] = local_tensor
+
+    all_padded = [torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
+    dist.all_gather(all_padded, padded)
+
+    if rank == 0:
+        all_results = []
+        for i in range(world_size):
+            sz = all_sizes[i].item()
+            data = bytes(all_padded[i][:sz].cpu().tolist())
+            all_results.extend(pickle.loads(data))
+        return all_results
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +178,7 @@ def evaluate_all(model, tokenizer, dataset, args, builder):
     tmp_dir = os.path.join(args.save_path, "tmp_images")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    for i, example in tqdm(enumerate(dataset), total=len(dataset)):
+    for i, example in tqdm(enumerate(dataset), total=len(dataset), disable=(args._rank != 0)):
         data_source = example["data_source"]
         domain = DOMAIN_MAP.get(data_source, "web")
 
@@ -148,17 +196,18 @@ def evaluate_all(model, tokenizer, dataset, args, builder):
         image = example["image"].convert("RGB")
         gt_bbox = ele["bbox_x1y1x2y2"]
 
-        # Save temp image for inference (run_saccade_inference needs a path)
-        tmp_path = os.path.join(tmp_dir, f"tmp_{i}.png")
+        # Save temp image for inference
+        tmp_path = os.path.join(tmp_dir, f"tmp_{args._rank}_{i}.png")
         image.save(tmp_path)
 
         t_start = time.time()
         pred = run_saccade_inference(
             image, tmp_path, example["instruction"],
             model, tokenizer, builder,
-            max_rounds=args.rounds, crop_ratio=args.crop_ratio,
-            crop_upsample_pixels=args.crop_upsample_pixels, crop_target_pixels=args.crop_target_pixels,
-    parser.add_argument("--crop_target_pixels", type=int, default=200704)
+            max_rounds=args.rounds,
+            crop_ratio=args.crop_ratio,
+            crop_size=args.crop_size,
+            crop_upscale=args.crop_upscale,
             device=str(device),
         )
         t_elapsed = time.time() - t_start
@@ -200,51 +249,87 @@ def evaluate_all(model, tokenizer, dataset, args, builder):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ScreenSpot v1 eval (saccade foveation v4)")
+    parser = argparse.ArgumentParser(description="ScreenSpot v1 eval (saccade foveation)")
 
+    # Model
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
+    # Data
     parser.add_argument("--dataset_name", type=str, default="rootsautomation/ScreenSpot")
     parser.add_argument("--save_path", type=str, default=None)
 
+    # Saccade
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.3)
-    parser.add_argument("--crop_upsample_pixels", type=int, default=0)
-    parser.add_argument("--crop_target_pixels", type=int, default=200704)
+    parser.add_argument("--crop_ratio", type=float, default=0.0,
+                        help="(Legacy) Fraction crop. 0=use crop_size.")
+    parser.add_argument("--crop_size", type=int, default=252,
+                        help="Fixed crop side length in pixels")
+    parser.add_argument("--crop_upscale", type=int, default=3,
+                        help="Integer upscale factor for crop")
 
-    parser.add_argument("--low_res_max_pixels", type=int, default=LOW_RES_MAX_PIXELS)
-    parser.add_argument("--high_res_max_pixels", type=int, default=HIGH_RES_MAX_PIXELS)
+    # Resolution
+    parser.add_argument("--low_res_max_pixels", type=int, default=400000)
 
+    # Misc
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
 
     args = parser.parse_args()
 
+    # DDP setup
+    rank, world_size, is_distributed, ddp_device = setup_distributed()
+    if ddp_device is not None:
+        args.device = ddp_device
+    args._rank = rank
+    is_main = (rank == 0)
+
+    # Auto save path
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
-        tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
+        if args.crop_size > 0:
+            tag = f"saccade_r{args.rounds}_crop{args.crop_size}x{args.crop_upscale}"
+        else:
+            tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
         args.save_path = f"results/screenspot_v1/{ckpt_name}/{tag}"
 
-    print("=== Config ===")
-    print(f"  checkpoint:  {args.checkpoint}")
-    print(f"  base_model:  {args.base_model}")
-    print(f"  rounds:      {args.rounds}")
-    print(f"  crop_ratio:  {args.crop_ratio}")
-    print(f"  device:      {args.device}")
-    print()
+    if is_main:
+        print("=== ScreenSpot v1 Eval ===")
+        print(f"  checkpoint:  {args.checkpoint}")
+        print(f"  base_model:  {args.base_model}")
+        print(f"  rounds:      {args.rounds}")
+        if args.crop_size > 0:
+            print(f"  crop:        {args.crop_size}x{args.crop_size} x{args.crop_upscale} -> {args.crop_size*args.crop_upscale}x{args.crop_size*args.crop_upscale}")
+        else:
+            print(f"  crop_ratio:  {args.crop_ratio}")
+        print(f"  low_res:     {args.low_res_max_pixels}")
+        print(f"  device:      {args.device}")
+        if is_distributed:
+            print(f"  DDP:         {world_size} GPUs")
+        print()
 
     # Load data from HuggingFace
-    print(f"Loading dataset: {args.dataset_name}")
+    if is_main:
+        print(f"Loading dataset: {args.dataset_name}")
     dataset = load_dataset(args.dataset_name, split="test")
-    print(f"Loaded {len(dataset)} examples")
+    if is_main:
+        print(f"Loaded {len(dataset)} examples")
 
     if args.max_samples is not None:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-        print(f"Limiting to {len(dataset)} samples")
+        if is_main:
+            print(f"Limiting to {len(dataset)} samples")
+
+    # Shard data across ranks
+    if is_distributed:
+        indices = list(range(rank, len(dataset), world_size))
+        dataset = dataset.select(indices)
+        if is_main:
+            print(f"Rank 0 processing {len(dataset)} samples (total split across {world_size} GPUs)")
 
     # Load model
-    print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
+    if is_main:
+        print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
     model, tokenizer = Qwen25VLWithActionHead.load_pretrained(
         args.checkpoint,
         base_model_name_or_path=args.base_model,
@@ -252,10 +337,11 @@ def main():
     )
     model.eval()
 
+    crop_pixels = (args.crop_size * args.crop_upscale) ** 2 if args.crop_size > 0 else 200704
     builder = MultiRoundInputBuilder(
         args.base_model, tokenizer, min_pixels=3136,
         low_res_max_pixels=args.low_res_max_pixels,
-        high_res_max_pixels=args.high_res_max_pixels,
+        high_res_max_pixels=crop_pixels,
     )
 
     os.makedirs(args.save_path, exist_ok=True)
@@ -263,45 +349,54 @@ def main():
     pred_path = os.path.join(args.save_path, f"{ckpt_name}_preds.json")
     metric_path = os.path.join(args.save_path, f"{ckpt_name}_metric.txt")
 
-    if os.path.exists(pred_path):
+    if os.path.exists(pred_path) and is_main:
         print(f"Loading cached predictions from {pred_path}")
         with open(pred_path, "r") as f:
             results = json.load(f)
     else:
         t0 = time.time()
         with torch.no_grad():
-            results = evaluate_all(model, tokenizer, dataset, args, builder)
-        elapsed = time.time() - t0
-        print(f"Evaluation took {elapsed:.1f}s ({elapsed / len(results):.2f}s/sample)")
+            local_results = evaluate_all(model, tokenizer, dataset, args, builder)
 
-        with open(pred_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Saved {len(results)} predictions to {pred_path}")
+        # Gather results from all ranks
+        if is_distributed:
+            dist.barrier()
+            results = gather_results(local_results, rank, world_size)
+        else:
+            results = local_results
 
-        round_counts = {}
-        for r in results:
-            nr = r.get("num_rounds", 1)
-            round_counts[nr] = round_counts.get(nr, 0) + 1
-        print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+        if is_main:
+            elapsed = time.time() - t0
+            print(f"Evaluation took {elapsed:.1f}s ({elapsed / max(len(results), 1):.2f}s/sample)")
 
-        token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
-        if token_counts:
-            print(f"Avg visual tokens: {sum(token_counts) / len(token_counts):.0f}")
+            with open(pred_path, "w") as f:
+                json.dump(results, f, indent=2)
+            print(f"Saved {len(results)} predictions to {pred_path}")
 
-        times = [r.get("inference_time", 0) for r in results if r.get("inference_time", 0) > 0]
-        if times:
-            print(f"Avg inference time: {sum(times) / len(times):.3f}s/sample")
+            round_counts = {}
+            for r in results:
+                nr = r.get("num_rounds", 1)
+                round_counts[nr] = round_counts.get(nr, 0) + 1
+            print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
 
-    if not os.path.exists(metric_path):
-        print("\n=== Metrics ===")
-        metric_info = get_metric(results)
-        with open(metric_path, "w") as f:
-            f.write(metric_info)
-        print(f"Saved metrics to {metric_path}")
-    else:
-        print(f"Metrics already exist at {metric_path}")
-        with open(metric_path, "r") as f:
-            print(f.read())
+            token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
+            if token_counts:
+                print(f"Avg visual tokens: {sum(token_counts) / len(token_counts):.0f}")
+
+    if is_main:
+        if not os.path.exists(metric_path):
+            print("\n=== Metrics ===")
+            metric_info = get_metric(results)
+            with open(metric_path, "w") as f:
+                f.write(metric_info)
+            print(f"\nSaved metrics to {metric_path}")
+        else:
+            print(f"Metrics already exist at {metric_path}")
+            with open(metric_path, "r") as f:
+                print(f.read())
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
