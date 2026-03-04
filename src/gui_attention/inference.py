@@ -234,16 +234,13 @@ def run_saccade_inference(
         nh_low, nw_low = grid_dims[0]
         latest_img_idx = len(vis_ranges) - 1
 
-        # Action head mask: current crop masks low-res + ALL old crops masked out
+        # Action head mask: current crop masks low-res overlap area
+        # NOTE: old crop tokens are NOT masked (matches training behavior)
         this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
         full_mask[:n_low] = this_crop_mask
-        # Mask all previous crop tokens (indices 1 to latest-1)
-        for prev_i in range(1, latest_img_idx):
-            off, ntok = vis_ranges[prev_i]
-            full_mask[off:off + ntok] = True
 
         total_vis_tokens = n_total
 
