@@ -555,10 +555,14 @@ class SaccadeTrainer:
                 n_total = vis_embeds.shape[0]
                 latest_img_idx = len(vis_ranges) - 1
 
-                # Mask: all crop areas in low-res are masked
+                # Mask: current crop overlap in low-res + all OLD crop tokens
                 this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
+                # Mask all previous crop tokens (not the latest one)
+                for prev_i in range(1, latest_img_idx):
+                    off_prev, ntok_prev = vis_ranges[prev_i]
+                    full_mask[off_prev:off_prev + ntok_prev] = True
 
                 if gt_in_crop:
                     # GT in crop → FINAL round, binary label on crop

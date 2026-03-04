@@ -1,33 +1,40 @@
 """
-ScreenSpot (v1) evaluation using saccade foveation.
+Unified ScreenSpot evaluation: v1, v2, and Pro.
 
-Dataset: rootsautomation/ScreenSpot on HuggingFace
-1,272 samples across mobile/desktop/web × text/icon.
+Supports multi-round saccade foveation with DDP.
 
 Usage:
-  # Single GPU
-  python eval/eval_screenspot.py \
-      --checkpoint /path/to/checkpoint \
-      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
-      --rounds 3
-
-  # Multi-GPU DDP
+  # ScreenSpot v1 (HuggingFace)
   torchrun --nproc_per_node=8 eval/eval_screenspot.py \
+      --dataset v1 \
       --checkpoint /path/to/checkpoint \
-      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
-      --rounds 3
+      --base_model /path/to/Qwen2.5-VL-3B-Instruct
+
+  # ScreenSpot v2 (local JSON + zip)
+  torchrun --nproc_per_node=8 eval/eval_screenspot.py \
+      --dataset v2 --data_dir /path/to/v2_data \
+      --checkpoint /path/to/checkpoint \
+      --base_model /path/to/Qwen2.5-VL-3B-Instruct
+
+  # ScreenSpot-Pro (local directory)
+  torchrun --nproc_per_node=8 eval/eval_screenspot.py \
+      --dataset pro --data_dir /path/to/ScreenSpot-Pro \
+      --checkpoint /path/to/checkpoint \
+      --base_model /path/to/Qwen2.5-VL-3B-Instruct
 """
 
 import argparse
+import glob
 import json
 import os
 import pickle
 import time
+import zipfile
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
+from PIL import Image
 from tqdm import tqdm
 
 from gui_attention.builder import MultiRoundInputBuilder
@@ -35,19 +42,171 @@ from gui_attention.inference import run_saccade_inference
 from gui_attention.model import Qwen25VLWithActionHead
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Constants
 # ---------------------------------------------------------------------------
 
 DOMAIN_MAP = {
-    "windows": "desktop", "macos": "desktop",
+    "windows": "desktop", "macos": "desktop", "linux": "desktop",
     "ios": "mobile", "android": "mobile",
-    "web-gitlab": "web", "web-shop": "web", "web-forum": "web", "web-tool": "web",
+    "web": "web",
+}
+
+# ScreenSpot-Pro category mapping
+PRO_CATEGORIES = {
+    "Dev": "Dev", "Creative": "Creative", "CAD": "CAD",
+    "Scientific": "Scientific", "Office": "Office", "OS": "OS",
 }
 
 
-def do_boxes_overlap(box1, box2):
-    return not (box1[2] < box2[0] or box1[0] > box2[2] or
-                box1[3] < box2[1] or box1[1] > box2[3])
+# ---------------------------------------------------------------------------
+# Data loaders
+# ---------------------------------------------------------------------------
+
+def load_screenspot_v1(data_dir=None):
+    """Load ScreenSpot v1 from HuggingFace."""
+    from datasets import load_dataset
+    dataset = load_dataset("rootsautomation/ScreenSpot", split="test",
+                           trust_remote_code=True)
+    samples = []
+    for i, ex in enumerate(dataset):
+        bbox = list(ex["bbox"])
+        # v1 bbox is already normalised [0,1]
+        if any(v > 1.0 for v in bbox):
+            img = ex["image"]
+            w, h = img.size
+            bbox = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
+
+        platform = ex.get("data_type", ex.get("platform", "web"))
+        domain = DOMAIN_MAP.get(platform.lower().split("-")[0] if platform else "web", "web")
+        ui_type = ex.get("ui_type", "text")
+
+        samples.append({
+            "image": ex["image"],
+            "image_path": None,  # will save temp
+            "instruction": ex.get("instruction", ex.get("prompt", "")),
+            "bbox_norm": bbox,  # [x1, y1, x2, y2] normalised
+            "ui_type": ui_type,
+            "domain": domain,
+            "data_source": platform,
+            "dataset_idx": i,
+        })
+    return samples
+
+
+def _find_v2_data_dir():
+    """Find ScreenSpot-v2 data in HF cache."""
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub/datasets--OS-Copilot--ScreenSpot-v2")
+    if not os.path.exists(cache_base):
+        return None
+    snapshots = glob.glob(os.path.join(cache_base, "snapshots", "*"))
+    return snapshots[0] if snapshots else None
+
+
+def load_screenspot_v2(data_dir=None):
+    """Load ScreenSpot v2 from local JSON files."""
+    if data_dir is None:
+        data_dir = _find_v2_data_dir()
+    if data_dir is None:
+        # Download
+        from huggingface_hub import snapshot_download
+        data_dir = snapshot_download("OS-Copilot/ScreenSpot-v2", repo_type="dataset")
+
+    json_files = {
+        "mobile": "screenspot_mobile_v2.json",
+        "desktop": "screenspot_desktop_v2.json",
+        "web": "screenspot_web_v2.json",
+    }
+    samples = []
+    for category, json_name in json_files.items():
+        json_path = os.path.join(data_dir, json_name)
+        if not os.path.exists(json_path):
+            print(f"  Warning: {json_path} not found, skipping {category}")
+            continue
+        with open(json_path, "r") as f:
+            items = json.load(f)
+        print(f"  {category}: {len(items)} samples")
+        for item in items:
+            # bbox is [x, y, w, h] in pixels
+            x, y, w, h = item["bbox"]
+            domain = DOMAIN_MAP.get(item.get("data_source", "").lower(), "web")
+            samples.append({
+                "image": None,
+                "image_path": None,
+                "img_filename": item["img_filename"],
+                "instruction": item["instruction"],
+                "bbox_xywh_px": [x, y, w, h],
+                "ui_type": item.get("data_type", "text"),
+                "domain": domain,
+                "data_source": item.get("data_source", ""),
+            })
+
+    # Find or extract images
+    image_dir = os.path.join(data_dir, "screenspotv2_image")
+    if not os.path.isdir(image_dir):
+        zip_path = os.path.join(data_dir, "screenspotv2_image.zip")
+        if os.path.exists(zip_path):
+            print(f"  Extracting images from {zip_path}...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(data_dir)
+
+    for item in samples:
+        item["image_path"] = os.path.join(image_dir, item["img_filename"])
+
+    return samples
+
+
+def load_screenspot_pro(data_dir):
+    """Load ScreenSpot-Pro from local directory."""
+    if data_dir is None:
+        raise ValueError("--data_dir required for ScreenSpot-Pro")
+
+    # Find annotation files
+    ann_dir = os.path.join(data_dir, "annotations")
+    if os.path.isdir(ann_dir):
+        json_files = sorted(glob.glob(os.path.join(ann_dir, "*.json")))
+    else:
+        json_files = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+
+    all_data = []
+    for json_path in json_files:
+        with open(json_path, "r") as f:
+            items = json.load(f)
+        if isinstance(items, list):
+            all_data.extend(items)
+
+    # Find image directory
+    image_dir = data_dir
+    if os.path.isdir(os.path.join(data_dir, "images")):
+        image_dir = os.path.join(data_dir, "images")
+
+    samples = []
+    for item in all_data:
+        bbox = item["bbox"]  # [x1, y1, x2, y2] in pixels
+        img_path = os.path.join(image_dir, item["img_filename"])
+        if not os.path.exists(img_path):
+            img_path = os.path.join(data_dir, item["img_filename"])
+
+        # Determine category and ui_type
+        ui_type = item.get("ui_type", "text")
+        # Pro has application/platform fields for category grouping
+        application = item.get("application", "")
+        platform = item.get("platform", "")
+        group = item.get("group", "")
+
+        samples.append({
+            "image": None,
+            "image_path": img_path,
+            "instruction": item["instruction"],
+            "bbox_px": bbox,  # [x1, y1, x2, y2] in pixels
+            "ui_type": ui_type,
+            "application": application,
+            "platform": platform,
+            "group": group,
+            "img_filename": item.get("img_filename", ""),
+        })
+
+    print(f"  Loaded {len(samples)} Pro samples")
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +225,6 @@ def setup_distributed():
 
 
 def gather_results(local_results, rank, world_size):
-    """Gather list of dicts from all ranks to rank 0."""
     local_bytes = pickle.dumps(local_results)
     local_tensor = torch.ByteTensor(list(local_bytes)).cuda()
     size_tensor = torch.tensor([len(local_bytes)], dtype=torch.long, device="cuda")
@@ -92,250 +250,337 @@ def gather_results(local_results, rank, world_size):
 
 
 # ---------------------------------------------------------------------------
-# Metrics (mobile/desktop/web × text/icon)
+# Helpers
 # ---------------------------------------------------------------------------
 
-def get_metric(list_of_examples,
-               domains=["mobile", "desktop", "web"],
-               ui_types=["text", "icon"]):
+def do_boxes_overlap(box1, box2):
+    return not (box1[2] < box2[0] or box1[0] > box2[2] or
+                box1[3] < box2[1] or box1[1] > box2[3])
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def print_metrics_v1v2(results):
+    """Print metrics for v1/v2: mobile/desktop/web × text/icon."""
+    domains = ["mobile", "desktop", "web"]
+    ui_types = ["text", "icon"]
+    return _print_metrics(results, domains, ui_types,
+                          group_key="domain", ui_key="ui_type")
+
+
+def print_metrics_pro(results):
+    """Print metrics for Pro: Dev/Creative/CAD/Scientific/Office/OS × text/icon."""
+    categories = ["Dev", "Creative", "CAD", "Scientific", "Office", "OS"]
+    ui_types = ["text", "icon"]
+    return _print_metrics(results, categories, ui_types,
+                          group_key="category", ui_key="ui_type")
+
+
+def _print_metrics(results, groups, ui_types, group_key, ui_key):
     metrics = ["hit_top1", "overlap_top1"]
 
     def compute_mean(examples, key):
         if not examples:
             return None
-        return sum(example.get(key, 0) for example in examples) / len(examples)
+        return sum(ex.get(key, 0) for ex in examples) / len(examples)
 
-    results = {metric: {} for metric in metrics}
+    metric_results = {m: {} for m in metrics}
 
-    for domain in domains:
-        domain_examples = [ex for ex in list_of_examples if ex.get("domain") == domain]
+    for grp in groups:
+        grp_examples = [r for r in results if r.get(group_key) == grp]
         for ui in ui_types:
-            domain_ui_examples = [ex for ex in domain_examples if ex.get("ui_type") == ui]
-            col_name = f"{domain}-{ui}"
-            for metric in metrics:
-                results[metric][col_name] = compute_mean(domain_ui_examples, metric)
-        col_name_avg = f"{domain}-avg"
-        for metric in metrics:
-            results[metric][col_name_avg] = compute_mean(domain_examples, metric)
+            sub = [r for r in grp_examples if r.get(ui_key) == ui]
+            col = f"{grp}-{ui}"
+            for m in metrics:
+                metric_results[m][col] = compute_mean(sub, m)
+        col_avg = f"{grp}-avg"
+        for m in metrics:
+            metric_results[m][col_avg] = compute_mean(grp_examples, m)
 
     for ui in ui_types:
-        ui_examples = [ex for ex in list_of_examples if ex.get("ui_type") == ui]
-        col_name = f"All-{ui}"
-        for metric in metrics:
-            results[metric][col_name] = compute_mean(ui_examples, metric)
+        sub = [r for r in results if r.get(ui_key) == ui]
+        col = f"All-{ui}"
+        for m in metrics:
+            metric_results[m][col] = compute_mean(sub, m)
 
-    for metric in metrics:
-        results[metric]["All-avg"] = compute_mean(list_of_examples, metric)
+    for m in metrics:
+        metric_results[m]["All-avg"] = compute_mean(results, m)
 
-    columns_order = []
-    for domain in domains:
+    # Build column order
+    columns = []
+    for grp in groups:
         for ui in ui_types:
-            columns_order.append(f"{domain}-{ui}")
-        columns_order.append(f"{domain}-avg")
+            columns.append(f"{grp}-{ui}")
+        columns.append(f"{grp}-avg")
     for ui in ui_types:
-        columns_order.append(f"All-{ui}")
-    columns_order.append("All-avg")
+        columns.append(f"All-{ui}")
+    columns.append("All-avg")
 
-    header = [""] + columns_order
-    col_widths = [max(len(col), 12) for col in header]
+    # Print table
+    header = [""] + columns
+    col_widths = [max(len(c), 12) for c in header]
 
-    def format_cell(cell):
-        if isinstance(cell, float):
-            return f"{cell * 100:.2f}"
-        elif cell is None:
-            return "N/A"
-        return str(cell)
+    def fmt(val):
+        if isinstance(val, float):
+            return f"{val * 100:.2f}"
+        return "N/A" if val is None else str(val)
 
-    header_line = " | ".join(word.ljust(width) for word, width in zip(header, col_widths))
-    separator_line = "-+-".join("-" * width for width in col_widths)
-    print(header_line)
-    print(separator_line)
+    print(" | ".join(w.ljust(cw) for w, cw in zip(header, col_widths)))
+    print("-+-".join("-" * cw for cw in col_widths))
+    for m in metrics:
+        row = [m] + [fmt(metric_results[m].get(c)) for c in columns]
+        print(" | ".join(w.ljust(cw) for w, cw in zip(row, col_widths)))
 
-    for metric in metrics:
-        row = [metric]
-        for col in columns_order:
-            val = results[metric].get(col)
-            row.append(format_cell(val))
-        row_line = " | ".join(word.ljust(width) for word, width in zip(row, col_widths))
-        print(row_line)
-
-    metric_info = "Tab-delimited Table for Excel:\n"
-    header_tab = "\t".join([""] + columns_order)
-    metric_info += header_tab + "\n"
-    for metric in metrics:
-        row = [metric] + [format_cell(results[metric].get(col)) for col in columns_order]
-        metric_info += ("\t".join(row) + "\n")
-    print(metric_info)
-    return metric_info
+    # Tab-delimited for Excel
+    info = "Tab-delimited Table for Excel:\n"
+    info += "\t".join([""] + columns) + "\n"
+    for m in metrics:
+        row = [m] + [fmt(metric_results[m].get(c)) for c in columns]
+        info += "\t".join(row) + "\n"
+    print(info)
+    return info
 
 
 # ---------------------------------------------------------------------------
-# Evaluation loop
+# Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_all(model, tokenizer, dataset, args, builder):
-    device = next(model.parameters()).device
-    results = []
+def evaluate_sample(sample, model, tokenizer, builder, args, device, tmp_dir, rank, idx):
+    """Evaluate a single sample. Returns result dict."""
+    instruction = sample["instruction"]
+
+    result = {
+        "instruction": instruction,
+        "ui_type": sample.get("ui_type", "text"),
+        "hit_top1": 0,
+        "overlap_top1": 0,
+    }
+
+    # Copy dataset-specific fields
+    for key in ["domain", "data_source", "category", "application",
+                "platform", "group", "img_filename", "file_name"]:
+        if key in sample:
+            result[key] = sample[key]
+
+    # Get image
+    if sample.get("image") is not None:
+        image = sample["image"].convert("RGB")
+        tmp_path = os.path.join(tmp_dir, f"tmp_{rank}_{idx}.png")
+        image.save(tmp_path)
+        image_path = tmp_path
+    elif sample.get("image_path") and os.path.exists(sample["image_path"]):
+        image = Image.open(sample["image_path"]).convert("RGB")
+        image_path = sample["image_path"]
+    else:
+        return result
+
+    w, h = image.size
+
+    # Get normalised GT bbox [x1, y1, x2, y2]
+    if "bbox_norm" in sample:
+        gt_bbox = sample["bbox_norm"]
+    elif "bbox_xywh_px" in sample:
+        x, y, bw, bh = sample["bbox_xywh_px"]
+        gt_bbox = [x / w, y / h, (x + bw) / w, (y + bh) / h]
+    elif "bbox_px" in sample:
+        bbox = sample["bbox_px"]
+        gt_bbox = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
+    else:
+        return result
+
+    t_start = time.time()
+    pred = run_saccade_inference(
+        image, image_path, instruction,
+        model, tokenizer, builder,
+        max_rounds=args.rounds,
+        crop_ratio=args.crop_ratio,
+        crop_size=args.crop_size,
+        crop_upscale=args.crop_upscale,
+        device=str(device),
+        use_adaptive_crop=args.adaptive_crop,
+    )
+    t_elapsed = time.time() - t_start
+
+    topk_points = pred.get("topk_points", [])
+    if not topk_points:
+        return result
+
+    n_w = pred.get("n_width", 1)
+    n_h = pred.get("n_height", 1)
+    px, py = topk_points[0]
+
+    x1, y1, x2, y2 = gt_bbox
+    if x1 <= px <= x2 and y1 <= py <= y2:
+        result["hit_top1"] = 1
+
+    half_pw = 0.5 / max(n_w, 1)
+    half_ph = 0.5 / max(n_h, 1)
+    pred_bbox = [px - half_pw, py - half_ph, px + half_pw, py + half_ph]
+    if do_boxes_overlap(pred_bbox, gt_bbox):
+        result["overlap_top1"] = 1
+
+    result["pred_x"] = px
+    result["pred_y"] = py
+    result["num_rounds"] = pred.get("num_rounds", 1)
+    result["total_vis_tokens"] = pred.get("total_vis_tokens", 0)
+    result["inference_time"] = t_elapsed
+
+    return result
+
+
+def evaluate_all(samples, model, tokenizer, builder, args, device, rank):
+    """Evaluate all samples."""
     tmp_dir = os.path.join(args.save_path, "tmp_images")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    for i, example in tqdm(enumerate(dataset), total=len(dataset), disable=(args._rank != 0)):
-        data_source = example["data_source"]
-        domain = DOMAIN_MAP.get(data_source, "web")
-
-        ele = {
-            "file_name": example["file_name"],
-            "ui_type": example["data_type"],  # "text" or "icon"
-            "domain": domain,
-            "data_source": data_source,
-            "instruction": example["instruction"],
-            "bbox_x1y1x2y2": list(example["bbox"]),  # already normalized [0,1]
-            "hit_top1": 0,
-            "overlap_top1": 0,
-        }
-
-        image = example["image"].convert("RGB")
-        gt_bbox = ele["bbox_x1y1x2y2"]
-
-        # Save temp image for inference
-        tmp_path = os.path.join(tmp_dir, f"tmp_{args._rank}_{i}.png")
-        image.save(tmp_path)
-
-        t_start = time.time()
-        pred = run_saccade_inference(
-            image, tmp_path, example["instruction"],
-            model, tokenizer, builder,
-            max_rounds=args.rounds,
-            crop_ratio=args.crop_ratio,
-            crop_size=args.crop_size,
-            crop_upscale=args.crop_upscale,
-            device=str(device),
-        )
-        t_elapsed = time.time() - t_start
-
-        topk_points = pred["topk_points"]
-        if not topk_points:
-            results.append(ele)
-            continue
-
-        n_w = pred.get("n_width", 1)
-        n_h = pred.get("n_height", 1)
-        IMAGE_PATCH_SIZE_x = 0.5 / max(n_w, 1)
-        IMAGE_PATCH_SIZE_y = 0.5 / max(n_h, 1)
-
-        x1, y1, x2, y2 = gt_bbox
-        px, py = topk_points[0]
-
-        if (x1 <= px <= x2) and (y1 <= py <= y2):
-            ele["hit_top1"] = 1
-
-        pred_bbox = [px - IMAGE_PATCH_SIZE_x, py - IMAGE_PATCH_SIZE_y,
-                     px + IMAGE_PATCH_SIZE_x, py + IMAGE_PATCH_SIZE_y]
-        if do_boxes_overlap(pred_bbox, gt_bbox):
-            ele["overlap_top1"] = 1
-
-        ele["pred_x"] = px
-        ele["pred_y"] = py
-        ele["num_rounds"] = pred.get("num_rounds", 1)
-        ele["total_vis_tokens"] = pred.get("total_vis_tokens", 0)
-        ele["inference_time"] = t_elapsed
-
-        results.append(ele)
-
+    results = []
+    for i, sample in tqdm(enumerate(samples), total=len(samples), disable=(rank != 0)):
+        result = evaluate_sample(sample, model, tokenizer, builder, args, device,
+                                 tmp_dir, rank, i)
+        results.append(result)
     return results
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Pro-specific: assign categories
+# ---------------------------------------------------------------------------
+
+def assign_pro_categories(results, data_dir):
+    """Assign Pro categories based on annotation file structure."""
+    ann_dir = os.path.join(data_dir, "annotations")
+    if not os.path.isdir(ann_dir):
+        return
+
+    # Map img_filename → category from annotation files
+    filename_to_cat = {}
+    for json_path in sorted(glob.glob(os.path.join(ann_dir, "*.json"))):
+        cat_name = Path(json_path).stem  # e.g., "Dev", "Creative"
+        # Match to known categories
+        matched = None
+        for known in PRO_CATEGORIES:
+            if known.lower() in cat_name.lower():
+                matched = known
+                break
+        if matched is None:
+            matched = cat_name
+
+        with open(json_path) as f:
+            items = json.load(f)
+        if isinstance(items, list):
+            for item in items:
+                fn = item.get("img_filename", "")
+                filename_to_cat[fn] = matched
+
+    for r in results:
+        fn = r.get("img_filename", "")
+        if fn in filename_to_cat:
+            r["category"] = filename_to_cat[fn]
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="ScreenSpot v1 eval (saccade foveation)")
+    parser = argparse.ArgumentParser(description="Unified ScreenSpot evaluation")
+
+    # Dataset
+    parser.add_argument("--dataset", type=str, default="v1",
+                        choices=["v1", "v2", "pro"],
+                        help="Dataset: v1 (ScreenSpot), v2 (ScreenSpot-v2), pro (ScreenSpot-Pro)")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Local data directory (required for pro, optional for v2)")
 
     # Model
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
-    # Data
-    parser.add_argument("--dataset_name", type=str, default="rootsautomation/ScreenSpot")
-    parser.add_argument("--save_path", type=str, default=None)
-
     # Saccade
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.0,
-                        help="(Legacy) Fraction crop. 0=use crop_size.")
-    parser.add_argument("--crop_size", type=int, default=252,
-                        help="Fixed crop side length in pixels")
-    parser.add_argument("--crop_upscale", type=int, default=3,
-                        help="Integer upscale factor for crop")
+    parser.add_argument("--crop_ratio", type=float, default=0.0)
+    parser.add_argument("--crop_size", type=int, default=252)
+    parser.add_argument("--crop_upscale", type=int, default=3)
+    parser.add_argument("--adaptive_crop", action="store_true", default=True,
+                        help="Use 3x3 adaptive crop (default: True)")
+    parser.add_argument("--no_adaptive_crop", action="store_true",
+                        help="Disable adaptive crop, use fixed crop_size")
 
     # Resolution
     parser.add_argument("--low_res_max_pixels", type=int, default=400000)
 
     # Misc
+    parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
 
     args = parser.parse_args()
 
-    # DDP setup
+    if args.no_adaptive_crop:
+        args.adaptive_crop = False
+
+    # DDP
     rank, world_size, is_distributed, ddp_device = setup_distributed()
-    if ddp_device is not None:
+    if ddp_device:
         args.device = ddp_device
-    args._rank = rank
     is_main = (rank == 0)
 
     # Auto save path
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
-        if args.crop_size > 0:
-            tag = f"saccade_r{args.rounds}_crop{args.crop_size}x{args.crop_upscale}"
-        else:
-            tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
-        args.save_path = f"results/screenspot_v1/{ckpt_name}/{tag}"
+        crop_tag = "adaptive3x3" if args.adaptive_crop else f"crop{args.crop_size}x{args.crop_upscale}"
+        tag = f"saccade_r{args.rounds}_{crop_tag}"
+        args.save_path = f"results/screenspot_{args.dataset}/{ckpt_name}/{tag}"
 
     if is_main:
-        print("=== ScreenSpot v1 Eval ===")
+        print(f"=== ScreenSpot {args.dataset.upper()} Eval ===")
         print(f"  checkpoint:  {args.checkpoint}")
         print(f"  base_model:  {args.base_model}")
         print(f"  rounds:      {args.rounds}")
-        if args.crop_size > 0:
-            print(f"  crop:        {args.crop_size}x{args.crop_size} x{args.crop_upscale} -> {args.crop_size*args.crop_upscale}x{args.crop_size*args.crop_upscale}")
-        else:
-            print(f"  crop_ratio:  {args.crop_ratio}")
+        print(f"  adaptive:    {args.adaptive_crop}")
+        if not args.adaptive_crop:
+            up = args.crop_size * args.crop_upscale
+            print(f"  crop:        {args.crop_size}x{args.crop_size} x{args.crop_upscale} -> {up}x{up}")
         print(f"  low_res:     {args.low_res_max_pixels}")
         print(f"  device:      {args.device}")
         if is_distributed:
             print(f"  DDP:         {world_size} GPUs")
         print()
 
-    # Load data from HuggingFace
+    # Load data
     if is_main:
-        print(f"Loading dataset: {args.dataset_name}")
-    dataset = load_dataset(args.dataset_name, split="test")
-    if is_main:
-        print(f"Loaded {len(dataset)} examples")
+        print(f"Loading {args.dataset} data...")
+    if args.dataset == "v1":
+        samples = load_screenspot_v1(args.data_dir)
+    elif args.dataset == "v2":
+        samples = load_screenspot_v2(args.data_dir)
+    elif args.dataset == "pro":
+        samples = load_screenspot_pro(args.data_dir)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    if args.max_samples is not None:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    if is_main:
+        print(f"Total: {len(samples)} samples")
+
+    if args.max_samples:
+        samples = samples[:args.max_samples]
         if is_main:
-            print(f"Limiting to {len(dataset)} samples")
+            print(f"Limiting to {len(samples)} samples")
 
-    # Shard data across ranks (pad to equal length to avoid DDP barrier hang)
-    total_samples = len(dataset)
+    # Shard with padding
+    total = len(samples)
     if is_distributed:
-        indices = list(range(rank, total_samples, world_size))
-        # Pad shorter shards
-        max_shard = (total_samples + world_size - 1) // world_size
-        while len(indices) < max_shard:
-            indices.append(indices[-1])
-        dataset = dataset.select(indices)
+        samples = samples[rank::world_size]
+        max_shard = (total + world_size - 1) // world_size
+        while len(samples) < max_shard:
+            samples.append(samples[-1])
         if is_main:
-            print(f"Rank 0 processing {len(dataset)} samples (total {total_samples} split across {world_size} GPUs)")
+            print(f"Rank 0: {len(samples)} samples (total {total} across {world_size} GPUs)")
 
     # Load model
     if is_main:
-        print(f"Loading model: {args.checkpoint} (base: {args.base_model})")
+        print(f"Loading model: {args.checkpoint}")
     model, tokenizer = Qwen25VLWithActionHead.load_pretrained(
         args.checkpoint,
         base_model_name_or_path=args.base_model,
@@ -343,7 +588,7 @@ def main():
     )
     model.eval()
 
-    crop_pixels = (args.crop_size * args.crop_upscale) ** 2 if args.crop_size > 0 else 200704
+    crop_pixels = (args.crop_size * args.crop_upscale) ** 2 if not args.adaptive_crop else 756 ** 2
     builder = MultiRoundInputBuilder(
         args.base_model, tokenizer, min_pixels=3136,
         low_res_max_pixels=args.low_res_max_pixels,
@@ -362,44 +607,70 @@ def main():
     else:
         t0 = time.time()
         with torch.no_grad():
-            local_results = evaluate_all(model, tokenizer, dataset, args, builder)
+            local_results = evaluate_all(samples, model, tokenizer, builder,
+                                         args, args.device, rank)
 
-        # Gather results from all ranks
         if is_distributed:
+            if is_main:
+                print(f"Gathering results from {world_size} GPUs...")
             dist.barrier()
             results = gather_results(local_results, rank, world_size)
         else:
             results = local_results
 
         if is_main:
+            # Deduplicate padded samples
+            seen = set()
+            unique = []
+            for r in results:
+                key = r.get("img_filename", r.get("file_name", "")) + r.get("instruction", "")
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(r)
+                elif not key:
+                    unique.append(r)
+            results = unique
+
             elapsed = time.time() - t0
-            print(f"Evaluation took {elapsed:.1f}s ({elapsed / max(len(results), 1):.2f}s/sample)")
+            print(f"Eval took {elapsed:.1f}s ({elapsed / max(len(results), 1):.2f}s/sample)")
+            print(f"Total unique results: {len(results)}")
 
             with open(pred_path, "w") as f:
                 json.dump(results, f, indent=2)
-            print(f"Saved {len(results)} predictions to {pred_path}")
+            print(f"Saved predictions to {pred_path}")
 
+            # Stats
             round_counts = {}
             for r in results:
                 nr = r.get("num_rounds", 1)
                 round_counts[nr] = round_counts.get(nr, 0) + 1
-            print(f"\nRound distribution: {dict(sorted(round_counts.items()))}")
+            print(f"Round distribution: {dict(sorted(round_counts.items()))}")
 
-            token_counts = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
-            if token_counts:
-                print(f"Avg visual tokens: {sum(token_counts) / len(token_counts):.0f}")
+            tokens = [r.get("total_vis_tokens", 0) for r in results if r.get("total_vis_tokens", 0) > 0]
+            if tokens:
+                print(f"Avg visual tokens: {sum(tokens) / len(tokens):.0f}")
 
+    # Metrics
     if is_main:
-        if not os.path.exists(metric_path):
-            print("\n=== Metrics ===")
-            metric_info = get_metric(results)
-            with open(metric_path, "w") as f:
-                f.write(metric_info)
-            print(f"\nSaved metrics to {metric_path}")
-        else:
+        if os.path.exists(metric_path):
             print(f"Metrics already exist at {metric_path}")
             with open(metric_path, "r") as f:
                 print(f.read())
+        else:
+            print("\n=== Metrics ===")
+
+            # Assign Pro categories if needed
+            if args.dataset == "pro" and args.data_dir:
+                assign_pro_categories(results, args.data_dir)
+
+            if args.dataset in ("v1", "v2"):
+                metric_info = print_metrics_v1v2(results)
+            else:
+                metric_info = print_metrics_pro(results)
+
+            with open(metric_path, "w") as f:
+                f.write(metric_info)
+            print(f"\nSaved metrics to {metric_path}")
 
     if is_distributed:
         dist.destroy_process_group()

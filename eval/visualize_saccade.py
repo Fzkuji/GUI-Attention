@@ -200,15 +200,12 @@ def run_saccade_with_recording(
         nh_low, nw_low = grid_dims[0]
         latest_img_idx = len(vis_ranges) - 1
 
-        # Mask: current crop covers low-res + all old crops masked
+        # Mask: current crop overlap on low-res. Old crops NOT masked (matches training).
         this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
         full_mask[:n_low] = this_crop_mask
-        for prev_i in range(1, latest_img_idx):
-            off, ntok = vis_ranges[prev_i]
-            full_mask[off:off + ntok] = True
 
         attn_ri, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
@@ -500,8 +497,11 @@ def main():
     parser.add_argument("--image", help="Path to input image")
     parser.add_argument("--instruction", help="Text instruction")
     parser.add_argument("--gt_bbox", help="GT bbox as x1,y1,x2,y2 (normalised)")
-    parser.add_argument("--screenspot_dir", help="Path to ScreenSpot-Pro dataset dir")
-    parser.add_argument("--sample_index", type=int, default=0, help="Sample index in ScreenSpot-Pro")
+    parser.add_argument("--dataset", default="pro", choices=["v1", "v2", "pro"],
+                        help="Dataset: v1 (ScreenSpot), v2 (ScreenSpot-v2), pro (ScreenSpot-Pro)")
+    parser.add_argument("--data_dir", help="Path to dataset directory (required for pro/v2)")
+    parser.add_argument("--screenspot_dir", help="(Deprecated) Alias for --data_dir with --dataset pro")
+    parser.add_argument("--sample_index", type=int, default=0, help="Sample index")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to visualize (batch mode)")
     parser.add_argument("--output", default="viz_saccade.png", help="Output image path")
     parser.add_argument("--max_rounds", type=int, default=4, help="Max saccade rounds")
@@ -532,17 +532,52 @@ def main():
         high_res_max_pixels=crop_pixels,
     )
 
+    # Backward compat: --screenspot_dir → --data_dir + --dataset pro
+    if args.screenspot_dir and not args.data_dir:
+        args.data_dir = args.screenspot_dir
+        args.dataset = "pro"
+
     # Collect samples to visualize
     samples = []
-    if args.screenspot_dir:
-        for idx in range(args.sample_index, args.sample_index + args.num_samples):
-            try:
-                image, image_path, instruction, gt_bbox, sample = load_screenspot_sample(
-                    args.screenspot_dir, idx)
-                out_path = args.output.replace(".png", f"_{idx}.png") if args.num_samples > 1 else args.output
-                samples.append((image, image_path, instruction, gt_bbox, out_path, idx))
-            except IndexError:
-                break
+    if args.data_dir or args.dataset in ("v1", "v2"):
+        # Load full dataset then pick samples by index
+        from eval_screenspot import load_screenspot_v1, load_screenspot_v2, load_screenspot_pro
+        if args.dataset == "v1":
+            all_samples = load_screenspot_v1(args.data_dir)
+        elif args.dataset == "v2":
+            all_samples = load_screenspot_v2(args.data_dir)
+        else:
+            all_samples = load_screenspot_pro(args.data_dir)
+
+        for idx in range(args.sample_index, min(args.sample_index + args.num_samples, len(all_samples))):
+            s = all_samples[idx]
+            # Get image
+            if s.get("image") is not None:
+                img = s["image"].convert("RGB")
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                img.save(tmp.name)
+                img_path = tmp.name
+            else:
+                img_path = s["image_path"]
+                img = Image.open(img_path).convert("RGB")
+
+            w, h = img.size
+            # Get normalised GT bbox
+            if "bbox_norm" in s:
+                gt_bbox = tuple(s["bbox_norm"])
+            elif "bbox_xywh_px" in s:
+                x, y, bw, bh = s["bbox_xywh_px"]
+                gt_bbox = (x / w, y / h, (x + bw) / w, (y + bh) / h)
+            elif "bbox_px" in s:
+                b = s["bbox_px"]
+                gt_bbox = (b[0] / w, b[1] / h, b[2] / w, b[3] / h)
+            else:
+                gt_bbox = None
+
+            out_path = args.output.replace(".png", f"_{idx}.png") if args.num_samples > 1 else args.output
+            samples.append((img, img_path, s["instruction"], gt_bbox, out_path, idx))
+
     elif args.image:
         image = Image.open(args.image).convert("RGB")
         image_path = args.image
