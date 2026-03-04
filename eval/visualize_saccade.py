@@ -430,14 +430,37 @@ def _draw_gt(ax, gt_bbox, img_w, img_h):
 
 def load_screenspot_sample(screenspot_dir: str, index: int):
     """Load a single sample from ScreenSpot-Pro dataset."""
-    json_path = os.path.join(screenspot_dir, "screenspot_pro.json")
-    with open(json_path, "r") as f:
-        data = json.load(f)
+    # Try multiple possible locations
+    candidates = [
+        os.path.join(screenspot_dir, "screenspot_pro.json"),
+        os.path.join(screenspot_dir, "annotations", "all.json"),
+    ]
+    # Also try all json files in annotations/
+    ann_dir = os.path.join(screenspot_dir, "annotations")
+    if os.path.isdir(ann_dir):
+        for fn in sorted(os.listdir(ann_dir)):
+            if fn.endswith(".json"):
+                candidates.append(os.path.join(ann_dir, fn))
+
+    data = []
+    for json_path in candidates:
+        if os.path.exists(json_path):
+            with open(json_path, "r") as f:
+                file_data = json.load(f)
+                if isinstance(file_data, list):
+                    data.extend(file_data)
+            if len(data) > index:
+                break
+    if not data:
+        raise FileNotFoundError(f"No annotation JSON found in {screenspot_dir}. Tried: {candidates}")
     if index >= len(data):
         raise IndexError(f"Sample index {index} out of range (total {len(data)})")
     sample = data[index]
 
+    # Try with and without images/ subdirectory
     img_path = os.path.join(screenspot_dir, sample["img_filename"])
+    if not os.path.exists(img_path):
+        img_path = os.path.join(screenspot_dir, "images", sample["img_filename"])
     instruction = sample["instruction"]
     bbox = sample["bbox"]  # [x1, y1, x2, y2] in pixels
     img = Image.open(img_path).convert("RGB")
