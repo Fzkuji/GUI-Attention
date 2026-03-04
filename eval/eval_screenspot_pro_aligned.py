@@ -339,11 +339,16 @@ def main():
         if is_main:
             print(f"Limiting to {len(data)} samples")
 
-    # Shard data across ranks
+    # Shard data across ranks (pad to equal length to avoid DDP barrier hang)
+    total_data = len(data)
     if is_distributed:
         data = data[rank::world_size]
+        # Pad shorter shards by repeating last sample (will be deduplicated after gather)
+        max_shard = (total_data + world_size - 1) // world_size
+        while len(data) < max_shard:
+            data.append(data[-1])
         if is_main:
-            print(f"Rank 0 processing {len(data)} samples (total split across {world_size} GPUs)")
+            print(f"Rank 0 processing {len(data)} samples (total {total_data} split across {world_size} GPUs)")
 
     # Load model
     if is_main:

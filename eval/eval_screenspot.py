@@ -321,12 +321,17 @@ def main():
         if is_main:
             print(f"Limiting to {len(dataset)} samples")
 
-    # Shard data across ranks
+    # Shard data across ranks (pad to equal length to avoid DDP barrier hang)
+    total_samples = len(dataset)
     if is_distributed:
-        indices = list(range(rank, len(dataset), world_size))
+        indices = list(range(rank, total_samples, world_size))
+        # Pad shorter shards
+        max_shard = (total_samples + world_size - 1) // world_size
+        while len(indices) < max_shard:
+            indices.append(indices[-1])
         dataset = dataset.select(indices)
         if is_main:
-            print(f"Rank 0 processing {len(dataset)} samples (total split across {world_size} GPUs)")
+            print(f"Rank 0 processing {len(dataset)} samples (total {total_samples} split across {world_size} GPUs)")
 
     # Load model
     if is_main:
