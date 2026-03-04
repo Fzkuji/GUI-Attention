@@ -265,13 +265,23 @@ def run_saccade_with_recording(
 # Plotting
 # ---------------------------------------------------------------------------
 
+def _draw_grid(ax, n_width, n_height, img_w, img_h, color="white", alpha=0.3, linewidth=0.5):
+    """Draw patch grid lines on an axis."""
+    patch_w = img_w / n_width
+    patch_h = img_h / n_height
+    for i in range(1, n_width):
+        ax.axvline(x=i * patch_w, color=color, alpha=alpha, linewidth=linewidth)
+    for j in range(1, n_height):
+        ax.axhline(y=j * patch_h, color=color, alpha=alpha, linewidth=linewidth)
+
+
 def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
                         instruction: str = "", output_path: str = "viz_saccade.png"):
     """Plot multi-round saccade results.
 
     Layout: one row per round.
-      - Round 0: full image + low-res heatmap + predicted point
-      - Round N: full image with crop box + crop image with heatmap + predicted point
+      - Round 0: full image + low-res heatmap + predicted point + patch grid
+      - Round N: full image with crop box + crop image with heatmap + patch grid
     """
     n_rounds = len(rounds_info)
     if n_rounds == 0:
@@ -297,16 +307,19 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
             ax_full = axes[i, 0]
             ax_full.imshow(img_np)
             attn = rinfo["attn_2d"]
+            nh, nw = rinfo["grid_dims"]
             # Upsample heatmap to image size
             heatmap = _upsample_heatmap(attn, img_w, img_h)
             ax_full.imshow(heatmap, alpha=0.5, cmap="jet", extent=[0, img_w, img_h, 0])
+            # Draw patch grid
+            _draw_grid(ax_full, nw, nh, img_w, img_h, color="white", alpha=0.4, linewidth=0.5)
             # Predicted point
             px, py = rinfo["pred_x"] * img_w, rinfo["pred_y"] * img_h
             ax_full.plot(px, py, "c*", markersize=18, markeredgecolor="black", markeredgewidth=1.5)
             # GT
             if gt_bbox is not None:
                 _draw_gt(ax_full, gt_bbox, img_w, img_h)
-            ax_full.set_title(f"Round {ri}: Low-res overview", fontsize=11)
+            ax_full.set_title(f"Round {ri}: Low-res overview ({nw}×{nh} patches)", fontsize=11)
             ax_full.axis("off")
 
             # Empty right column for round 0
@@ -323,6 +336,9 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
             if "attn_2d_low" in rinfo:
                 heatmap_low = _upsample_heatmap(rinfo["attn_2d_low"], img_w, img_h)
                 ax_full.imshow(heatmap_low, alpha=0.4, cmap="jet", extent=[0, img_w, img_h, 0])
+                # Draw low-res grid on full image
+                nh_low, nw_low = rinfo["grid_dims_low"]
+                _draw_grid(ax_full, nw_low, nh_low, img_w, img_h, color="white", alpha=0.3, linewidth=0.5)
 
             crop_bbox = rinfo["crop_bbox"]
             if crop_bbox is not None:
@@ -343,7 +359,7 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
             ax_full.set_title(f"Round {ri}: Full image (attended={attended})", fontsize=11)
             ax_full.axis("off")
 
-            # Right: crop image with crop heatmap
+            # Right: crop image with crop heatmap + grid
             if crop_bbox is not None and "attn_2d_crop" in rinfo:
                 cx1, cy1, cx2, cy2 = crop_bbox
                 crop_pil = image.crop((
@@ -355,6 +371,9 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
                 ax_crop.imshow(crop_np)
                 crop_heatmap = _upsample_heatmap(rinfo["attn_2d_crop"], cw, ch)
                 ax_crop.imshow(crop_heatmap, alpha=0.5, cmap="jet", extent=[0, cw, ch, 0])
+                # Draw crop patch grid
+                crop_nh, crop_nw = rinfo["grid_dims_crop"]
+                _draw_grid(ax_crop, crop_nw, crop_nh, cw, ch, color="white", alpha=0.5, linewidth=0.5)
 
                 # Predicted point in crop coords
                 if cx1 <= rinfo["pred_x"] <= cx2 and cy1 <= rinfo["pred_y"] <= cy2:
@@ -374,7 +393,7 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
                         ax_crop.plot(local_gx, local_gy, "r+", markersize=18,
                                      markeredgewidth=3)
 
-                ax_crop.set_title(f"Round {ri}: Crop region", fontsize=11)
+                ax_crop.set_title(f"Round {ri}: Crop region ({crop_nw}×{crop_nh} patches)", fontsize=11)
             else:
                 ax_crop.text(0.5, 0.5, "No crop data", ha="center", va="center",
                              transform=ax_crop.transAxes, fontsize=12, color="gray")
