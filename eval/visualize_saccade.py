@@ -460,31 +460,16 @@ def main():
     parser.add_argument("--gt_bbox", help="GT bbox as x1,y1,x2,y2 (normalised)")
     parser.add_argument("--screenspot_dir", help="Path to ScreenSpot-Pro dataset dir")
     parser.add_argument("--sample_index", type=int, default=0, help="Sample index in ScreenSpot-Pro")
+    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to visualize (batch mode)")
     parser.add_argument("--output", default="viz_saccade.png", help="Output image path")
     parser.add_argument("--max_rounds", type=int, default=4, help="Max saccade rounds")
-    parser.add_argument("--crop_ratio", type=float, default=0.3, help="Crop ratio")
-    parser.add_argument("--crop_target_pixels", type=int, default=1003520, help="Crop target pixels")
-    parser.add_argument("--low_res_max_pixels", type=int, default=500000, help="Low-res max pixels")
+    parser.add_argument("--crop_ratio", type=float, default=0.0, help="Crop ratio (legacy, 0=use crop_size)")
+    parser.add_argument("--crop_size", type=int, default=252, help="Fixed crop side length in pixels")
+    parser.add_argument("--crop_upscale", type=int, default=3, help="Integer upscale factor")
+    parser.add_argument("--crop_target_pixels", type=int, default=0, help="(Legacy) Crop target pixels")
+    parser.add_argument("--low_res_max_pixels", type=int, default=400000, help="Low-res max pixels")
     parser.add_argument("--device", default="cuda:0", help="Device")
     args = parser.parse_args()
-
-    # Load image
-    if args.screenspot_dir:
-        image, image_path, instruction, gt_bbox, sample = load_screenspot_sample(
-            args.screenspot_dir, args.sample_index)
-        print(f"ScreenSpot-Pro sample {args.sample_index}: {instruction}")
-        print(f"  GT bbox (norm): {gt_bbox}")
-        print(f"  Image: {image_path}")
-    elif args.image:
-        image = Image.open(args.image).convert("RGB")
-        image_path = args.image
-        instruction = args.instruction or "Click the target element"
-        gt_bbox = None
-        if args.gt_bbox:
-            gt_bbox = tuple(float(x) for x in args.gt_bbox.split(","))
-    else:
-        parser.error("Provide --image or --screenspot_dir")
-        return
 
     # Load model
     print(f"Loading model from {args.checkpoint} (base: {args.base_model})")
@@ -497,36 +482,71 @@ def main():
     print("Model loaded.")
 
     # Build input builder
+    crop_pixels = args.crop_target_pixels if args.crop_target_pixels > 0 else (args.crop_size * args.crop_upscale) ** 2
     builder = MultiRoundInputBuilder(
         model_path=args.base_model,
         tokenizer=tokenizer,
         low_res_max_pixels=args.low_res_max_pixels,
-        high_res_max_pixels=args.crop_target_pixels,
+        high_res_max_pixels=crop_pixels,
     )
 
-    # Run inference with recording
-    rounds_info = run_saccade_with_recording(
-        image=image,
-        image_path=image_path,
-        instruction=instruction,
-        model=model,
-        tokenizer=tokenizer,
-        builder=builder,
-        max_rounds=args.max_rounds,
-        crop_ratio=args.crop_ratio,
-        crop_target_pixels=args.crop_target_pixels,
-        device=args.device,
-    )
+    # Collect samples to visualize
+    samples = []
+    if args.screenspot_dir:
+        for idx in range(args.sample_index, args.sample_index + args.num_samples):
+            try:
+                image, image_path, instruction, gt_bbox, sample = load_screenspot_sample(
+                    args.screenspot_dir, idx)
+                out_path = args.output.replace(".png", f"_{idx}.png") if args.num_samples > 1 else args.output
+                samples.append((image, image_path, instruction, gt_bbox, out_path, idx))
+            except IndexError:
+                break
+    elif args.image:
+        image = Image.open(args.image).convert("RGB")
+        image_path = args.image
+        instruction = args.instruction or "Click the target element"
+        gt_bbox = None
+        if args.gt_bbox:
+            gt_bbox = tuple(float(x) for x in args.gt_bbox.split(","))
+        samples.append((image, image_path, instruction, gt_bbox, args.output, 0))
+    else:
+        parser.error("Provide --image or --screenspot_dir")
+        return
 
-    print(f"Completed {len(rounds_info)} rounds")
-    for rinfo in rounds_info:
-        ri = rinfo["round"]
-        print(f"  Round {ri}: pred=({rinfo['pred_x']:.4f}, {rinfo['pred_y']:.4f}), "
-              f"attended={rinfo.get('attended_image', 'low')}")
+    # Process each sample
+    for image, image_path, instruction, gt_bbox, output_path, idx in samples:
+        print(f"\n--- Sample {idx}: {instruction[:80]}{'...' if len(instruction) > 80 else ''}")
+        if gt_bbox:
+            print(f"  GT bbox (norm): ({gt_bbox[0]:.3f}, {gt_bbox[1]:.3f}, {gt_bbox[2]:.3f}, {gt_bbox[3]:.3f})")
 
-    # Plot
-    plot_saccade_rounds(image, rounds_info, gt_bbox=gt_bbox,
-                        instruction=instruction, output_path=args.output)
+        rounds_info = run_saccade_with_recording(
+            image=image,
+            image_path=image_path,
+            instruction=instruction,
+            model=model,
+            tokenizer=tokenizer,
+            builder=builder,
+            max_rounds=args.max_rounds,
+            crop_ratio=args.crop_ratio,
+            crop_size=args.crop_size,
+            crop_upscale=args.crop_upscale,
+            crop_target_pixels=args.crop_target_pixels,
+            device=args.device,
+        )
+
+        print(f"  {len(rounds_info)} rounds:")
+        for rinfo in rounds_info:
+            ri = rinfo["round"]
+            hit = ""
+            if gt_bbox:
+                px, py = rinfo["pred_x"], rinfo["pred_y"]
+                in_box = gt_bbox[0] <= px <= gt_bbox[2] and gt_bbox[1] <= py <= gt_bbox[3]
+                hit = " ✓ HIT" if in_box else " ✗ MISS"
+            print(f"    Round {ri}: pred=({rinfo['pred_x']:.4f}, {rinfo['pred_y']:.4f}), "
+                  f"attended={rinfo.get('attended_image', 'low')}{hit}")
+
+        plot_saccade_rounds(image, rounds_info, gt_bbox=gt_bbox,
+                            instruction=instruction, output_path=output_path)
 
 
 if __name__ == "__main__":
