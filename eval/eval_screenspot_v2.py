@@ -1,33 +1,36 @@
 """
 ScreenSpot v2 evaluation using saccade foveation.
 
-Dataset: likaixin/ScreenSpot-v2 on HuggingFace
-Extended from v1 with more platforms and instruction styles.
+Dataset: OS-Copilot/ScreenSpot-v2 on HuggingFace (manual JSON + zip format)
+Fields: img_filename, bbox [x,y,w,h] in pixels, instruction, data_type (text/icon), data_source (windows/macos/ios/android/web)
 
 Usage:
-  # Single GPU
-  python eval/eval_screenspot_v2.py \
+  # Auto-download from HF cache
+  torchrun --nproc_per_node=8 eval/eval_screenspot_v2.py \
       --checkpoint /path/to/checkpoint \
       --base_model /path/to/Qwen2.5-VL-3B-Instruct \
       --rounds 3
 
-  # Multi-GPU DDP
-  torchrun --nproc_per_node=8 eval/eval_screenspot_v2.py \
+  # Or specify local data dir
+  python eval/eval_screenspot_v2.py \
+      --data_dir /path/to/screenspot_v2_extracted/ \
       --checkpoint /path/to/checkpoint \
       --base_model /path/to/Qwen2.5-VL-3B-Instruct \
       --rounds 3
 """
 
 import argparse
+import glob
 import json
 import os
 import pickle
 import time
+import zipfile
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
+from PIL import Image
 from tqdm import tqdm
 
 from gui_attention.builder import MultiRoundInputBuilder
@@ -35,16 +38,99 @@ from gui_attention.inference import run_saccade_inference
 from gui_attention.model import Qwen25VLWithActionHead
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Constants
 # ---------------------------------------------------------------------------
 
-# ScreenSpot-v2 platform → domain mapping
 DOMAIN_MAP = {
     "windows": "desktop", "macos": "desktop", "linux": "desktop",
     "ios": "mobile", "android": "mobile",
     "web": "web",
 }
 
+JSON_FILES = {
+    "mobile": "screenspot_mobile_v2.json",
+    "desktop": "screenspot_desktop_v2.json",
+    "web": "screenspot_web_v2.json",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def find_data_dir():
+    """Find ScreenSpot-v2 data in HF cache."""
+    cache_base = os.path.expanduser("~/.cache/huggingface/hub/datasets--OS-Copilot--ScreenSpot-v2")
+    if not os.path.exists(cache_base):
+        return None
+    snapshots = glob.glob(os.path.join(cache_base, "snapshots", "*"))
+    if snapshots:
+        return snapshots[0]
+    return None
+
+
+def load_screenspot_v2(data_dir, image_dir=None):
+    """Load all samples from ScreenSpot-v2 JSON files.
+    
+    Args:
+        data_dir: Directory containing the 3 JSON files and optionally the zip
+        image_dir: Directory with extracted images (if None, will extract from zip)
+    
+    Returns:
+        list of dicts with keys: img_filename, bbox_x1y1x2y2, instruction, 
+        data_type, data_source, domain, image_path
+    """
+    all_data = []
+    
+    for category, json_name in JSON_FILES.items():
+        json_path = os.path.join(data_dir, json_name)
+        if not os.path.exists(json_path):
+            print(f"  Warning: {json_path} not found, skipping {category}")
+            continue
+        with open(json_path, "r") as f:
+            items = json.load(f)
+        print(f"  {category}: {len(items)} samples")
+        for item in items:
+            # Convert [x, y, w, h] -> [x1, y1, x2, y2]
+            x, y, w, h = item["bbox"]
+            bbox_xyxy = [x, y, x + w, y + h]
+            
+            domain = DOMAIN_MAP.get(item.get("data_source", "").lower(), "web")
+            
+            all_data.append({
+                "img_filename": item["img_filename"],
+                "bbox_x1y1x2y2": bbox_xyxy,
+                "instruction": item["instruction"],
+                "data_type": item.get("data_type", "text"),
+                "data_source": item.get("data_source", ""),
+                "domain": domain,
+                "ui_type": item.get("data_type", "text"),
+            })
+    
+    # Find or extract images
+    if image_dir is None:
+        image_dir = os.path.join(data_dir, "screenspotv2_image")
+    
+    if not os.path.isdir(image_dir):
+        zip_path = os.path.join(data_dir, "screenspotv2_image.zip")
+        if os.path.exists(zip_path):
+            print(f"  Extracting images from {zip_path}...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(data_dir)
+            print(f"  Extracted to {image_dir}")
+        else:
+            raise FileNotFoundError(f"No images found at {image_dir} and no zip at {zip_path}")
+    
+    # Set image paths
+    for item in all_data:
+        item["image_path"] = os.path.join(image_dir, item["img_filename"])
+    
+    return all_data
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def do_boxes_overlap(box1, box2):
     return not (box1[2] < box2[0] or box1[0] > box2[2] or
@@ -67,7 +153,6 @@ def setup_distributed():
 
 
 def gather_results(local_results, rank, world_size):
-    """Gather list of dicts from all ranks to rank 0."""
     local_bytes = pickle.dumps(local_results)
     local_tensor = torch.ByteTensor(list(local_bytes)).cuda()
     size_tensor = torch.tensor([len(local_bytes)], dtype=torch.long, device="cuda")
@@ -93,7 +178,7 @@ def gather_results(local_results, rank, world_size):
 
 
 # ---------------------------------------------------------------------------
-# Metrics (mobile/desktop/web × text/icon)
+# Metrics
 # ---------------------------------------------------------------------------
 
 def get_metric(list_of_examples,
@@ -174,64 +259,39 @@ def get_metric(list_of_examples,
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate_all(model, tokenizer, dataset, args, builder):
+def evaluate_all(model, tokenizer, data, args, builder):
     device = next(model.parameters()).device
     results = []
-    tmp_dir = os.path.join(args.save_path, "tmp_images")
-    os.makedirs(tmp_dir, exist_ok=True)
 
-    for i, example in tqdm(enumerate(dataset), total=len(dataset), disable=(args._rank != 0)):
-        # Detect field names (v2 may use different names)
-        # Try v2 fields first, fall back to v1
-        instruction = example.get("instruction", example.get("prompt", ""))
-        data_type = example.get("data_type", example.get("ui_type", "text"))
-        data_source = example.get("data_source", example.get("platform", "web"))
-        file_name = example.get("file_name", example.get("img_filename", f"sample_{i}"))
-
-        # Normalize domain
-        domain = DOMAIN_MAP.get(data_source.lower().split("-")[0] if data_source else "web", "web")
-
-        # Skip negative GT samples (v2 has gt_type field)
-        gt_type = example.get("gt_type", "positive")
-        if gt_type == "negative":
-            continue
-
+    for i, example in tqdm(enumerate(data), total=len(data), disable=(args._rank != 0)):
+        instruction = example["instruction"]
+        
         ele = {
-            "file_name": file_name,
-            "ui_type": data_type,
-            "domain": domain,
-            "data_source": data_source,
+            "file_name": example["img_filename"],
+            "ui_type": example["ui_type"],
+            "domain": example["domain"],
+            "data_source": example["data_source"],
             "instruction": instruction,
             "hit_top1": 0,
             "overlap_top1": 0,
         }
 
-        # Get bbox — v2 uses [x1, y1, x2, y2] in pixels, normalized [0,1]
-        bbox = example.get("bbox", None)
-        if bbox is None:
+        bbox = example["bbox_x1y1x2y2"]
+        image_path = example["image_path"]
+
+        if not os.path.exists(image_path):
             results.append(ele)
             continue
 
-        bbox = list(bbox)
-        ele["bbox_x1y1x2y2"] = bbox
-
-        # Get image
-        image = example["image"].convert("RGB")
+        image = Image.open(image_path).convert("RGB")
         w, h = image.size
 
-        # Normalize bbox if in pixel coords (> 1.0 means pixels)
-        if any(v > 1.0 for v in bbox):
-            gt_bbox = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
-        else:
-            gt_bbox = bbox
-
-        # Save temp image for inference
-        tmp_path = os.path.join(tmp_dir, f"tmp_{args._rank}_{i}.png")
-        image.save(tmp_path)
+        # Normalize bbox to [0, 1]
+        gt_bbox = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
 
         t_start = time.time()
         pred = run_saccade_inference(
-            image, tmp_path, instruction,
+            image, image_path, instruction,
             model, tokenizer, builder,
             max_rounds=args.rounds,
             crop_ratio=args.crop_ratio,
@@ -285,18 +345,16 @@ def main():
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
     # Data
-    parser.add_argument("--dataset_name", type=str, default="OS-Copilot/ScreenSpot-v2")
-    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Directory with screenspot_*_v2.json + screenspotv2_image/. "
+                             "If not set, auto-detect from HF cache.")
     parser.add_argument("--save_path", type=str, default=None)
 
     # Saccade
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--crop_ratio", type=float, default=0.0,
-                        help="(Legacy) Fraction crop. 0=use crop_size.")
-    parser.add_argument("--crop_size", type=int, default=252,
-                        help="Fixed crop side length in pixels")
-    parser.add_argument("--crop_upscale", type=int, default=3,
-                        help="Integer upscale factor for crop")
+    parser.add_argument("--crop_ratio", type=float, default=0.0)
+    parser.add_argument("--crop_size", type=int, default=252)
+    parser.add_argument("--crop_upscale", type=int, default=3)
 
     # Resolution
     parser.add_argument("--low_res_max_pixels", type=int, default=400000)
@@ -317,10 +375,7 @@ def main():
     # Auto save path
     if args.save_path is None:
         ckpt_name = Path(args.checkpoint).name
-        if args.crop_size > 0:
-            tag = f"saccade_r{args.rounds}_crop{args.crop_size}x{args.crop_upscale}"
-        else:
-            tag = f"saccade_r{args.rounds}_crop{args.crop_ratio}"
+        tag = f"saccade_r{args.rounds}_crop{args.crop_size}x{args.crop_upscale}"
         args.save_path = f"results/screenspot_v2/{ckpt_name}/{tag}"
 
     if is_main:
@@ -331,39 +386,51 @@ def main():
         if args.crop_size > 0:
             up = args.crop_size * args.crop_upscale
             print(f"  crop:        {args.crop_size}x{args.crop_size} x{args.crop_upscale} -> {up}x{up}")
-        else:
-            print(f"  crop_ratio:  {args.crop_ratio}")
         print(f"  low_res:     {args.low_res_max_pixels}")
         print(f"  device:      {args.device}")
         if is_distributed:
             print(f"  DDP:         {world_size} GPUs")
         print()
 
-    # Load data from HuggingFace
+    # Find data directory
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = find_data_dir()
+        if data_dir is None:
+            # Download first with huggingface_hub
+            if is_main:
+                print("Downloading OS-Copilot/ScreenSpot-v2 from HuggingFace...")
+                from huggingface_hub import snapshot_download
+                data_dir = snapshot_download("OS-Copilot/ScreenSpot-v2", repo_type="dataset")
+            if is_distributed:
+                dist.barrier()
+                if not is_main:
+                    data_dir = find_data_dir()
+
     if is_main:
-        print(f"Loading dataset: {args.dataset_name} (split={args.split})")
-    dataset = load_dataset(args.dataset_name, split=args.split, trust_remote_code=True)
+        print(f"Data dir: {data_dir}")
+
+    # Load data
     if is_main:
-        print(f"Loaded {len(dataset)} examples")
-        # Print column names for debugging
-        print(f"Columns: {dataset.column_names}")
+        print("Loading ScreenSpot-v2 data...")
+    data = load_screenspot_v2(data_dir)
+    if is_main:
+        print(f"Total: {len(data)} samples")
 
     if args.max_samples is not None:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+        data = data[:args.max_samples]
         if is_main:
-            print(f"Limiting to {len(dataset)} samples")
+            print(f"Limiting to {len(data)} samples")
 
-    # Shard data across ranks (pad to equal length to avoid DDP barrier hang)
-    total_samples = len(dataset)
+    # Shard data across ranks (pad to equal length)
+    total_data = len(data)
     if is_distributed:
-        indices = list(range(rank, total_samples, world_size))
-        # Pad shorter shards
-        max_shard = (total_samples + world_size - 1) // world_size
-        while len(indices) < max_shard:
-            indices.append(indices[-1])
-        dataset = dataset.select(indices)
+        data = data[rank::world_size]
+        max_shard = (total_data + world_size - 1) // world_size
+        while len(data) < max_shard:
+            data.append(data[-1])
         if is_main:
-            print(f"Rank 0 processing {len(dataset)} samples (total {total_samples} split across {world_size} GPUs)")
+            print(f"Rank 0 processing {len(data)} samples (total {total_data} split across {world_size} GPUs)")
 
     # Load model
     if is_main:
@@ -394,10 +461,11 @@ def main():
     else:
         t0 = time.time()
         with torch.no_grad():
-            local_results = evaluate_all(model, tokenizer, dataset, args, builder)
+            local_results = evaluate_all(model, tokenizer, data, args, builder)
 
-        # Gather results from all ranks
         if is_distributed:
+            if is_main:
+                print(f"Rank 0 done, gathering results from {world_size} GPUs ...")
             dist.barrier()
             results = gather_results(local_results, rank, world_size)
         else:
@@ -405,11 +473,22 @@ def main():
 
         if is_main:
             elapsed = time.time() - t0
+            # Deduplicate padded samples
+            seen = set()
+            unique_results = []
+            for r in results:
+                key = r.get("file_name", "") + r.get("instruction", "")
+                if key not in seen:
+                    seen.add(key)
+                    unique_results.append(r)
+            results = unique_results
+
             print(f"Evaluation took {elapsed:.1f}s ({elapsed / max(len(results), 1):.2f}s/sample)")
+            print(f"Total unique results: {len(results)}")
 
             with open(pred_path, "w") as f:
                 json.dump(results, f, indent=2)
-            print(f"Saved {len(results)} predictions to {pred_path}")
+            print(f"Saved predictions to {pred_path}")
 
             round_counts = {}
             for r in results:
