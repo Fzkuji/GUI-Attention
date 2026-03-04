@@ -1,7 +1,16 @@
-"""Inference utilities for saccade foveation (v4).
+"""Inference utilities for saccade foveation (v5).
 
-Includes BFS connected region prediction (from GUI-Actor) and multi-round
-saccade inference loop.
+Multi-round saccade:
+  Round 0: low-res full image → action head → argmax → crop 3×3 patches around it
+  Round N: low-res + ALL historical crops (visible) → action head
+           → argmax in high-res crop → stop (found target)
+           → argmax in low-res → saccade (continue)
+
+Key changes from v4:
+  - Soft-argmax disabled (beta=5 makes it ≈ argmax anyway)
+  - Crop = 3×3 patch region around selected patch (adaptive to image resolution)
+  - Old crops NOT masked (matches training)
+  - Stop condition: attended == "high"
 """
 
 from typing import List, Tuple
@@ -9,7 +18,6 @@ from typing import List, Tuple
 import torch
 
 from gui_attention.attention import (
-    adjust_crop_position_ids,
     extract_anchor_hidden_states,
     extract_visual_hidden_states,
     identify_attended_image,
@@ -101,6 +109,46 @@ def get_prediction_region_point(
     return best_point, sorted_centers, sorted_scores
 
 
+def _compute_3x3_crop_bbox(attn_1d, n_width, n_height, img_w, img_h):
+    """Compute crop bbox covering 3×3 patches around the argmax patch.
+
+    Returns:
+        (cx_norm, cy_norm): center of the 3×3 region in normalised coords.
+        crop_size_pixels: side length in pixels for the 3×3 patch region.
+    """
+    # Find argmax patch
+    argmax_idx = attn_1d.argmax().item()
+    row = argmax_idx // n_width
+    col = argmax_idx % n_width
+
+    # 3×3 region bounds (clamped to grid)
+    r_start = max(0, row - 1)
+    r_end = min(n_height - 1, row + 1)
+    c_start = max(0, col - 1)
+    c_end = min(n_width - 1, col + 1)
+
+    # Center of the 3×3 region in normalised coords
+    cx = ((c_start + c_end) / 2 + 0.5) / n_width
+    cy = ((r_start + r_end) / 2 + 0.5) / n_height
+
+    # Crop size in pixels: cover the 3×3 patch region
+    # Each patch covers (img_w / n_width) × (img_h / n_height) pixels
+    patch_w = img_w / n_width
+    patch_h = img_h / n_height
+    n_cols = c_end - c_start + 1
+    n_rows = r_end - r_start + 1
+
+    # Use the larger dimension to make a square crop
+    crop_w = int(n_cols * patch_w)
+    crop_h = int(n_rows * patch_h)
+    crop_size = max(crop_w, crop_h)
+
+    # Round to nearest multiple of 28 for clean token grid
+    crop_size = max(28, ((crop_size + 13) // 28) * 28)
+
+    return cx, cy, crop_size
+
+
 def run_saccade_inference(
     image,
     image_path,
@@ -116,15 +164,20 @@ def run_saccade_inference(
     crop_target_pixels: int = 0,
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
+    use_adaptive_crop: bool = True,
 ) -> dict:
     """Multi-round saccade inference.
 
-    Round 0: low-res full image → action head → select focus.
-    Round 1+: low-res (masked) + high-res crop → action head
-              → argmax in high → click; argmax in low → saccade.
+    Round 0: low-res full image → action head → argmax → crop 3×3 patches.
+    Round 1+: low-res + all crops (visible) → action head
+              → argmax in high-res → stop; argmax in low-res → saccade.
+
+    Args:
+        use_adaptive_crop: if True, crop 3×3 patches around argmax (adaptive size).
+                          if False, use fixed crop_size × crop_upscale.
 
     Returns:
-        dict with topk_points, n_width, n_height, num_rounds, attended_source.
+        dict with topk_points, n_width, n_height, num_rounds, total_vis_tokens.
     """
     saccade = SaccadeLoop(max_rounds=max_rounds, crop_ratio=crop_ratio,
                           crop_size=crop_size, crop_upscale=crop_upscale)
@@ -133,7 +186,6 @@ def run_saccade_inference(
 
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
-    # Navigate to spatial_merge_size (handle PEFT-wrapped, plain, and DeepSpeed-wrapped)
     _backbone = model.backbone
     if hasattr(_backbone, 'base_model') and hasattr(_backbone.base_model, 'model'):
         _inner = _backbone.base_model.model
@@ -146,6 +198,8 @@ def run_saccade_inference(
     else:
         raise AttributeError(f"Cannot find visual module in {type(_inner)}")
     merge = _visual.spatial_merge_size
+
+    img_w, img_h = image.size
 
     # Round 0: low-res only
     r0_inputs, cur_text, cur_images = builder.build_round0(image_path, instruction)
@@ -171,24 +225,25 @@ def run_saccade_inference(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    grid_info_r0 = {"n_height": nh0, "n_width": nw0, "image_offset": 0}
-    attn0, _, _, pred_coords = model.action_head(vis_embeds, anchor, grid_info=grid_info_r0)
+    # No grid_info → no soft-argmax, just get attention weights
+    attn0, _, _, _ = model.action_head(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
-    # Use soft-argmax prediction for sub-patch precision
-    if pred_coords is not None:
-        focus_x = pred_coords[0].item()
-        focus_y = pred_coords[1].item()
+    # Use BFS region prediction for focus point
+    n_low = vis_ranges[0][1]
+    low_attn = attn_1d[:n_low]
+    best_pt, _, _ = get_prediction_region_point(low_attn, nw0, nh0, activation_threshold)
+    focus_x, focus_y = best_pt
+
+    # Compute adaptive crop size (3×3 patches around argmax)
+    if use_adaptive_crop:
+        _, _, adaptive_crop_size = _compute_3x3_crop_bbox(low_attn, nw0, nh0, img_w, img_h)
     else:
-        best_pt, _, _ = get_prediction_region_point(attn_1d, nw0, nh0, activation_threshold)
-        focus_x, focus_y = best_pt
+        adaptive_crop_size = crop_size
 
     decision = saccade.decide_round0(state, focus_x, focus_y)
     nw_final, nh_final = nw0, nh0
     final_point = (focus_x, focus_y)
-
-    # Subsequent rounds: LLM sees full history (all crops accumulated).
-    # Action head only considers unmasked low-res + latest crop; old crops masked.
     total_vis_tokens = vis_embeds.shape[0] if vis_embeds is not None else 0
 
     for ri in range(1, max_rounds):
@@ -196,14 +251,15 @@ def run_saccade_inference(
             break
 
         # Crop around current focus
+        current_crop_size = adaptive_crop_size if use_adaptive_crop else crop_size
         cropped, crop_bbox = crop_image(image, focus_x, focus_y,
                                         crop_ratio=crop_ratio,
-                                        crop_size=crop_size,
+                                        crop_size=current_crop_size,
                                         crop_upscale=crop_upscale,
                                         upsample_pixels=crop_upsample_pixels,
                                         crop_target_pixels=crop_target_pixels)
 
-        # Extend context (accumulate all crops for LLM context)
+        # Extend context (accumulate all crops)
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
                 cur_text, cur_images, cropped, crop_bbox,
@@ -232,10 +288,8 @@ def run_saccade_inference(
 
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
         nh_low, nw_low = grid_dims[0]
-        latest_img_idx = len(vis_ranges) - 1
 
-        # Action head mask: current crop masks low-res overlap area
-        # NOTE: old crop tokens are NOT masked (matches training behavior)
+        # Mask: only current crop's overlap on low-res. Old crops NOT masked.
         this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
@@ -244,19 +298,11 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        # Use soft-argmax on the latest crop for sub-patch precision
-        latest_img_idx = len(vis_ranges) - 1
-        nh_latest, nw_latest = grid_dims[latest_img_idx]
-        off_latest, n_latest = vis_ranges[latest_img_idx]
-        grid_info_ri = {
-            "n_height": nh_latest, "n_width": nw_latest,
-            "image_offset": off_latest, "n_image_tokens": n_latest,
-        }
-        attn_ri, _, _, pred_coords_ri = model.action_head(
-            vis_embeds, anchor, mask=full_mask, grid_info=grid_info_ri)
+        # Action head (no soft-argmax)
+        attn_ri, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
-        # Identify which image has argmax (for attended_source detection)
+        # Identify which image has argmax
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
         info = builder.image_infos[img_idx]
 
@@ -265,14 +311,10 @@ def run_saccade_inference(
         else:
             break
 
-        # Use soft-argmax coords if the model attends to the crop
-        if pred_coords_ri is not None and img_idx == latest_img_idx:
-            lx = pred_coords_ri[0].item()
-            ly = pred_coords_ri[1].item()
-        else:
-            off_a, n_a = vis_ranges[img_idx]
-            img_attn = attn_1d[off_a:off_a+n_a]
-            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+        # Compute local coords via BFS in the attended image
+        off_a, n_a = vis_ranges[img_idx]
+        img_attn = attn_1d[off_a:off_a + n_a]
+        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
 
         bx1, by1, bx2, by2 = info.global_bbox
         global_x = bx1 + lx * (bx2 - bx1)
@@ -287,8 +329,13 @@ def run_saccade_inference(
         if decision["action"] == "stop":
             break
 
-        # Saccade: update focus
+        # Saccade: update focus and recompute adaptive crop size
         focus_x, focus_y = global_x, global_y
+        if use_adaptive_crop:
+            # Recompute crop size based on low-res grid for next round
+            low_attn_new = attn_1d[:vis_ranges[0][1]]
+            _, _, adaptive_crop_size = _compute_3x3_crop_bbox(
+                low_attn_new, nw_low, nh_low, img_w, img_h)
 
     return {
         "topk_points": [final_point],
