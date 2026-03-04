@@ -27,6 +27,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from datasets import load_dataset
 from tqdm import tqdm
 
 from gui_attention.builder import MultiRoundInputBuilder
