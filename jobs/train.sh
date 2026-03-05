@@ -96,12 +96,12 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
-    --warmup_rounds_step 500 \
+    --warmup_rounds_step 1000 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
     --lora_target_modules "q_proj,v_proj" \
-    --action_head_lr 5e-5 \
+    --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
     --lm_loss_weight 1.0 \
     --pointer_loss_weight 1.0 \
@@ -112,7 +112,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 2 \
     --weight_decay 0.0 \
-    --warmup_ratio 0.03 \
+    --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
     --save_steps 5000 \
