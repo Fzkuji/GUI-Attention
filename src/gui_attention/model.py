@@ -48,7 +48,9 @@ def build_model(
     backbone.config.use_cache = False
 
     if gradient_checkpointing:
-        backbone.gradient_checkpointing_enable()
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         if hasattr(backbone, "enable_input_require_grads"):
             backbone.enable_input_require_grads()
 
