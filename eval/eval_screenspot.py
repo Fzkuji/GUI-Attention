@@ -51,11 +51,26 @@ DOMAIN_MAP = {
     "web": "web",
 }
 
-# ScreenSpot-Pro category mapping
-PRO_CATEGORIES = {
-    "Dev": "Dev", "Creative": "Creative", "CAD": "CAD",
-    "Scientific": "Scientific", "Office": "Office", "OS": "OS",
+# ScreenSpot-Pro: application → category mapping
+APP_TO_CATEGORY = {
+    # Dev
+    "android_studio": "Dev", "pycharm": "Dev", "vscode": "Dev",
+    "quartus": "Dev", "vivado": "Dev", "unreal_engine": "Dev",
+    # Creative
+    "photoshop": "Creative", "illustrator": "Creative", "premiere": "Creative",
+    "blender": "Creative", "fruitloops": "Creative", "davinci": "Creative",
+    # CAD
+    "autocad": "CAD", "solidworks": "CAD", "inventor": "CAD",
+    # Scientific
+    "matlab": "Scientific", "origin": "Scientific", "eviews": "Scientific",
+    "stata": "Scientific",
+    # Office
+    "excel": "Office", "word": "Office", "powerpoint": "Office",
+    # OS
+    "linux_common": "OS", "macos_common": "OS", "windows_common": "OS",
+    "vmware": "OS",
 }
+PRO_CATEGORIES = ["Dev", "Creative", "CAD", "Scientific", "Office", "OS"]
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +287,8 @@ def print_metrics_v1v2(results):
 
 def print_metrics_pro(results):
     """Print metrics for Pro: Dev/Creative/CAD/Scientific/Office/OS × text/icon."""
-    categories = ["Dev", "Creative", "CAD", "Scientific", "Office", "OS"]
     ui_types = ["text", "icon"]
-    return _print_metrics(results, categories, ui_types,
+    return _print_metrics(results, PRO_CATEGORIES, ui_types,
                           group_key="category", ui_key="ui_type")
 
 
@@ -448,7 +462,7 @@ def evaluate_all(samples, model, tokenizer, builder, args, device, rank):
 # ---------------------------------------------------------------------------
 
 def assign_pro_categories(results, data_dir):
-    """Assign Pro categories based on annotation file structure."""
+    """Assign Pro categories based on annotation file names (application_platform.json)."""
     ann_dir = os.path.join(data_dir, "annotations")
     if not os.path.isdir(ann_dir):
         return
@@ -456,27 +470,31 @@ def assign_pro_categories(results, data_dir):
     # Map img_filename → category from annotation files
     filename_to_cat = {}
     for json_path in sorted(glob.glob(os.path.join(ann_dir, "*.json"))):
-        cat_name = Path(json_path).stem  # e.g., "Dev", "Creative"
-        # Match to known categories
-        matched = None
-        for known in PRO_CATEGORIES:
-            if known.lower() in cat_name.lower():
-                matched = known
-                break
-        if matched is None:
-            matched = cat_name
+        stem = Path(json_path).stem  # e.g., "photoshop_windows", "all"
+        if stem == "all":
+            continue
+        # Extract application name (remove _platform suffix)
+        parts = stem.rsplit("_", 1)  # ["photoshop", "windows"]
+        app_name = parts[0] if len(parts) > 1 else stem
+        category = APP_TO_CATEGORY.get(app_name, None)
+        if category is None:
+            print(f"  Warning: unknown app '{app_name}' from {Path(json_path).name}")
+            continue
 
         with open(json_path) as f:
             items = json.load(f)
         if isinstance(items, list):
             for item in items:
                 fn = item.get("img_filename", "")
-                filename_to_cat[fn] = matched
+                filename_to_cat[fn] = category
 
+    assigned = 0
     for r in results:
         fn = r.get("img_filename", "")
         if fn in filename_to_cat:
             r["category"] = filename_to_cat[fn]
+            assigned += 1
+    print(f"  Assigned categories to {assigned}/{len(results)} samples")
 
 
 # ---------------------------------------------------------------------------
