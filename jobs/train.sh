@@ -103,7 +103,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_target_modules "q_proj,v_proj" \
     --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
-    --lm_loss_weight 1.0 \
+    --lm_loss_weight 0.1 \
     --pointer_loss_weight 1.0 \
     --coord_loss_weight 0.0 \
     --align_crop_mrope false \
