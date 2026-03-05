@@ -76,8 +76,8 @@ if [ -n "$RESUME_CKPT" ]; then
 fi
 
 echo "============================================================"
-echo "  GUI-Attention v9 Training"
-echo "  Config: LoRA + 1M pixels + M-RoPE alignment"
+echo "  GUI-Attention v12 Training"
+echo "  Config: LoRA + 1M low-res + adaptive 3x3 crop + mask old crops"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}"
