@@ -1,10 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# v13 Training: Dual Head (LookHead + ClickHead)
+# v14 Training: Dual Head (LookHead + ClickHead)
 #
-# Phase 1 (steps 0-1000): Single-round warmup, LookHead only
-# Phase 1 (steps 1000-3000): Multi-round, LookHead only
-# Phase 2 (steps 3000+): Multi-round, LookHead + ClickHead
+# Multi-round from step 0, both heads train together.
+# No warmup phases — LookHead + ClickHead learn simultaneously.
 #
 # Config: LoRA + 1M low-res + 308px crop + mask old crops
 #
@@ -79,12 +78,11 @@ if [ -n "$RESUME_CKPT" ]; then
 fi
 
 echo "============================================================"
-echo "  GUI-Attention v13 Training (Dual Head: LookHead + ClickHead)"
-echo "  Phase 1: LookHead only (steps 0-3000)"
-echo "  Phase 2: LookHead + ClickHead (steps 3000+)"
+echo "  GUI-Attention v14 Training (Dual Head: LookHead + ClickHead)"
+echo "  Multi-round from step 0, both heads train together"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
-echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v13_dual}"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v14_dual}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -93,15 +91,14 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v13_dual}" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v14_dual}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1001600 \
     --crop_size 308 \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
-    --warmup_rounds_step 1000 \
-    --click_phase_step 3000 \
+    \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
@@ -124,4 +121,4 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --gradient_checkpointing true \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v13_dual.txt"
+    2>&1 | tee "$LOG_DIR/train_v14_dual.txt"
