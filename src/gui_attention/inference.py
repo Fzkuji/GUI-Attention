@@ -109,23 +109,30 @@ def get_prediction_region_point(
     return best_point, sorted_centers, sorted_scores
 
 
-def _compute_3x3_crop_bbox(attn_1d, n_width, n_height, img_w, img_h):
-    """Compute crop bbox covering 3×3 patches around the argmax patch.
+def _compute_patch_crop_bbox(attn_1d, n_width, n_height, img_w, img_h,
+                              crop_patches_w=8, crop_patches_h=6):
+    """Compute crop bbox covering N×M patches around the argmax patch.
+
+    Args:
+        crop_patches_w: number of patches wide (default 8).
+        crop_patches_h: number of patches tall (default 6).
 
     Returns:
-        (cx_norm, cy_norm): center of the 3×3 region in normalised coords.
-        crop_size_pixels: side length in pixels for the 3×3 patch region.
+        (cx_norm, cy_norm): center of the region in normalised coords.
+        crop_size_pixels: side length in pixels (square, takes max of w/h).
     """
     # Find argmax patch
     argmax_idx = attn_1d.argmax().item()
     row = argmax_idx // n_width
     col = argmax_idx % n_width
 
-    # 3×3 region bounds (clamped to grid)
-    r_start = max(0, row - 1)
-    r_end = min(n_height - 1, row + 1)
-    c_start = max(0, col - 1)
-    c_end = min(n_width - 1, col + 1)
+    # Region bounds (clamped to grid)
+    half_w = crop_patches_w // 2
+    half_h = crop_patches_h // 2
+    r_start = max(0, row - half_h)
+    r_end = min(n_height - 1, row + half_h - 1 + (crop_patches_h % 2))
+    c_start = max(0, col - half_w)
+    c_end = min(n_width - 1, col + half_w - 1 + (crop_patches_w % 2))
 
     # Center of the 3×3 region in normalised coords
     cx = ((c_start + c_end) / 2 + 0.5) / n_width
@@ -237,7 +244,7 @@ def run_saccade_inference(
 
     # Compute adaptive crop size (3×3 patches around argmax)
     if use_adaptive_crop:
-        _, _, adaptive_crop_size = _compute_3x3_crop_bbox(low_attn, nw0, nh0, img_w, img_h)
+        _, _, adaptive_crop_size = _compute_patch_crop_bbox(low_attn, nw0, nh0, img_w, img_h)
     else:
         adaptive_crop_size = crop_size
 
@@ -334,7 +341,7 @@ def run_saccade_inference(
         if use_adaptive_crop:
             # Recompute crop size based on low-res grid for next round
             low_attn_new = attn_1d[:vis_ranges[0][1]]
-            _, _, adaptive_crop_size = _compute_3x3_crop_bbox(
+            _, _, adaptive_crop_size = _compute_patch_crop_bbox(
                 low_attn_new, nw_low, nh_low, img_w, img_h)
 
     return {

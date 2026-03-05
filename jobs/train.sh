@@ -92,7 +92,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1001600 \
-    --crop_size 252 \
+    --crop_size 308 \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
