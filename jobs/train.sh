@@ -106,6 +106,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lm_loss_weight 0.1 \
     --pointer_loss_weight 1.0 \
     --coord_loss_weight 0.0 \
+    --bbox_loss_weight 1.0 \
     --align_crop_mrope false \
     --teacher_forcing_crop false \
     --num_train_epochs 1 \

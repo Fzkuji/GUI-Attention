@@ -59,6 +59,14 @@ class ActionHead(nn.Module):
             nn.Linear(projection_dim, d_model),
         )
 
+        # Bbox regression head (YOLO-style): each visual token predicts (w, h)
+        # Output: 2 values per token, sigmoid → normalised [0, 1] relative to image
+        self.bbox_head = nn.Sequential(
+            nn.Linear(d_model, projection_dim // 2),
+            nn.GELU(),
+            nn.Linear(projection_dim // 2, 2),
+        )
+
     def _compute_logits(self, visual_hidden, anchor_hidden, mask=None):
         """Compute raw logits from visual and anchor hidden states.
 
@@ -134,7 +142,8 @@ class ActionHead(nn.Module):
         return pred_x, pred_y
 
     def forward(self, visual_hidden, anchor_hidden, labels=None, mask=None,
-                grid_info=None, gt_coords=None, coord_loss_weight=1.0):
+                grid_info=None, gt_coords=None, coord_loss_weight=1.0,
+                gt_bbox_wh=None, bbox_loss_weight=1.0):
         """Forward pass.
 
         Args:
@@ -153,12 +162,17 @@ class ActionHead(nn.Module):
             gt_coords: optional (2,) tensor [gt_x, gt_y] in [0, 1].
                        If provided with grid_info, computes coord_loss (L1).
             coord_loss_weight: weight for coordinate loss (default 1.0).
+            gt_bbox_wh: optional (2,) tensor [gt_w, gt_h] normalised [0, 1].
+                        If provided, computes bbox regression loss on the
+                        argmax visual token's prediction.
+            bbox_loss_weight: weight for bbox regression loss (default 1.0).
 
         Returns:
             attn_weights: (n_anchor, n_vis) attention weights (softmax).
-            loss: scalar total loss (KL + coord) if labels/gt_coords provided, else None.
+            loss: scalar total loss (KL + coord + bbox) if labels/gt provided, else None.
             logits: (n_anchor, n_vis) raw logits before softmax.
             pred_coords: optional (2,) tensor [pred_x, pred_y] if grid_info provided, else None.
+            pred_bbox_wh: (2,) predicted [w, h] from the argmax token, or None.
         """
         logits = self._compute_logits(visual_hidden, anchor_hidden, mask)
 
@@ -197,4 +211,23 @@ class ActionHead(nn.Module):
                 else:
                     loss = coord_loss_weight * coord_loss
 
-        return attn_weights, loss, logits, pred_coords
+        # Bbox regression: each visual token predicts (w, h)
+        # Use the visual_ctx from _compute_logits (need to recompute or cache)
+        # For efficiency, compute bbox predictions from visual_hidden directly
+        bbox_raw = self.bbox_head(visual_hidden)  # (n_vis, 2)
+        bbox_pred_all = torch.sigmoid(bbox_raw)   # (n_vis, 2) in [0, 1]
+
+        # Get argmax token's bbox prediction
+        argmax_idx = attn_weights.squeeze(0).argmax().item()
+        pred_bbox_wh = bbox_pred_all[argmax_idx]  # (2,) = [w, h]
+
+        # Bbox regression loss (only on argmax token, YOLO-style)
+        if gt_bbox_wh is not None and bbox_loss_weight > 0:
+            gt_wh = gt_bbox_wh.to(logits.device).float()
+            bbox_loss = F.l1_loss(pred_bbox_wh, gt_wh)
+            if loss is not None:
+                loss = loss + bbox_loss_weight * bbox_loss
+            else:
+                loss = bbox_loss_weight * bbox_loss
+
+        return attn_weights, loss, logits, pred_coords, pred_bbox_wh

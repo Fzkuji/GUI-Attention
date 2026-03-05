@@ -139,7 +139,7 @@ def run_saccade_with_recording(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _, _, _ = model.action_head(vis_embeds, anchor)
+    attn0, _, _, _, _ = model.action_head(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Low-res attention for round 0
@@ -207,7 +207,7 @@ def run_saccade_with_recording(
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
         full_mask[:n_low] = this_crop_mask
 
-        attn_ri, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
+        attn_ri, _, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)

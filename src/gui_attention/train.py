@@ -146,6 +146,7 @@ class ScriptArgs:
     lm_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LM (next-token prediction) loss. 0 or negative to disable."})
     pointer_loss_weight: float = field(default=1.0, metadata={"help": "Weight for pointer (ActionHead KL) loss."})
     coord_loss_weight: float = field(default=1.0, metadata={"help": "Weight for coordinate L1 loss (soft-argmax vs GT center)."})
+    bbox_loss_weight: float = field(default=1.0, metadata={"help": "Weight for bbox regression loss (YOLO-style w/h prediction)."})
     # LoRA (ignored when use_lora=False)
     use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
     lora_r: int = field(default=32)
@@ -423,10 +424,16 @@ class SaccadeTrainer:
                                                    soft=False).to(device).unsqueeze(0)
                 grid_info_r0 = {"n_height": nh0, "n_width": nw0, "image_offset": 0}
                 gt_xy = torch.tensor([gt_cx, gt_cy], device=device)
-                attn, ptr_loss, _, pred_coords = self.model.action_head(
+                # GT bbox (w, h) normalised for bbox regression
+                gt_w = bbox_gt[2] - bbox_gt[0]
+                gt_h = bbox_gt[3] - bbox_gt[1]
+                gt_bbox_wh = torch.tensor([gt_w, gt_h], device=device)
+                attn, ptr_loss, _, pred_coords, _ = self.model.action_head(
                     vis_embeds, anchor, labels=ptr_labels,
                     grid_info=grid_info_r0, gt_coords=gt_xy,
-                    coord_loss_weight=self.sa.coord_loss_weight)
+                    coord_loss_weight=self.sa.coord_loss_weight,
+                    gt_bbox_wh=gt_bbox_wh,
+                    bbox_loss_weight=self.sa.bbox_loss_weight)
 
                 if ptr_loss is not None:
                     total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
@@ -596,7 +603,7 @@ class SaccadeTrainer:
                         "n_height": nh_hi, "n_width": nw_hi,
                         "image_offset": off_hi, "n_image_tokens": n_hi,
                     }
-                    attn, ptr_loss, _, pred_coords = self.model.action_head(
+                    attn, ptr_loss, _, pred_coords, _ = self.model.action_head(
                         vis_embeds, anchor, labels=full_labels, mask=full_mask,
                         grid_info=grid_info_crop, gt_coords=local_gt_xy,
                         coord_loss_weight=self.sa.coord_loss_weight)
@@ -646,7 +653,7 @@ class SaccadeTrainer:
                         # Saccade: coord loss on low-res image pointing to GT
                         grid_info_low = {"n_height": nh0, "n_width": nw0, "image_offset": 0, "n_image_tokens": n_low}
                         gt_xy_low = torch.tensor([gt_cx, gt_cy], device=device)
-                        attn, ptr_loss, _, _ = self.model.action_head(
+                        attn, ptr_loss, _, _, _ = self.model.action_head(
                             vis_embeds, anchor, labels=full_labels, mask=full_mask,
                             grid_info=grid_info_low, gt_coords=gt_xy_low,
                             coord_loss_weight=self.sa.coord_loss_weight)
@@ -655,7 +662,7 @@ class SaccadeTrainer:
                             n_valid += 1
                     else:
                         with torch.no_grad():
-                            attn, _, _, _ = self.model.action_head(
+                            attn, _, _, _, _ = self.model.action_head(
                                 vis_embeds, anchor, mask=full_mask)
 
                     self.metrics["crop_hit"].append(0)

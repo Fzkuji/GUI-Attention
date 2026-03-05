@@ -172,6 +172,7 @@ def run_saccade_inference(
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
     use_adaptive_crop: bool = True,
+    use_bbox_pred: bool = False,
 ) -> dict:
     """Multi-round saccade inference.
 
@@ -233,7 +234,7 @@ def run_saccade_inference(
     nh0, nw0 = grid_dims[0]
 
     # No grid_info → no soft-argmax, just get attention weights
-    attn0, _, _, _ = model.action_head(vis_embeds, anchor)
+    attn0, _, _, _, pred_bbox0 = model.action_head(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Use BFS region prediction for focus point
@@ -242,8 +243,16 @@ def run_saccade_inference(
     best_pt, _, _ = get_prediction_region_point(low_attn, nw0, nh0, activation_threshold)
     focus_x, focus_y = best_pt
 
-    # Compute adaptive crop size (3×3 patches around argmax)
-    if use_adaptive_crop:
+    # Compute crop size
+    if pred_bbox0 is not None and use_bbox_pred:
+        # Use model's predicted bbox (w, h) to determine crop size
+        pred_w, pred_h = pred_bbox0[0].item(), pred_bbox0[1].item()
+        # Convert normalised (w, h) to pixels, add padding (×2 for margin)
+        crop_w_px = int(pred_w * img_w * 2)
+        crop_h_px = int(pred_h * img_h * 2)
+        adaptive_crop_size = max(crop_w_px, crop_h_px)
+        adaptive_crop_size = max(28, ((adaptive_crop_size + 13) // 28) * 28)
+    elif use_adaptive_crop:
         _, _, adaptive_crop_size = _compute_patch_crop_bbox(low_attn, nw0, nh0, img_w, img_h)
     else:
         adaptive_crop_size = crop_size
@@ -306,7 +315,7 @@ def run_saccade_inference(
         total_vis_tokens = n_total
 
         # Action head (no soft-argmax)
-        attn_ri, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
+        attn_ri, _, _, _, pred_bbox_ri = model.action_head(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         # Identify which image has argmax
