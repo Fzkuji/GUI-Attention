@@ -80,7 +80,7 @@ echo "  GUI-Attention v9 Training"
 echo "  Config: LoRA + 1M pixels + M-RoPE alignment"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
-echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v11}"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -89,9 +89,9 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v11}" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}" \
     --min_pixels 3136 \
-    --low_res_max_pixels 400000 \
+    --low_res_max_pixels 1001600 \
     --crop_size 252 \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
