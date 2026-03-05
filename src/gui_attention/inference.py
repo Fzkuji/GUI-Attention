@@ -241,21 +241,52 @@ def run_saccade_inference(
         attended_source = "high" if info.resolution == "high" else "low"
 
         if attended_source == "high" and use_click_head:
-            # LookHead chose a high-res crop → ClickHead for precise position
-            off_a, n_a = vis_ranges[img_idx]
-            crop_vis = vis_embeds[off_a:off_a + n_a]
+            # LookHead chose a high-res crop → ClickHead on ALL crop tokens
+            # Collect all high-res crop tokens
+            crop_vis_list = []
+            crop_meta = []  # (n_tokens, grid_w, grid_h, global_bbox)
+            for ci_idx in range(1, len(vis_ranges)):
+                ci_off, ci_n = vis_ranges[ci_idx]
+                ci_info = builder.image_infos[ci_idx]
+                if ci_info.resolution == "high":
+                    crop_vis_list.append(vis_embeds[ci_off:ci_off + ci_n])
+                    ci_nh, ci_nw = grid_dims[ci_idx] if ci_idx < len(grid_dims) else (1, 1)
+                    crop_meta.append((ci_n, ci_nw, ci_nh, ci_info.global_bbox))
 
-            click_attn, _, _ = model.dual_head.click(crop_vis, anchor)
-            click_1d = click_attn.squeeze(0)
+            if crop_vis_list:
+                combined_crop_vis = torch.cat(crop_vis_list, dim=0)
+                click_attn, _, _ = model.dual_head.click(combined_crop_vis, anchor)
+                click_1d = click_attn.squeeze(0)
 
-            # Use BFS on ClickHead attention for precise positioning
-            click_pt, _, _ = get_prediction_region_point(
-                click_1d, nw_a, nh_a, activation_threshold)
-            lx, ly = click_pt
-
-            bx1, by1, bx2, by2 = info.global_bbox
-            global_x = bx1 + lx * (bx2 - bx1)
-            global_y = by1 + ly * (by2 - by1)
+                # Find which crop token has highest attention
+                global_argmax = click_1d.argmax().item()
+                running = 0
+                for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
+                    if running + ci_n > global_argmax:
+                        local_tok = global_argmax - running
+                        lx = ((local_tok % ci_nw) + 0.5) / ci_nw
+                        ly = ((local_tok // ci_nw) + 0.5) / ci_nh
+                        bx1, by1, bx2, by2 = ci_bbox
+                        global_x = bx1 + lx * (bx2 - bx1)
+                        global_y = by1 + ly * (by2 - by1)
+                        break
+                    running += ci_n
+                else:
+                    # Fallback: use LookHead attention
+                    off_a, n_a = vis_ranges[img_idx]
+                    img_attn = attn_1d[off_a:off_a + n_a]
+                    lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                    bx1, by1, bx2, by2 = info.global_bbox
+                    global_x = bx1 + lx * (bx2 - bx1)
+                    global_y = by1 + ly * (by2 - by1)
+            else:
+                # No crop tokens available, fallback to LookHead
+                off_a, n_a = vis_ranges[img_idx]
+                img_attn = attn_1d[off_a:off_a + n_a]
+                lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                bx1, by1, bx2, by2 = info.global_bbox
+                global_x = bx1 + lx * (bx2 - bx1)
+                global_y = by1 + ly * (by2 - by1)
         else:
             # Use LookHead attention directly
             off_a, n_a = vis_ranges[img_idx]
