@@ -345,7 +345,7 @@ class SaccadeTrainer:
         # Track all crop info for ClickHead at the end
         # Each entry: (vis_embeds_slice, grid_h, grid_w, crop_bbox)
         all_crop_info = []
-        sample_crop_hit = False  # sample-level: did any crop contain GT?
+        crop_hit_round = None  # which round first covered GT (None = never)
 
         max_rounds = self.max_rounds_now
         pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
@@ -413,7 +413,7 @@ class SaccadeTrainer:
                                                     crop_size=self.sa.crop_size,
                                                     crop_upscale=self.sa.crop_upscale)
                     if point_in_bbox(gt_cx, gt_cy, virtual_bbox):
-                        sample_crop_hit = True
+                        crop_hit_round = 1  # round 0's crop = crop round 1
 
             else:
                 # ===== Round ri: Crop =====
@@ -422,8 +422,8 @@ class SaccadeTrainer:
                                                   crop_size=self.sa.crop_size,
                                                   crop_upscale=self.sa.crop_upscale)
                 gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
-                if gt_in_crop:
-                    sample_crop_hit = True
+                if gt_in_crop and crop_hit_round is None:
+                    crop_hit_round = ri  # first round that covered GT
 
                 # Re-build full context: low-res + all crops
                 self.builder.reset()
@@ -636,8 +636,11 @@ class SaccadeTrainer:
                     else:
                         break
 
-        # Sample-level crop_hit
-        self.metrics["crop_hit"].append(1 if sample_crop_hit else 0)
+        # crop_rounds: how many rounds to first cover GT (lower = better)
+        if crop_hit_round is not None:
+            self.metrics["crop_rounds"].append(crop_hit_round)
+        else:
+            self.metrics["crop_rounds"].append(max_rounds)
 
         # Track total visual tokens
         try:
@@ -780,7 +783,7 @@ class SaccadeTrainer:
                         print(f"  [Step {self.global_step}] [{phase}] loss={loss_val:.4f}{lm_str}{click_str} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
-                              f"crop_hit={ar('crop_hit'):.1%} vis_tok={ar('vis_tokens'):.0f} "
+                              f"crop_rounds={ar('crop_rounds'):.1f} vis_tok={ar('vis_tokens'):.0f} "
                               f"head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
