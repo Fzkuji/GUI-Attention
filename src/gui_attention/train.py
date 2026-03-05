@@ -339,6 +339,9 @@ class SaccadeTrainer:
                     sample, sample["instruction"],
                 )
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
+                # Enable grad on pixel_values for gradient checkpointing
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
 
                 # LM labels
                 lm_labels = None
@@ -348,7 +351,7 @@ class SaccadeTrainer:
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
-                    pixel_values=inp.get("pixel_values"),
+                    pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
                     labels=lm_labels,
                 )
@@ -361,7 +364,7 @@ class SaccadeTrainer:
 
                 # Visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
-                    inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+                    inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
                 _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
                 anchor = extract_anchor_hidden_states(
@@ -431,6 +434,8 @@ class SaccadeTrainer:
                     break
 
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
 
                 # LM labels
                 lm_labels = None
@@ -440,7 +445,7 @@ class SaccadeTrainer:
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
-                    pixel_values=inp.get("pixel_values"),
+                    pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
                     labels=lm_labels,
                 )
@@ -451,7 +456,7 @@ class SaccadeTrainer:
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
                 vis_embeds = self.model.extract_visual_embeds(
-                    inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+                    inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
                 _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
                 anchor = extract_anchor_hidden_states(
