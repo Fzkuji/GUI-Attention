@@ -3,10 +3,10 @@ Saccade Foveation Training: Dual Head (LookHead + ClickHead).
 
 Uses Qwen2.5-VL + peft LoRA + DualActionHead. DDP via torchrun.
 
-Multi-round training from step 0:
+Multi-round training from step 0 (no single-round warmup):
   Round 0: low-res full image → LookHead → KL loss on GT region → crop
   Round 1+: low-res + crops → LookHead → saccade or stop
-  When GT is in crop → break → ClickHead on ALL crop tokens → precise click
+  When GT is in crop → break → ClickHead on ALL crop tokens (after click_phase_step)
 
 Usage:
     python -m gui_attention.train \
@@ -98,6 +98,7 @@ class ScriptArgs:
     crop_upscale: int = field(default=3, metadata={"help": "Integer upscale factor for fixed crop."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     max_saccade_rounds: int = field(default=6, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades)."})
+    click_phase_step: int = field(default=3000, metadata={"help": "Step to start training ClickHead. Before this, only LookHead trains."})
     # Loss weights
     lm_loss_weight: float = field(default=0.1, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
@@ -288,17 +289,22 @@ class SaccadeTrainer:
     # -- helpers -------------------------------------------------------------
 
     @property
+    def in_click_phase(self):
+        """Whether ClickHead is active."""
+        return self.global_step >= self.sa.click_phase_step
+
+    @property
     def max_rounds(self):
         return self.sa.max_saccade_rounds
 
     # -- multi-round saccade forward ----------------------------------------
 
     def _forward_sample(self, sample):
-        """Multi-round training with LookHead + ClickHead.
+        """Multi-round training with LookHead + optional ClickHead.
 
-        All rounds use LookHead for saccade. When GT is in crop → break,
-        then ClickHead runs on ALL accumulated crop visual tokens for
-        precise positioning.
+        All rounds use LookHead for saccade. When GT is in crop → break.
+        After click_phase_step, ClickHead also runs on ALL accumulated
+        crop visual tokens for precise positioning.
 
         Returns (total_loss, num_valid_rounds, round_preds, click_pred).
           click_pred: (x, y) from ClickHead if available, else None.
@@ -512,8 +518,8 @@ class SaccadeTrainer:
                         total_loss = total_loss + self.sa.look_loss_weight * look_loss
                         n_valid += 1
 
-                    # ClickHead: precise position on ALL crop tokens
-                    if all_crop_info:
+                    # ClickHead (after click_phase_step): precise position on ALL crop tokens
+                    if self.in_click_phase and all_crop_info:
                         # Concatenate all crop visual tokens
                         crop_vis_list = []
                         click_label_list = []
@@ -694,6 +700,7 @@ class SaccadeTrainer:
             print(f"  crop_size={self.sa.crop_size}x{self.sa.crop_size} x{self.sa.crop_upscale} -> "
                   f"{self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  "
                   f"max_saccade_rounds={self.sa.max_saccade_rounds}")
+            print(f"  click_phase_step={self.sa.click_phase_step} (ClickHead starts at step {self.sa.click_phase_step})")
             print(f"  lm_loss_weight={self.sa.lm_loss_weight}  look_loss_weight={self.sa.look_loss_weight}  "
                   f"click_loss_weight={self.sa.click_loss_weight}")
             print(f"  head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
@@ -739,7 +746,8 @@ class SaccadeTrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
 
-                    pass  # no phase transitions
+                    if self.rank == 0 and self.global_step == self.sa.click_phase_step:
+                        print(f"  *** Step {self.global_step}: ClickHead activated ***")
 
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
@@ -753,7 +761,8 @@ class SaccadeTrainer:
                         bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val
                         lm_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
                         click_str = f" click={ar('click_loss'):.3f}" if self.metrics["click_loss"] else ""
-                        print(f"  [Step {self.global_step}] loss={loss_val:.4f}{lm_str}{click_str} "
+                        phase = "Look+Click" if self.in_click_phase else "Look"
+                        print(f"  [Step {self.global_step}] [{phase}] loss={loss_val:.4f}{lm_str}{click_str} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
                               f"crop_rounds={ar('crop_rounds'):.1f} vis_tok={ar('vis_tokens'):.0f} "

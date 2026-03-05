@@ -79,7 +79,7 @@ fi
 
 echo "============================================================"
 echo "  GUI-Attention v14 Training (Dual Head: LookHead + ClickHead)"
-echo "  Multi-round from step 0, both heads train together"
+echo "  Multi-round from step 0; LookHead only → step 3000: +ClickHead"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v14_dual}"
@@ -98,7 +98,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
-    \
+    --click_phase_step 3000 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
