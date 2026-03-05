@@ -59,7 +59,7 @@ from gui_attention.builder import MultiRoundInputBuilder
 from gui_attention.crop import crop_image
 from gui_attention.foveation import SaccadeLoop
 from gui_attention.labels import compute_overlap_mask
-from gui_attention.model import Qwen25VLWithActionHead
+from gui_attention.model import Qwen25VLWithDualHead
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ def run_saccade_with_recording(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    attn0, _, _, _, _ = model.action_head(vis_embeds, anchor)
+    attn0, _, _ = model.dual_head.look(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
     # Low-res attention for round 0
@@ -207,7 +207,7 @@ def run_saccade_with_recording(
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
         full_mask[:n_low] = this_crop_mask
 
-        attn_ri, _, _, _, _ = model.action_head(vis_embeds, anchor, mask=full_mask)
+        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
@@ -515,7 +515,7 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint} (base: {args.base_model})")
-    model, tokenizer = Qwen25VLWithActionHead.load_pretrained(
+    model, tokenizer = Qwen25VLWithDualHead.load_pretrained(
         args.checkpoint, args.base_model,
         attn_implementation="flash_attention_2",
         device=args.device,

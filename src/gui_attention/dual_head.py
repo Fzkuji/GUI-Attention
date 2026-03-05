@@ -1,8 +1,18 @@
 """Dual Head architecture: LookHead (explore) + ClickHead (precise click).
 
-LookHead selects which region to crop (coarse localization).
+LookHead selects which region to crop (coarse localization on full image).
 ClickHead selects precise click position within a high-res crop.
 Two independent heads with separate parameters — no interference.
+
+Training:
+  Phase 1: Only LookHead trains (learn to select good crop regions).
+  Phase 2: Both heads train (LookHead selects crop, ClickHead clicks on it).
+
+Inference:
+  Round 0: LookHead on low-res → select crop center.
+  Round N: LookHead on low-res + crops.
+    If LookHead attends high-res crop → ClickHead on that crop → precise (x,y) → stop.
+    If LookHead attends low-res → saccade continues.
 """
 
 import torch
@@ -15,6 +25,12 @@ class _AttentionHead(nn.Module):
 
     Shared architecture for both LookHead and ClickHead, but each
     instantiates its own parameters.
+
+    Architecture:
+        visual_hidden → SelfAttention → LayerNorm+Residual → MLP_V → proj_v
+        anchor_hidden → MLP_T → proj_t
+        logits = (proj_t @ proj_v^T) / sqrt(d_model)
+        attn_weights = softmax(logits, dim=-1)
     """
 
     def __init__(self, d_model: int, projection_dim: int = None,
@@ -51,10 +67,10 @@ class _AttentionHead(nn.Module):
         """Forward pass.
 
         Args:
-            visual_hidden: (n_vis, d_model) visual token embeddings.
-            anchor_hidden: (n_anchor, d_model) anchor/pointer token embeddings.
-            labels: optional (n_anchor, n_vis) target distribution.
-            mask: optional (n_vis,) bool tensor. True = masked.
+            visual_hidden: (n_vis, d_model) visual token embeddings (pre-LLM ViT output).
+            anchor_hidden: (n_anchor, d_model) anchor/pointer token embeddings (post-LLM).
+            labels: optional (n_anchor, n_vis) target distribution for KL loss.
+            mask: optional (n_vis,) bool tensor. True = masked (logit → -inf).
 
         Returns:
             attn_weights: (n_anchor, n_vis) attention weights.
@@ -101,18 +117,8 @@ class _AttentionHead(nn.Module):
 class DualActionHead(nn.Module):
     """Dual head: LookHead for exploration + ClickHead for precise clicking.
 
-    LookHead: decides where to crop next (coarse localization on full image).
-    ClickHead: decides precise click position (fine localization on crop).
-
-    Training:
-      Phase 1: Only LookHead trains (learn to select good crop regions).
-      Phase 2: Both heads train (LookHead for crop, ClickHead for click).
-
-    Inference:
-      Round 0: LookHead on low-res → select crop.
-      Round N: LookHead on low-res + crops.
-        If LookHead attends high-res crop → ClickHead on that crop → precise (x,y) → stop.
-        If LookHead attends low-res → saccade continues.
+    Both heads share the same _AttentionHead architecture but have
+    completely independent parameters.
     """
 
     def __init__(self, d_model: int, projection_dim: int = None,
@@ -124,56 +130,15 @@ class DualActionHead(nn.Module):
             d_model, projection_dim, num_attention_heads, dropout_rate)
 
     def look(self, visual_hidden, anchor_hidden, labels=None, mask=None):
-        """LookHead forward: decide where to crop.
+        """LookHead forward: decide where to crop next.
 
-        Returns:
-            attn_weights: (n_anchor, n_vis) attention over all visual tokens.
-            loss: KL loss if labels provided.
-            logits: raw logits.
+        Returns: (attn_weights, loss, logits)
         """
         return self.look_head(visual_hidden, anchor_hidden, labels, mask)
 
     def click(self, visual_hidden, anchor_hidden, labels=None, mask=None):
-        """ClickHead forward: decide precise click position.
+        """ClickHead forward: decide precise click position on high-res crop.
 
-        Typically called only on crop tokens (high-res) when LookHead
-        has indicated a high-res region.
-
-        Returns:
-            attn_weights: (n_anchor, n_vis) attention over visual tokens.
-            loss: KL loss if labels provided.
-            logits: raw logits.
+        Returns: (attn_weights, loss, logits)
         """
         return self.click_head(visual_hidden, anchor_hidden, labels, mask)
-
-    def forward(self, visual_hidden, anchor_hidden,
-                look_labels=None, click_labels=None,
-                look_mask=None, click_mask=None,
-                mode="look"):
-        """Unified forward.
-
-        Args:
-            mode: "look" (exploration), "click" (precise), or "both".
-
-        Returns:
-            dict with keys:
-              look_attn, look_loss, look_logits (if mode in ["look", "both"])
-              click_attn, click_loss, click_logits (if mode in ["click", "both"])
-        """
-        result = {}
-
-        if mode in ("look", "both"):
-            attn, loss, logits = self.look_head(
-                visual_hidden, anchor_hidden, look_labels, look_mask)
-            result["look_attn"] = attn
-            result["look_loss"] = loss
-            result["look_logits"] = logits
-
-        if mode in ("click", "both"):
-            attn, loss, logits = self.click_head(
-                visual_hidden, anchor_hidden, click_labels, click_mask)
-            result["click_attn"] = attn
-            result["click_loss"] = loss
-            result["click_logits"] = logits
-
-        return result

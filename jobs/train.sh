@@ -1,15 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# v9 Training: v5 config (LoRA + 1M pixels) + M-RoPE position alignment
+# v13 Training: Dual Head (LookHead + ClickHead)
 #
-# vs v5: + align_crop_mrope (new)
-# vs v8: LoRA instead of full-param, 1M instead of 200K pixels, higher LR
+# Phase 1 (steps 0-1000): Single-round warmup, LookHead only
+# Phase 1 (steps 1000-3000): Multi-round, LookHead only
+# Phase 2 (steps 3000+): Multi-round, LookHead + ClickHead
+#
+# Config: LoRA + 1M low-res + 308px crop + mask old crops
 #
 # Usage (Tencent server, 8 GPUs):
-#   NUM_GPUS=8 bash jobs/train_v9.sh
+#   NUM_GPUS=8 bash jobs/train.sh
 #
 # Resume:
-#   RESUME_CKPT=/path/to/checkpoint NUM_GPUS=8 bash jobs/train_v9.sh
+#   RESUME_CKPT=/path/to/checkpoint NUM_GPUS=8 bash jobs/train.sh
 # ============================================================================
 
 set -e
@@ -72,15 +75,16 @@ fi
 RESUME_ARG=""
 if [ -n "$RESUME_CKPT" ]; then
     echo "Resuming from: $RESUME_CKPT"
-    RESUME_ARG="--resume_from_checkpoint $RESUME_CKPT"
+    RESUME_ARG="--resume_ckpt $RESUME_CKPT"
 fi
 
 echo "============================================================"
-echo "  GUI-Attention v12 Training"
-echo "  Config: LoRA + 1M low-res + adaptive 3x3 crop + mask old crops"
+echo "  GUI-Attention v13 Training (Dual Head: LookHead + ClickHead)"
+echo "  Phase 1: LookHead only (steps 0-3000)"
+echo "  Phase 2: LookHead + ClickHead (steps 3000+)"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
-echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v13_dual}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -89,7 +93,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v12_1M}" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v13_dual}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1001600 \
     --crop_size 308 \
@@ -97,6 +101,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
     --warmup_rounds_step 1000 \
+    --click_phase_step 3000 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
@@ -104,11 +109,8 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
     --lm_loss_weight 0.1 \
-    --pointer_loss_weight 1.0 \
-    --coord_loss_weight 0.0 \
-    --bbox_loss_weight 1.0 \
-    --align_crop_mrope false \
-    --teacher_forcing_crop false \
+    --look_loss_weight 1.0 \
+    --click_loss_weight 1.0 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 2 \
@@ -120,7 +122,6 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --save_total_limit 3 \
     --bf16 true \
     --gradient_checkpointing true \
-    --soft_labels false \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v9_qwen.txt"
+    2>&1 | tee "$LOG_DIR/train_v13_dual.txt"

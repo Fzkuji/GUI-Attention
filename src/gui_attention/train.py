@@ -1,27 +1,15 @@
 """
-Saccade Foveation Training: LoRA/full-param + ActionHead, multi-round saccade.
+Saccade Foveation Training: Dual Head (LookHead + ClickHead).
 
-Uses transformers Qwen2.5-VL + peft LoRA + ActionHead. DDP via torchrun.
+Uses Qwen2.5-VL + peft LoRA + DualActionHead. DDP via torchrun.
 
-Each sample trains up to max_saccade_rounds, using the model's OWN predictions
-to decide where to crop (not teacher forcing). Three scenarios per round:
+Two-phase training:
+  Phase 1 (LookHead only, steps 0 to click_phase_step):
+    Round 0: low-res full image → LookHead → KL loss on GT region
+    Round 1+: low-res + crops → LookHead → saccade or stop
 
-  Round 0: [low-res full image] [instruction] [anchor_0]
-    → forward → action head → loss (binary overlap with GT)
-    → model predicts a point → used as crop center for round 1
-
-  Round 1+ (GT in crop):
-    → labels on high-res crop patches (local GT overlap)
-    → low-res patches covered by crops are masked
-    → stop (target found)
-
-  Round 1+ (GT NOT in crop — saccade):
-    → labels on UNMASKED low-res patches overlapping GT
-    → high-res patches get 0 labels
-    → model predicts new point → next crop center
-    → continue loop
-
-  Total loss = mean of all valid round losses
+  Phase 2 (LookHead + ClickHead, steps click_phase_step onwards):
+    Same as Phase 1, but when GT is in crop → ClickHead predicts precise position
 
 Usage:
     python -m gui_attention.train \
@@ -49,7 +37,6 @@ from PIL import Image, ImageFile
 from tqdm import tqdm
 
 from gui_attention.attention import (
-    adjust_crop_position_ids,
     extract_anchor_hidden_states,
     extract_visual_hidden_states,
     identify_attended_image,
@@ -60,7 +47,7 @@ from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
 from gui_attention.constants import IGNORE_INDEX
 from gui_attention.crop import crop_image, point_in_bbox
 from gui_attention.labels import compute_binary_labels, compute_overlap_mask
-from gui_attention.model import Qwen25VLWithActionHead, build_model
+from gui_attention.model import Qwen25VLWithDualHead, build_model
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -69,38 +56,20 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # -- LM Labels ---------------------------------------------------------------
 
 def make_lm_labels(input_ids, tokenizer, round_idx=0):
-    """Create LM labels for a specific round's assistant response only.
-
-    Finds all assistant turns in the input sequence, and only supervises
-    the round_idx-th one (0-indexed). All other tokens get IGNORE_INDEX.
-
-    This prevents double-counting when multi-round training does separate
-    forward passes: each round only gets LM loss on its own assistant turn.
-
-    Args:
-        input_ids: (1, seq_len) tensor.
-        tokenizer: tokenizer with special tokens.
-        round_idx: which assistant turn to supervise (0-based).
-
-    Returns:
-        labels: (1, seq_len) tensor with IGNORE_INDEX for non-supervised tokens.
-    """
+    """Create LM labels for a specific round's assistant response only."""
     labels = torch.full_like(input_ids, IGNORE_INDEX)
     im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
     ids = input_ids[0].tolist()
     seq_len = len(ids)
 
-    # Find all assistant turns: (content_start, content_end) positions
     assistant_turns = []
     i = 0
     while i < seq_len:
         if ids[i] == im_start_id:
-            # Decode next few tokens to check role
             end_check = min(i + 4, seq_len)
             role_text = tokenizer.decode(ids[i + 1:end_check], skip_special_tokens=False)
             if role_text.lstrip().startswith("assistant"):
-                # Find end of this assistant turn: next <|im_start|> or end of sequence
-                content_start = i + 1  # supervise from token after <|im_start|>
+                content_start = i + 1
                 j = i + 1
                 while j < seq_len and ids[j] != im_start_id:
                     j += 1
@@ -110,7 +79,6 @@ def make_lm_labels(input_ids, tokenizer, round_idx=0):
                 continue
         i += 1
 
-    # Only supervise the round_idx-th assistant turn
     if round_idx < len(assistant_turns):
         start, end = assistant_turns[round_idx]
         labels[0, start:end] = input_ids[0, start:end]
@@ -129,32 +97,23 @@ class ScriptArgs:
     min_pixels: int = field(default=3136)
     low_res_max_pixels: int = field(default=LOW_RES_MAX_PIXELS)
     high_res_max_pixels: int = field(default=HIGH_RES_MAX_PIXELS)
-    crop_ratio: float = field(default=0.0, metadata={"help": "(Legacy) Fraction of image to crop. 0=use crop_size instead."})
-    crop_size: int = field(default=252, metadata={"help": "Fixed crop side length in pixels (square crop). Must be divisible by 28. 0=use crop_ratio."})
-    crop_upscale: int = field(default=3, metadata={"help": "Integer upscale factor for fixed crop. E.g. 4 → 168px crop becomes 672px. crop_size*crop_upscale should be divisible by 28."})
-    crop_upsample_pixels: int = field(default=0, metadata={"help": "(Legacy) Upsample crop to this many pixels. Overridden by crop_target_pixels."})
-    crop_target_pixels: int = field(default=0, metadata={"help": "(Legacy) Resize crop to this pixel budget. 0=disabled. Only used with crop_ratio mode."})
+    crop_size: int = field(default=308, metadata={"help": "Fixed crop side length in pixels. Must be divisible by 28."})
+    crop_upscale: int = field(default=3, metadata={"help": "Integer upscale factor for fixed crop."})
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
-    align_crop_mrope: bool = field(default=True, metadata={"help": "Align crop M-RoPE position_ids to low-res spatial grid. False = default sequential positions."})
-    teacher_forcing_crop: bool = field(default=False, metadata={"help": "Use GT center as crop location (teacher forcing). False = use model's own prediction."})
-    teacher_forcing_ratio: float = field(default=1.0, metadata={"help": "Probability of using GT crop when teacher_forcing_crop=true. 0.0=always model prediction, 1.0=always GT. Allows scheduled mixing."})
-    soft_labels: bool = field(default=False, metadata={"help": "Use Gaussian soft labels (default: binary overlap labels)"})
-    soft_label_sigma: float = field(default=0.5, metadata={"help": "Sigma scale for soft label Gaussian (sigma_pixels = scale * pixel_size)"})
-    max_saccade_rounds: int = field(default=4, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades). Default 4 = 1 low-res + up to 3 crops."})
-    warmup_rounds_step: int = field(default=0, metadata={"help": "If > 0, use single-round (round 0 only) for the first N steps, then switch to max_saccade_rounds. 0=disabled."})
+    max_saccade_rounds: int = field(default=6, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades)."})
+    warmup_rounds_step: int = field(default=1000, metadata={"help": "Single-round (LookHead only on round 0) for the first N steps, then multi-round."})
+    click_phase_step: int = field(default=3000, metadata={"help": "Step to start training ClickHead (Phase 2). Before this, only LookHead trains."})
     # Loss weights
-    lm_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LM (next-token prediction) loss. 0 or negative to disable."})
-    pointer_loss_weight: float = field(default=1.0, metadata={"help": "Weight for pointer (ActionHead KL) loss."})
-    coord_loss_weight: float = field(default=1.0, metadata={"help": "Weight for coordinate L1 loss (soft-argmax vs GT center)."})
-    bbox_loss_weight: float = field(default=1.0, metadata={"help": "Weight for bbox regression loss (YOLO-style w/h prediction)."})
-    # LoRA (ignored when use_lora=False)
-    use_lora: bool = field(default=True, metadata={"help": "Use LoRA. Set False for full parameter fine-tuning."})
+    lm_loss_weight: float = field(default=0.1, metadata={"help": "Weight for LM (next-token prediction) loss."})
+    look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
+    click_loss_weight: float = field(default=1.0, metadata={"help": "Weight for ClickHead KL loss."})
+    # LoRA
+    use_lora: bool = field(default=True)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=64)
     lora_target_modules: str = field(default="q_proj,v_proj")
-    # Dual LR (when use_lora=True: action_head_lr for head, lora_lr for backbone)
-    # When use_lora=False: action_head_lr for head, lora_lr for backbone (all params)
-    action_head_lr: float = field(default=1e-4)
+    # LR
+    action_head_lr: float = field(default=1e-4, metadata={"help": "LR for dual head (both LookHead and ClickHead)"})
     lora_lr: float = field(default=5e-5, metadata={"help": "LR for backbone params (LoRA or full)"})
     # Per-dataset sample limits
     max_samples_per_dataset: Optional[str] = field(default=None, metadata={
@@ -200,32 +159,24 @@ def load_single_dataset(data_path, image_folder):
 
 
 def load_dataset(data_path, image_folder, max_samples=None, max_samples_per_dataset=None):
-    """Load one or more datasets. Comma-separated paths for multiple datasets.
-
-    Args:
-        max_samples_per_dataset: comma-separated per-dataset limits, e.g. "0,0,0,60000,0".
-            0 means no limit. Must match number of datasets if provided.
-    """
+    """Load one or more datasets. Comma-separated paths for multiple."""
     data_paths = [p.strip() for p in data_path.split(",")]
     image_folders = [p.strip() for p in image_folder.split(",")]
     if len(image_folders) == 1 and len(data_paths) > 1:
         image_folders = image_folders * len(data_paths)
-    assert len(data_paths) == len(image_folders), \
-        f"Mismatch: {len(data_paths)} data_paths vs {len(image_folders)} image_folders"
+    assert len(data_paths) == len(image_folders)
 
-    # Parse per-dataset limits
     per_ds_limits = None
     if max_samples_per_dataset:
         per_ds_limits = [int(x.strip()) for x in max_samples_per_dataset.split(",")]
-        assert len(per_ds_limits) == len(data_paths), \
-            f"max_samples_per_dataset has {len(per_ds_limits)} entries but {len(data_paths)} datasets"
+        assert len(per_ds_limits) == len(data_paths)
 
     samples = []
     for i, (dp, imf) in enumerate(zip(data_paths, image_folders)):
         s = load_single_dataset(dp, imf)
         limit = per_ds_limits[i] if per_ds_limits else 0
         if limit > 0 and len(s) > limit:
-            s = s[:limit]  # take first N (like GUI-AIMA's "first:60000")
+            s = s[:limit]
             print(f"  {os.path.basename(dp)}: {len(s)} samples (limited to {limit})")
         else:
             print(f"  {os.path.basename(dp)}: {len(s)} samples")
@@ -246,10 +197,37 @@ def _get_model_device(model):
     return next(model.parameters()).device
 
 
+def _get_backbone_for_rope(model):
+    """Walk through wrapping layers to find get_rope_index."""
+    backbone = model.backbone
+    for _attr in ('base_model', 'model', 'model'):
+        if hasattr(backbone, 'get_rope_index'):
+            return backbone
+        if hasattr(backbone, _attr):
+            backbone = getattr(backbone, _attr)
+    if not hasattr(backbone, 'get_rope_index'):
+        raise AttributeError(f"Cannot find get_rope_index. Final type: {type(backbone)}")
+    return backbone
+
+
+def _get_visual_module(model):
+    """Find the visual encoder module."""
+    _backbone = model.backbone
+    if hasattr(_backbone, 'base_model') and hasattr(_backbone.base_model, 'model'):
+        _inner = _backbone.base_model.model
+    else:
+        _inner = _backbone
+    if hasattr(_inner, 'visual'):
+        return _inner.visual
+    elif hasattr(_inner, 'model') and hasattr(_inner.model, 'visual'):
+        return _inner.model.visual
+    raise AttributeError(f"Cannot find visual module in {type(_inner)}")
+
+
 # -- Trainer ------------------------------------------------------------------
 
 class SaccadeTrainer:
-    def __init__(self, model: Qwen25VLWithActionHead, tokenizer, train_data,
+    def __init__(self, model: Qwen25VLWithDualHead, tokenizer, train_data,
                  args: TrainArgs, script_args: ScriptArgs):
         self.tokenizer = tokenizer
         self.train_data = train_data
@@ -263,7 +241,7 @@ class SaccadeTrainer:
 
         self.model = model
 
-        # Detect distributed (torchrun)
+        # Distributed
         if dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
@@ -271,7 +249,7 @@ class SaccadeTrainer:
             self.rank = 0
             self.world_size = 1
 
-        # Compute total steps for scheduler
+        # Total steps for scheduler
         total_steps = (
             int(args.num_train_epochs) * len(train_data)
             // self.world_size
@@ -281,11 +259,11 @@ class SaccadeTrainer:
         if args.max_steps and args.max_steps > 0:
             total_steps = min(total_steps, args.max_steps)
 
-        # Dual LR: action_head gets higher LR, backbone gets lower LR
-        action_head_params = list(model.action_head.parameters())
+        # Dual LR: heads get higher LR, backbone gets lower LR
+        head_params = list(model.dual_head.parameters())
         backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
         param_groups = [
-            {"params": action_head_params, "lr": script_args.action_head_lr},
+            {"params": head_params, "lr": script_args.action_head_lr},
             {"params": backbone_params, "lr": script_args.lora_lr},
         ]
         self.optimizer = torch.optim.AdamW(
@@ -301,7 +279,7 @@ class SaccadeTrainer:
         self.metrics = defaultdict(list)
         self.global_step = 0
 
-        # Resume training state (optimizer, scheduler, step)
+        # Resume
         if script_args.resume_ckpt:
             state_path = os.path.join(script_args.resume_ckpt, "training_state.pt")
             if os.path.exists(state_path):
@@ -312,15 +290,33 @@ class SaccadeTrainer:
                 if self.rank == 0:
                     print(f"  Resumed training state: global_step={self.global_step}")
 
+    # -- determine phase ---------------------------------------------------
+
+    @property
+    def in_click_phase(self):
+        """Whether ClickHead is active (Phase 2)."""
+        return self.global_step >= self.sa.click_phase_step
+
+    @property
+    def max_rounds_now(self):
+        """Current max rounds based on warmup schedule."""
+        if self.sa.warmup_rounds_step > 0 and self.global_step < self.sa.warmup_rounds_step:
+            return 1
+        return self.sa.max_saccade_rounds
+
     # -- multi-round saccade forward ----------------------------------------
 
     def _forward_sample(self, sample):
-        """Single-round training with random scenario selection.
+        """Multi-round training with LookHead + optional ClickHead.
 
-        With 50% probability:
-          - LOW-RES: low-res full image → action head → loss
-          - CROP: no_grad low-res → get model's crop prediction →
-                  low-res + crop (with grad) → action head → loss
+        Phase 1 (before click_phase_step):
+          All rounds use LookHead only. When GT is in crop, LookHead
+          gets labels on the crop patch containing GT → break.
+
+        Phase 2 (after click_phase_step):
+          Same as Phase 1, but when GT is in crop, ClickHead is
+          additionally run on ONLY the crop visual tokens for precise
+          positioning.
 
         Returns (total_loss, num_valid_rounds, round_preds).
         """
@@ -336,22 +332,7 @@ class SaccadeTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
-        # Navigate to spatial_merge_size (handle PEFT-wrapped, plain, and DeepSpeed-wrapped)
-        _backbone = self.model.backbone
-        # Unwrap PEFT if present
-        if hasattr(_backbone, 'base_model') and hasattr(_backbone.base_model, 'model'):
-            _inner = _backbone.base_model.model
-        else:
-            _inner = _backbone
-        # Qwen2_5_VLForConditionalGeneration has .model.visual
-        # Qwen2_5_VLModel has .visual directly
-        if hasattr(_inner, 'visual'):
-            _visual = _inner.visual
-        elif hasattr(_inner, 'model') and hasattr(_inner.model, 'visual'):
-            _visual = _inner.model.visual
-        else:
-            raise AttributeError(f"Cannot find visual module in {type(_inner)}")
-        merge = _visual.spatial_merge_size
+        merge = _get_visual_module(self.model).spatial_merge_size
 
         self.builder.reset()
         self.model.train()
@@ -359,23 +340,8 @@ class SaccadeTrainer:
         n_valid = 0
         round_preds = []
 
-        # Get backbone for rope index computation — unwrap LoRA/PEFT layers
-        _backbone_for_rope = self.model.backbone
-        # Walk through possible wrapping: PeftModel -> LoraModel -> Qwen2_5_VLForConditionalGeneration -> Qwen2_5_VLModel
-        for _attr in ('base_model', 'model', 'model'):
-            if hasattr(_backbone_for_rope, 'get_rope_index'):
-                break
-            if hasattr(_backbone_for_rope, _attr):
-                _backbone_for_rope = getattr(_backbone_for_rope, _attr)
-        if not hasattr(_backbone_for_rope, 'get_rope_index'):
-            raise AttributeError(f"Cannot find get_rope_index on backbone. Final type: {type(_backbone_for_rope)}")
-
-        # Warmup: single-round for first N steps, then full multi-round
-        if self.sa.warmup_rounds_step > 0 and self.global_step < self.sa.warmup_rounds_step:
-            max_rounds = 1
-        else:
-            max_rounds = self.sa.max_saccade_rounds
-        pred_x, pred_y = gt_cx, gt_cy  # will be overwritten by round 0
+        max_rounds = self.max_rounds_now
+        pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
 
         for ri in range(max_rounds):
             if ri == 0:
@@ -385,7 +351,7 @@ class SaccadeTrainer:
                 )
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
 
-                # LM labels for this round's assistant response
+                # LM labels
                 lm_labels = None
                 if self.sa.lm_loss_weight > 0:
                     lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
@@ -404,12 +370,11 @@ class SaccadeTrainer:
                     total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
-                # Visual input: use visual embeds (pre-LLM) for spatial info
+                # Visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
                 _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
-                # Anchor: use last-layer hidden states (post-LLM, has text context)
                 anchor = extract_anchor_hidden_states(
                     last_hs, inp["input_ids"], pp_id, n=0)
 
@@ -419,43 +384,25 @@ class SaccadeTrainer:
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 nh0, nw0 = grid_dims[0]
 
-                # Round 0: binary labels (coarse navigation, not final positioning)
-                ptr_labels = compute_binary_labels(nh0, nw0, bbox_gt,
-                                                   soft=False).to(device).unsqueeze(0)
-                grid_info_r0 = {"n_height": nh0, "n_width": nw0, "image_offset": 0}
-                gt_xy = torch.tensor([gt_cx, gt_cy], device=device)
-                # GT bbox (w, h) normalised for bbox regression
-                gt_w = bbox_gt[2] - bbox_gt[0]
-                gt_h = bbox_gt[3] - bbox_gt[1]
-                gt_bbox_wh = torch.tensor([gt_w, gt_h], device=device)
-                attn, ptr_loss, _, pred_coords, _ = self.model.action_head(
-                    vis_embeds, anchor, labels=ptr_labels,
-                    grid_info=grid_info_r0, gt_coords=gt_xy,
-                    coord_loss_weight=self.sa.coord_loss_weight,
-                    gt_bbox_wh=gt_bbox_wh,
-                    bbox_loss_weight=self.sa.bbox_loss_weight)
+                # LookHead: binary labels on GT region
+                look_labels = compute_binary_labels(nh0, nw0, bbox_gt,
+                                                    soft=False).to(device).unsqueeze(0)
+                attn, look_loss, _ = self.model.dual_head.look(
+                    vis_embeds, anchor, labels=look_labels)
 
-                if ptr_loss is not None:
-                    total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
+                if look_loss is not None:
+                    total_loss = total_loss + self.sa.look_loss_weight * look_loss
                     n_valid += 1
 
                 with torch.no_grad():
-                    # Use soft-argmax prediction for crop positioning
-                    if pred_coords is not None:
-                        pred_x = pred_coords[0].item()
-                        pred_y = pred_coords[1].item()
-                    else:
-                        _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
-                        low_attn = attn.squeeze(0)[vis_ranges[0][0]:vis_ranges[0][0]+vis_ranges[0][1]]
-                        pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
+                    # Decode prediction from LookHead attention
+                    _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
+                    low_attn = attn.squeeze(0)[vis_ranges[0][0]:vis_ranges[0][0]+vis_ranges[0][1]]
+                    pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
                     round_preds.append((pred_x, pred_y))
 
-                    # Log beta value
-                    self.metrics["beta"].append(self.model.action_head.beta.item())
-
-                    # Virtual crop_hit: would GT be inside a crop around prediction?
+                    # Virtual crop_hit
                     _, virtual_bbox = crop_image(img, pred_x, pred_y,
-                                                    crop_ratio=self.sa.crop_ratio,
                                                     crop_size=self.sa.crop_size,
                                                     crop_upscale=self.sa.crop_upscale)
                     self.metrics["crop_hit"].append(
@@ -463,45 +410,28 @@ class SaccadeTrainer:
 
             else:
                 # ===== Round ri: Crop =====
-                # Teacher forcing with ratio: randomly choose GT or model prediction
-                use_tf = (self.sa.teacher_forcing_crop
-                          and random.random() < self.sa.teacher_forcing_ratio)
-                crop_cx = gt_cx if use_tf else pred_x
-                crop_cy = gt_cy if use_tf else pred_y
+                crop_cx, crop_cy = pred_x, pred_y
                 cropped, crop_bbox = crop_image(img, crop_cx, crop_cy,
-                                                  crop_ratio=self.sa.crop_ratio,
                                                   crop_size=self.sa.crop_size,
-                                                  crop_upscale=self.sa.crop_upscale,
-                                                  upsample_pixels=self.sa.crop_upsample_pixels,
-                                                  crop_target_pixels=self.sa.crop_target_pixels)
+                                                  crop_upscale=self.sa.crop_upscale)
                 gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
 
-                # Re-build full context: low-res + all crops up to this round
+                # Re-build full context: low-res + all crops
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
                 )
-                # Add all previous crops + this one
-                # (for simplicity, we only add the current crop since builder
-                # doesn't store previous crops; re-crop from round_preds)
                 for prev_ri in range(1, ri):
-                    if use_tf:
-                        prev_px, prev_py = gt_cx, gt_cy
-                    else:
-                        prev_px, prev_py = round_preds[prev_ri - 1]
+                    prev_px, prev_py = round_preds[prev_ri - 1]
                     prev_crop, prev_bbox = crop_image(img, prev_px, prev_py,
-                                                       crop_ratio=self.sa.crop_ratio,
                                                        crop_size=self.sa.crop_size,
-                                                       crop_upscale=self.sa.crop_upscale,
-                                                       upsample_pixels=self.sa.crop_upsample_pixels,
-                                                       crop_target_pixels=self.sa.crop_target_pixels)
+                                                       crop_upscale=self.sa.crop_upscale)
                     try:
                         r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                             cur_text, cur_images, prev_crop, prev_bbox,
                         )
                     except Exception:
                         break
-                # Add current round's crop
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
@@ -511,24 +441,10 @@ class SaccadeTrainer:
 
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
 
-                # LM labels for this round's assistant response
+                # LM labels
                 lm_labels = None
                 if self.sa.lm_loss_weight > 0:
                     lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
-
-                # Optionally align crop M-RoPE position_ids to low-res spatial grid
-                extra_kwargs = {}
-                if self.sa.align_crop_mrope:
-                    position_ids, _ = _backbone_for_rope.get_rope_index(
-                        input_ids=inp["input_ids"],
-                        image_grid_thw=inp.get("image_grid_thw"),
-                        attention_mask=inp.get("attention_mask"),
-                    )
-                    position_ids = adjust_crop_position_ids(
-                        position_ids, inp["input_ids"], inp["image_grid_thw"],
-                        merge, crop_bbox, img_tok,
-                    )
-                    extra_kwargs["position_ids"] = position_ids
 
                 outputs = self.model(
                     input_ids=inp["input_ids"],
@@ -536,21 +452,17 @@ class SaccadeTrainer:
                     pixel_values=inp.get("pixel_values"),
                     image_grid_thw=inp.get("image_grid_thw"),
                     labels=lm_labels,
-                    **extra_kwargs,
                 )
                 last_hs = outputs.hidden_states[-1]
 
-                # LM loss
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
                     total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
-                # Visual input: use visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
                 _, vis_ranges = extract_visual_hidden_states(
                     last_hs, inp["input_ids"], img_tok)
-                # Anchor: use last-layer hidden states (post-LLM)
                 anchor = extract_anchor_hidden_states(
                     last_hs, inp["input_ids"], pp_id, n=ri)
 
@@ -562,17 +474,16 @@ class SaccadeTrainer:
                 n_total = vis_embeds.shape[0]
                 latest_img_idx = len(vis_ranges) - 1
 
-                # Mask: current crop overlap in low-res + all OLD crop tokens
+                # Mask: current crop overlap in low-res + old crop tokens
                 this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
-                # Mask all previous crop tokens (not the latest one)
                 for prev_i in range(1, latest_img_idx):
                     off_prev, ntok_prev = vis_ranges[prev_i]
                     full_mask[off_prev:off_prev + ntok_prev] = True
 
                 if gt_in_crop:
-                    # GT in crop → FINAL round, binary label on crop
+                    # GT in crop → LookHead labels on crop patch + optional ClickHead
                     nh_high, nw_high = grid_dims[latest_img_idx]
                     cbx1, cby1, cbx2, cby2 = crop_bbox
                     cbw, cbh = cbx2 - cbx1, cby2 - cby1
@@ -583,46 +494,32 @@ class SaccadeTrainer:
                             max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
                             max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
                         )
-                        high_labels = compute_binary_labels(nh_high, nw_high, local_gt,
-                                                            soft=False)
+                        high_labels = compute_binary_labels(nh_high, nw_high, local_gt, soft=False)
                     else:
                         high_labels = torch.zeros(vis_ranges[latest_img_idx][1])
 
-                    full_labels = torch.zeros(1, n_total, device=device)
+                    # LookHead: labels on crop tokens (coarse: which crop has GT)
+                    look_full_labels = torch.zeros(1, n_total, device=device)
                     offset_hi, n_hi = vis_ranges[latest_img_idx]
-                    full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
+                    look_full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
-                    # Compute local GT coords within crop for coord loss
-                    cbx1, cby1, cbx2, cby2 = crop_bbox
-                    local_gt_x = (gt_cx - cbx1) / max(cbx2 - cbx1, 1e-8)
-                    local_gt_y = (gt_cy - cby1) / max(cby2 - cby1, 1e-8)
-                    local_gt_xy = torch.tensor([local_gt_x, local_gt_y], device=device)
-                    nh_hi, nw_hi = grid_dims[latest_img_idx]
-                    off_hi, n_hi = vis_ranges[latest_img_idx]
-                    grid_info_crop = {
-                        "n_height": nh_hi, "n_width": nw_hi,
-                        "image_offset": off_hi, "n_image_tokens": n_hi,
-                    }
-                    attn, ptr_loss, _, pred_coords, _ = self.model.action_head(
-                        vis_embeds, anchor, labels=full_labels, mask=full_mask,
-                        grid_info=grid_info_crop, gt_coords=local_gt_xy,
-                        coord_loss_weight=self.sa.coord_loss_weight)
-                    if ptr_loss is not None:
-                        total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
+                    attn, look_loss, _ = self.model.dual_head.look(
+                        vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
+                    if look_loss is not None:
+                        total_loss = total_loss + self.sa.look_loss_weight * look_loss
                         n_valid += 1
 
-                    # crop_hit: in teacher forcing mode, evaluate using model's
-                    # round-0 prediction to track actual saccade quality
-                    if self.sa.teacher_forcing_crop and len(round_preds) > 0:
-                        r0_px, r0_py = round_preds[0]
-                        _, virtual_crop_bbox = crop_image(img, r0_px, r0_py,
-                                                            crop_ratio=self.sa.crop_ratio,
-                                                            crop_size=self.sa.crop_size,
-                                                            crop_upscale=self.sa.crop_upscale)
-                        self.metrics["crop_hit"].append(
-                            1 if point_in_bbox(gt_cx, gt_cy, virtual_crop_bbox) else 0)
-                    else:
-                        self.metrics["crop_hit"].append(1)
+                    # ClickHead (Phase 2 only): precise position on crop tokens only
+                    if self.in_click_phase:
+                        crop_vis = vis_embeds[offset_hi:offset_hi + n_hi]
+                        click_labels = high_labels.to(device).unsqueeze(0)
+                        _, click_loss, _ = self.model.dual_head.click(
+                            crop_vis, anchor, labels=click_labels)
+                        if click_loss is not None:
+                            total_loss = total_loss + self.sa.click_loss_weight * click_loss
+                            self.metrics["click_loss"].append(click_loss.item())
+
+                    self.metrics["crop_hit"].append(1)
 
                     # Record prediction and break
                     with torch.no_grad():
@@ -642,27 +539,22 @@ class SaccadeTrainer:
                     break
 
                 else:
-                    # GT not in crop → saccade, binary label on low-res
+                    # GT not in crop → saccade, LookHead labels on low-res
                     low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
                     low_labels[this_crop_mask] = 0.0
 
                     if low_labels.sum() > 0:
-                        full_labels = torch.zeros(1, n_total, device=device)
-                        full_labels[0, :n_low] = low_labels.to(device)
+                        look_full_labels = torch.zeros(1, n_total, device=device)
+                        look_full_labels[0, :n_low] = low_labels.to(device)
 
-                        # Saccade: coord loss on low-res image pointing to GT
-                        grid_info_low = {"n_height": nh0, "n_width": nw0, "image_offset": 0, "n_image_tokens": n_low}
-                        gt_xy_low = torch.tensor([gt_cx, gt_cy], device=device)
-                        attn, ptr_loss, _, _, _ = self.model.action_head(
-                            vis_embeds, anchor, labels=full_labels, mask=full_mask,
-                            grid_info=grid_info_low, gt_coords=gt_xy_low,
-                            coord_loss_weight=self.sa.coord_loss_weight)
-                        if ptr_loss is not None:
-                            total_loss = total_loss + self.sa.pointer_loss_weight * ptr_loss
+                        attn, look_loss, _ = self.model.dual_head.look(
+                            vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
+                        if look_loss is not None:
+                            total_loss = total_loss + self.sa.look_loss_weight * look_loss
                             n_valid += 1
                     else:
                         with torch.no_grad():
-                            attn, _, _, _, _ = self.model.action_head(
+                            attn, _, _ = self.model.dual_head.look(
                                 vis_embeds, anchor, mask=full_mask)
 
                     self.metrics["crop_hit"].append(0)
@@ -684,7 +576,7 @@ class SaccadeTrainer:
                     else:
                         break
 
-        # Track total visual tokens from the last round's input
+        # Track total visual tokens
         try:
             n_img_tokens = (inp["input_ids"][0] == img_tok).sum().item()
             self.metrics["vis_tokens"].append(n_img_tokens)
@@ -702,7 +594,6 @@ class SaccadeTrainer:
         if nv > 0 and loss.requires_grad:
             (loss / max(self.args.gradient_accumulation_steps, 1)).backward()
 
-        # Metrics
         gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
         gcy = (sample["bbox_gt"][1] + sample["bbox_gt"][3]) / 2
         self.metrics["avg_rounds"].append(len(round_preds))
@@ -729,68 +620,6 @@ class SaccadeTrainer:
                 traceback.print_exc()
         return acc_loss, acc_n
 
-    # -- debug ----------------------------------------------------------------
-
-    def _print_sample_debug(self, sample):
-        """Print a complete training sample for debugging the data pipeline."""
-        print("\n" + "=" * 70)
-        print("  DEBUG: First training sample")
-        print("=" * 70)
-        print(f"  image_path: {sample['image_path']}")
-        print(f"  instruction: {sample['instruction']}")
-        print(f"  bbox_gt: {sample['bbox_gt']}")
-        gt_cx = (sample['bbox_gt'][0] + sample['bbox_gt'][2]) / 2
-        gt_cy = (sample['bbox_gt'][1] + sample['bbox_gt'][3]) / 2
-        print(f"  gt_center: ({gt_cx:.4f}, {gt_cy:.4f})")
-
-        # Build round0 inputs to show the actual model input
-        try:
-            from PIL import Image
-            img = Image.open(sample["image_path"]).convert("RGB")
-            print(f"  image_size: {img.size} (w×h)")
-
-            self.builder.reset()
-            r0_inputs, cur_text, cur_images = self.builder.build_round0(
-                sample, sample["instruction"],
-            )
-
-            input_ids = r0_inputs["input_ids"][0]
-            print(f"  input_ids shape: {r0_inputs['input_ids'].shape}")
-            print(f"  pixel_values shape: {r0_inputs['pixel_values'].shape}")
-            print(f"  image_grid_thw: {r0_inputs['image_grid_thw']}")
-
-            # Decode the text tokens (skip image tokens for readability)
-            img_tok_id = self.model.config.image_token_id
-            non_img_ids = input_ids[input_ids != img_tok_id]
-            n_img_tokens = (input_ids == img_tok_id).sum().item()
-            decoded = self.tokenizer.decode(non_img_ids, skip_special_tokens=False)
-            print(f"  n_visual_tokens: {n_img_tokens}")
-            print(f"  text (without img tokens):")
-            # Print first/last part to keep it readable
-            if len(decoded) > 500:
-                print(f"    {decoded[:250]}")
-                print(f"    ... ({len(decoded)} chars total) ...")
-                print(f"    {decoded[-250:]}")
-            else:
-                print(f"    {decoded}")
-
-            # Show special token positions
-            pp_id = self.model.config.pointer_pad_token_id
-            ps_id = self.model.config.pointer_start_token_id
-            pe_id = self.model.config.pointer_end_token_id
-            pp_pos = (input_ids == pp_id).nonzero(as_tuple=True)[0].tolist()
-            ps_pos = (input_ids == ps_id).nonzero(as_tuple=True)[0].tolist()
-            pe_pos = (input_ids == pe_id).nonzero(as_tuple=True)[0].tolist()
-            print(f"  pointer_start positions: {ps_pos}")
-            print(f"  pointer_pad (anchor) positions: {pp_pos}")
-            print(f"  pointer_end positions: {pe_pos}")
-
-            self.builder.reset()  # Clean up
-        except Exception as e:
-            print(f"  (debug failed: {e})")
-
-        print("=" * 70 + "\n")
-
     # -- main train loop ------------------------------------------------------
 
     def train(self):
@@ -801,31 +630,25 @@ class SaccadeTrainer:
 
         if self.rank == 0:
             mode = "Full-param" if not self.sa.use_lora else "LoRA"
-            print(f"=== Saccade Foveation Training (v5: {mode} + ActionHead) ===")
+            print(f"=== Saccade Foveation Training (Dual Head: LookHead + ClickHead, {mode}) ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  low_res={self.sa.low_res_max_pixels}  high_res={self.sa.high_res_max_pixels}")
-            if self.sa.crop_size > 0:
-                print(f"  crop_size={self.sa.crop_size}x{self.sa.crop_size} x{self.sa.crop_upscale} -> {self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  max_saccade_rounds={self.sa.max_saccade_rounds}")
-            else:
-                print(f"  crop_ratio={self.sa.crop_ratio}  max_saccade_rounds={self.sa.max_saccade_rounds}")
-            if self.sa.warmup_rounds_step > 0:
-                print(f"  warmup_rounds_step={self.sa.warmup_rounds_step} (single-round until step {self.sa.warmup_rounds_step})")
-            print(f"  lm_loss_weight={self.sa.lm_loss_weight}  pointer_loss_weight={self.sa.pointer_loss_weight}  coord_loss_weight={self.sa.coord_loss_weight}")
-            print(f"  action_head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
+            print(f"  crop_size={self.sa.crop_size}x{self.sa.crop_size} x{self.sa.crop_upscale} -> "
+                  f"{self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  "
+                  f"max_saccade_rounds={self.sa.max_saccade_rounds}")
+            print(f"  warmup_rounds_step={self.sa.warmup_rounds_step} (single-round until step {self.sa.warmup_rounds_step})")
+            print(f"  click_phase_step={self.sa.click_phase_step} (ClickHead starts at step {self.sa.click_phase_step})")
+            print(f"  lm_loss_weight={self.sa.lm_loss_weight}  look_loss_weight={self.sa.look_loss_weight}  "
+                  f"click_loss_weight={self.sa.click_loss_weight}")
+            print(f"  head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
             if self.sa.use_lora:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
-                print(f"  lora_targets={self.sa.lora_target_modules}")
             print(f"  world_size={self.world_size}  max_steps={max_steps}")
 
-        # Print a complete training sample for debugging
-        if self.rank == 0:
-            self._print_sample_debug(self.train_data[0])
-
         self.optimizer.zero_grad()
-        micro = self.global_step * ga  # correct micro count for resume
+        micro = self.global_step * ga
 
         for epoch in range(epochs):
-            # Deterministic shuffle: same order across all ranks for correct sharding
             epoch_rng = random.Random(42 + epoch)
             epoch_rng.shuffle(self.train_data)
             if self.world_size > 1:
@@ -833,7 +656,6 @@ class SaccadeTrainer:
             else:
                 shard = self.train_data
 
-            # Skip already-processed samples when resuming
             skip_samples = self.global_step * ga * bs
             if skip_samples > 0 and skip_samples < len(shard):
                 if self.rank == 0:
@@ -850,7 +672,6 @@ class SaccadeTrainer:
                 loss_val, nv = self.train_step(shard[i:i+bs])
                 micro += 1
                 if micro % ga == 0:
-                    # Sync gradients across GPUs before optimizer step
                     if self.world_size > 1:
                         for p in self.model.parameters():
                             if p.grad is not None:
@@ -862,29 +683,32 @@ class SaccadeTrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
 
-                    # Log when switching from single-round warmup to multi-round
-                    if (self.rank == 0
-                            and self.sa.warmup_rounds_step > 0
-                            and self.global_step == self.sa.warmup_rounds_step):
-                        print(f"  *** Step {self.global_step}: switching from single-round to "
-                              f"max_saccade_rounds={self.sa.max_saccade_rounds} ***")
+                    # Log phase transitions
+                    if self.rank == 0:
+                        if (self.sa.warmup_rounds_step > 0
+                                and self.global_step == self.sa.warmup_rounds_step):
+                            print(f"  *** Step {self.global_step}: switching to "
+                                  f"max_saccade_rounds={self.sa.max_saccade_rounds} ***")
+                        if self.global_step == self.sa.click_phase_step:
+                            print(f"  *** Step {self.global_step}: ClickHead activated (Phase 2) ***")
 
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     if micro % ga == 0:
-                        n_since_last = self.args.logging_steps * ga * self.world_size * self.args.per_device_train_batch_size
+                        n_since_last = self.args.logging_steps * ga * self.world_size * bs
                         def ar(k, n=n_since_last):
                             vals = self.metrics[k][-n:]
                             return sum(vals) / max(len(vals), 1)
                         all_lrs = self.scheduler.get_last_lr()
-                        lr_val = all_lrs[0]  # action_head lr
-                        bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val  # backbone lr
-                        lm_loss_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
-                        beta_str = f" β={ar('beta'):.2f}" if self.metrics["beta"] else ""
-                        print(f"  [Step {self.global_step}] loss={loss_val:.4f}{lm_loss_str} "
-                              f"hit={ar('hit_rate'):.1%} final_dist={ar('avg_dist'):.4f} "
+                        lr_val = all_lrs[0]
+                        bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val
+                        lm_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
+                        click_str = f" click={ar('click_loss'):.3f}" if self.metrics["click_loss"] else ""
+                        phase = "P2(Look+Click)" if self.in_click_phase else "P1(Look)"
+                        print(f"  [Step {self.global_step}] [{phase}] loss={loss_val:.4f}{lm_str}{click_str} "
+                              f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
-                              f"crop_hit={ar('crop_hit'):.1%} vis_tokens={ar('vis_tokens'):.0f}{beta_str} "
+                              f"crop_hit={ar('crop_hit'):.1%} vis_tok={ar('vis_tokens'):.0f} "
                               f"head_lr={lr_val:.2e} bb_lr={bb_lr_val:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
@@ -913,7 +737,6 @@ class SaccadeTrainer:
         os.makedirs(p, exist_ok=True)
         self.model.save_pretrained(p)
         self.tokenizer.save_pretrained(p)
-        # Save training state for resume
         torch.save({
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
@@ -929,7 +752,6 @@ class SaccadeTrainer:
 # -- Main --------------------------------------------------------------------
 
 def main():
-    # Distributed setup (torchrun sets RANK, LOCAL_RANK, WORLD_SIZE)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
@@ -952,13 +774,12 @@ def main():
         use_lora=sa.use_lora,
     )
 
-    # Load model weights from checkpoint if resuming
+    # Load checkpoint if resuming
     if sa.resume_ckpt:
         ckpt = sa.resume_ckpt
         if rank == 0:
             print(f"Loading model weights from checkpoint: {ckpt}")
         if sa.use_lora:
-            # Load LoRA adapter weights
             from peft import set_peft_model_state_dict
             adapter_file = os.path.join(ckpt, "adapter_model.safetensors")
             if os.path.exists(adapter_file):
@@ -969,17 +790,28 @@ def main():
                                            map_location="cpu", weights_only=True)
             set_peft_model_state_dict(model.backbone, adapter_state)
         else:
-            # Full model: load backbone state dict
             model_file = os.path.join(ckpt, "model.safetensors")
             if os.path.exists(model_file):
                 from safetensors.torch import load_file
                 state = load_file(model_file)
                 model.backbone.load_state_dict(state, strict=False)
-        # Load action head weights
-        head_path = os.path.join(ckpt, "action_head.pt")
-        if os.path.exists(head_path):
-            model.action_head.load_state_dict(
-                torch.load(head_path, map_location="cpu", weights_only=True))
+
+        # Load dual head (or old action_head with backward compat)
+        dual_path = os.path.join(ckpt, "dual_head.pt")
+        old_path = os.path.join(ckpt, "action_head.pt")
+        if os.path.exists(dual_path):
+            model.dual_head.load_state_dict(
+                torch.load(dual_path, map_location="cpu", weights_only=True))
+        elif os.path.exists(old_path):
+            old_state = torch.load(old_path, map_location="cpu", weights_only=True)
+            look_state = {}
+            for k, v in old_state.items():
+                if k.startswith("bbox_head") or k == "beta":
+                    continue
+                look_state[f"look_head.{k}"] = v
+            model.dual_head.load_state_dict(look_state, strict=False)
+            if rank == 0:
+                print(f"  Loaded old ActionHead → LookHead (backward compat)")
         if rank == 0:
             print(f"  Model weights loaded from {ckpt}")
 

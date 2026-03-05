@@ -1,16 +1,10 @@
-"""Inference utilities for saccade foveation (v5).
+"""Inference utilities for saccade foveation with Dual Head.
 
 Multi-round saccade:
-  Round 0: low-res full image → action head → argmax → crop 3×3 patches around it
-  Round N: low-res + ALL historical crops (visible) → action head
-           → argmax in high-res crop → stop (found target)
+  Round 0: low-res full image → LookHead → argmax → crop around it
+  Round N: low-res + ALL historical crops (visible) → LookHead
+           → argmax in high-res crop → ClickHead on crop tokens → precise (x,y) → stop
            → argmax in low-res → saccade (continue)
-
-Key changes from v4:
-  - Soft-argmax disabled (beta=5 makes it ≈ argmax anyway)
-  - Crop = 3×3 patch region around selected patch (adaptive to image resolution)
-  - Old crops NOT masked (matches training)
-  - Stop condition: attended == "high"
 """
 
 from typing import List, Tuple
@@ -40,36 +34,22 @@ def get_prediction_region_point(
     1. Threshold activated patches (> activation_threshold * max_score).
     2. BFS to find connected regions (4-directional).
     3. Return weighted center of highest-scoring region.
-
-    Args:
-        attn_scores: (n_vis,) attention weights.
-        n_width: grid width.
-        n_height: grid height.
-        activation_threshold: fraction of max score for thresholding.
-
-    Returns:
-        best_point: (x, y) normalised coordinates.
-        sorted_centers: all region centers sorted by score.
-        sorted_scores: corresponding average activation scores.
     """
     scores = attn_scores.float().cpu()
     max_score = scores.max().item()
     threshold = max_score * activation_threshold
 
-    # Build set of activated patches
-    activated = {}  # flat_idx → score
+    activated = {}
     for idx in range(scores.numel()):
         if scores[idx].item() > threshold:
             activated[idx] = scores[idx].item()
 
     if not activated:
-        # Fallback: argmax
         idx = scores.argmax().item()
         x = (idx % n_width + 0.5) / n_width
         y = (idx // n_width + 0.5) / n_height
         return (x, y), [(x, y)], [scores[idx].item()]
 
-    # BFS to find connected regions
     visited = set()
     regions = []
 
@@ -92,7 +72,6 @@ def get_prediction_region_point(
                     queue.append(nidx)
         regions.append(region)
 
-    # Score each region and compute weighted center
     region_info = []
     for region in regions:
         total_w = sum(s for _, _, s in region)
@@ -109,53 +88,6 @@ def get_prediction_region_point(
     return best_point, sorted_centers, sorted_scores
 
 
-def _compute_patch_crop_bbox(attn_1d, n_width, n_height, img_w, img_h,
-                              crop_patches_w=8, crop_patches_h=6):
-    """Compute crop bbox covering N×M patches around the argmax patch.
-
-    Args:
-        crop_patches_w: number of patches wide (default 8).
-        crop_patches_h: number of patches tall (default 6).
-
-    Returns:
-        (cx_norm, cy_norm): center of the region in normalised coords.
-        crop_size_pixels: side length in pixels (square, takes max of w/h).
-    """
-    # Find argmax patch
-    argmax_idx = attn_1d.argmax().item()
-    row = argmax_idx // n_width
-    col = argmax_idx % n_width
-
-    # Region bounds (clamped to grid)
-    half_w = crop_patches_w // 2
-    half_h = crop_patches_h // 2
-    r_start = max(0, row - half_h)
-    r_end = min(n_height - 1, row + half_h - 1 + (crop_patches_h % 2))
-    c_start = max(0, col - half_w)
-    c_end = min(n_width - 1, col + half_w - 1 + (crop_patches_w % 2))
-
-    # Center of the 3×3 region in normalised coords
-    cx = ((c_start + c_end) / 2 + 0.5) / n_width
-    cy = ((r_start + r_end) / 2 + 0.5) / n_height
-
-    # Crop size in pixels: cover the 3×3 patch region
-    # Each patch covers (img_w / n_width) × (img_h / n_height) pixels
-    patch_w = img_w / n_width
-    patch_h = img_h / n_height
-    n_cols = c_end - c_start + 1
-    n_rows = r_end - r_start + 1
-
-    # Use the larger dimension to make a square crop
-    crop_w = int(n_cols * patch_w)
-    crop_h = int(n_rows * patch_h)
-    crop_size = max(crop_w, crop_h)
-
-    # Round to nearest multiple of 28 for clean token grid
-    crop_size = max(28, ((crop_size + 13) // 28) * 28)
-
-    return cx, cy, crop_size
-
-
 def run_saccade_inference(
     image,
     image_path,
@@ -164,36 +96,35 @@ def run_saccade_inference(
     tokenizer,
     builder: MultiRoundInputBuilder,
     max_rounds: int = 3,
-    crop_ratio: float = 0.0,
-    crop_size: int = 252,
+    crop_size: int = 308,
     crop_upscale: int = 3,
-    crop_upsample_pixels: int = 0,
-    crop_target_pixels: int = 0,
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
-    use_adaptive_crop: bool = True,
-    use_bbox_pred: bool = False,
+    use_click_head: bool = True,
 ) -> dict:
-    """Multi-round saccade inference.
+    """Multi-round saccade inference with LookHead + ClickHead.
 
-    Round 0: low-res full image → action head → argmax → crop 3×3 patches.
-    Round 1+: low-res + all crops (visible) → action head
-              → argmax in high-res → stop; argmax in low-res → saccade.
+    Round 0: low-res full image → LookHead → BFS region → crop center.
+    Round 1+: low-res + all crops (visible) → LookHead
+              → argmax in high-res → ClickHead on crop → precise (x,y) → stop
+              → argmax in low-res → saccade.
 
     Args:
-        use_adaptive_crop: if True, crop 3×3 patches around argmax (adaptive size).
-                          if False, use fixed crop_size × crop_upscale.
+        use_click_head: if True, use ClickHead for precise positioning when
+                       LookHead selects a high-res crop. If False, use
+                       LookHead's attention directly (Phase 1 behavior).
 
     Returns:
         dict with topk_points, n_width, n_height, num_rounds, total_vis_tokens.
     """
-    saccade = SaccadeLoop(max_rounds=max_rounds, crop_ratio=crop_ratio,
-                          crop_size=crop_size, crop_upscale=crop_upscale)
+    saccade = SaccadeLoop(max_rounds=max_rounds, crop_size=crop_size, crop_upscale=crop_upscale)
     state = saccade.new_state()
     builder.reset()
 
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
+
+    # Find visual module for merge_size
     _backbone = model.backbone
     if hasattr(_backbone, 'base_model') and hasattr(_backbone.base_model, 'model'):
         _inner = _backbone.base_model.model
@@ -233,29 +164,14 @@ def run_saccade_inference(
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    # No grid_info → no soft-argmax, just get attention weights
-    attn0, _, _, _, pred_bbox0 = model.action_head(vis_embeds, anchor)
+    # LookHead on low-res
+    attn0, _, _ = model.dual_head.look(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
-    # Use BFS region prediction for focus point
     n_low = vis_ranges[0][1]
     low_attn = attn_1d[:n_low]
     best_pt, _, _ = get_prediction_region_point(low_attn, nw0, nh0, activation_threshold)
     focus_x, focus_y = best_pt
-
-    # Compute crop size
-    if pred_bbox0 is not None and use_bbox_pred:
-        # Use model's predicted bbox (w, h) to determine crop size
-        pred_w, pred_h = pred_bbox0[0].item(), pred_bbox0[1].item()
-        # Convert normalised (w, h) to pixels, add padding (×2 for margin)
-        crop_w_px = int(pred_w * img_w * 2)
-        crop_h_px = int(pred_h * img_h * 2)
-        adaptive_crop_size = max(crop_w_px, crop_h_px)
-        adaptive_crop_size = max(28, ((adaptive_crop_size + 13) // 28) * 28)
-    elif use_adaptive_crop:
-        _, _, adaptive_crop_size = _compute_patch_crop_bbox(low_attn, nw0, nh0, img_w, img_h)
-    else:
-        adaptive_crop_size = crop_size
 
     decision = saccade.decide_round0(state, focus_x, focus_y)
     nw_final, nh_final = nw0, nh0
@@ -267,15 +183,11 @@ def run_saccade_inference(
             break
 
         # Crop around current focus
-        current_crop_size = adaptive_crop_size if use_adaptive_crop else crop_size
         cropped, crop_bbox = crop_image(image, focus_x, focus_y,
-                                        crop_ratio=crop_ratio,
-                                        crop_size=current_crop_size,
-                                        crop_upscale=crop_upscale,
-                                        upsample_pixels=crop_upsample_pixels,
-                                        crop_target_pixels=crop_target_pixels)
+                                        crop_size=crop_size,
+                                        crop_upscale=crop_upscale)
 
-        # Extend context (accumulate all crops)
+        # Extend context
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
                 cur_text, cur_images, cropped, crop_bbox,
@@ -305,7 +217,7 @@ def run_saccade_inference(
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
         nh_low, nw_low = grid_dims[0]
 
-        # Mask: only current crop's overlap on low-res. Old crops NOT masked.
+        # Mask: current crop overlap on low-res
         this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
         n_total = sum(r[1] for r in vis_ranges)
@@ -314,11 +226,10 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        # Action head (no soft-argmax)
-        attn_ri, _, _, _, pred_bbox_ri = model.action_head(vis_embeds, anchor, mask=full_mask)
+        # LookHead: decide where attention goes
+        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
         attn_1d = attn_ri.squeeze(0)
 
-        # Identify which image has argmax
         img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
         info = builder.image_infos[img_idx]
 
@@ -327,16 +238,34 @@ def run_saccade_inference(
         else:
             break
 
-        # Compute local coords via BFS in the attended image
-        off_a, n_a = vis_ranges[img_idx]
-        img_attn = attn_1d[off_a:off_a + n_a]
-        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-
-        bx1, by1, bx2, by2 = info.global_bbox
-        global_x = bx1 + lx * (bx2 - bx1)
-        global_y = by1 + ly * (by2 - by1)
-
         attended_source = "high" if info.resolution == "high" else "low"
+
+        if attended_source == "high" and use_click_head:
+            # LookHead chose a high-res crop → ClickHead for precise position
+            off_a, n_a = vis_ranges[img_idx]
+            crop_vis = vis_embeds[off_a:off_a + n_a]
+
+            click_attn, _, _ = model.dual_head.click(crop_vis, anchor)
+            click_1d = click_attn.squeeze(0)
+
+            # Use BFS on ClickHead attention for precise positioning
+            click_pt, _, _ = get_prediction_region_point(
+                click_1d, nw_a, nh_a, activation_threshold)
+            lx, ly = click_pt
+
+            bx1, by1, bx2, by2 = info.global_bbox
+            global_x = bx1 + lx * (bx2 - bx1)
+            global_y = by1 + ly * (by2 - by1)
+        else:
+            # Use LookHead attention directly
+            off_a, n_a = vis_ranges[img_idx]
+            img_attn = attn_1d[off_a:off_a + n_a]
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+
+            bx1, by1, bx2, by2 = info.global_bbox
+            global_x = bx1 + lx * (bx2 - bx1)
+            global_y = by1 + ly * (by2 - by1)
+
         decision = saccade.decide_saccade(state, attended_source, global_x, global_y)
 
         nw_final, nh_final = nw_a, nh_a
@@ -345,13 +274,8 @@ def run_saccade_inference(
         if decision["action"] == "stop":
             break
 
-        # Saccade: update focus and recompute adaptive crop size
+        # Saccade: update focus
         focus_x, focus_y = global_x, global_y
-        if use_adaptive_crop:
-            # Recompute crop size based on low-res grid for next round
-            low_attn_new = attn_1d[:vis_ranges[0][1]]
-            _, _, adaptive_crop_size = _compute_patch_crop_bbox(
-                low_attn_new, nw_low, nh_low, img_w, img_h)
 
     return {
         "topk_points": [final_point],

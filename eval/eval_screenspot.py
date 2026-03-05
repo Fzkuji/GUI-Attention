@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 from gui_attention.builder import MultiRoundInputBuilder
 from gui_attention.inference import run_saccade_inference
-from gui_attention.model import Qwen25VLWithActionHead
+from gui_attention.model import Qwen25VLWithDualHead
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -409,11 +409,9 @@ def evaluate_sample(sample, model, tokenizer, builder, args, device, tmp_dir, ra
         image, image_path, instruction,
         model, tokenizer, builder,
         max_rounds=args.rounds,
-        crop_ratio=args.crop_ratio,
         crop_size=args.crop_size,
         crop_upscale=args.crop_upscale,
         device=str(device),
-        use_adaptive_crop=args.adaptive_crop,
     )
     t_elapsed = time.time() - t_start
 
@@ -599,7 +597,7 @@ def main():
     # Load model
     if is_main:
         print(f"Loading model: {args.checkpoint}")
-    model, tokenizer = Qwen25VLWithActionHead.load_pretrained(
+    model, tokenizer = Qwen25VLWithDualHead.load_pretrained(
         args.checkpoint,
         base_model_name_or_path=args.base_model,
         device=args.device,
