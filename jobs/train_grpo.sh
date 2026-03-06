@@ -75,7 +75,7 @@ echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
     src/gui_attention/grpo.py \
-    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/GUI-AIMA-3B}" \
+    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}" \
     --resume_ckpt "$SFT_CKPT" \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \

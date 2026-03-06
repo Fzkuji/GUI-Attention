@@ -215,7 +215,7 @@ class GRPOTrainer:
         for ri in range(max_rounds):
             if ri == 0:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample, sample["instruction"])
+                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 if inp.get("pixel_values") is not None:
                     inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
@@ -272,7 +272,7 @@ class GRPOTrainer:
                 # Rebuild context
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample, sample["instruction"])
+                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
                 for prev_ri in range(1, ri):
                     prev_px, prev_py = round_preds[prev_ri]  # round_preds[1] = first crop pred
                     if prev_ri - 1 < len(crop_bboxes):
@@ -282,12 +282,14 @@ class GRPOTrainer:
                                                           crop_upscale=self.ga.crop_upscale)
                         try:
                             r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                                cur_text, cur_images, prev_crop, prev_bbox)
+                                cur_text, cur_images, prev_crop, prev_bbox,
+                                use_dual_tokens=True)
                         except Exception:
                             break
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                        cur_text, cur_images, cropped, crop_bbox)
+                        cur_text, cur_images, cropped, crop_bbox,
+                        use_dual_tokens=True)
                 except Exception:
                     break
 
@@ -545,7 +547,7 @@ class GRPOTrainer:
         for ri in range(traj.n_rounds):
             if ri == 0:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample, sample["instruction"])
+                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 if inp.get("pixel_values") is not None:
                     inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
@@ -595,7 +597,7 @@ class GRPOTrainer:
                 # Rebuild context
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample, sample["instruction"])
+                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
                 for prev_ri in range(1, ri):
                     pp_x, pp_y = traj.round_preds[prev_ri - 1]
                     prev_crop, prev_bbox = crop_image(img, pp_x, pp_y,
@@ -603,12 +605,14 @@ class GRPOTrainer:
                                                       crop_upscale=self.ga.crop_upscale)
                     try:
                         r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                            cur_text, cur_images, prev_crop, prev_bbox)
+                            cur_text, cur_images, prev_crop, prev_bbox,
+                            use_dual_tokens=True)
                     except Exception:
                         return None
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                        cur_text, cur_images, cropped, crop_bbox)
+                        cur_text, cur_images, cropped, crop_bbox,
+                        use_dual_tokens=True)
                 except Exception:
                     return None
 
@@ -675,15 +679,61 @@ class GRPOTrainer:
                         log_prob = F.log_softmax(logits_1d, dim=-1)[best_idx]
                         total_log_prob = total_log_prob + log_prob
 
-        # ClickHead log_prob (if ClickHead was used)
-        if traj.click_log_prob != 0.0 and traj.hit is not None:
-            # We'd need to replay ClickHead too, but for now use stored log_prob
-            # TODO: full differentiable replay of ClickHead
-            pass
+        # ClickHead differentiable replay (if trajectory ended with a click)
+        if traj.click_log_prob != 0.0 and traj.n_rounds > 1:
+            # The last round's forward is already done above.
+            # Re-run ClickHead on accumulated crop tokens.
+            try:
+                crop_vis_list = []
+                crop_meta = []
+                for ci_idx in range(1, len(vis_ranges)):
+                    if ci_idx >= len(grid_dims) or ci_idx >= len(self.builder.image_infos):
+                        continue
+                    ci_off, ci_n = vis_ranges[ci_idx]
+                    ci_info = self.builder.image_infos[ci_idx]
+                    ci_nh, ci_nw = grid_dims[ci_idx]
+                    crop_vis_list.append(vis_embeds[ci_off:ci_off + ci_n])
+                    crop_meta.append((ci_n, ci_nw, ci_nh, ci_info.global_bbox))
 
-        # GRPO loss: -advantage * total_log_prob
+                if crop_vis_list:
+                    combined = torch.cat(crop_vis_list, dim=0)
+                    _, _, click_logits = self.model.dual_head.click(combined, anchor)
+                    click_logits_1d = click_logits.squeeze(0) / temperature
+
+                    # Reconstruct which token was clicked
+                    cx, cy = traj.click_pred
+                    click_idx = 0
+                    running = 0
+                    for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
+                        bx1, by1, bx2, by2 = ci_bbox
+                        if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                            local_x = (cx - bx1) / max(bx2 - bx1, 1e-8)
+                            local_y = (cy - by1) / max(by2 - by1, 1e-8)
+                            col = min(max(int(local_x * ci_nw), 0), ci_nw - 1)
+                            row = min(max(int(local_y * ci_nh), 0), ci_nh - 1)
+                            click_idx = running + row * ci_nw + col
+                            break
+                        running += ci_n
+
+                    if click_idx < click_logits_1d.shape[0]:
+                        click_lp = F.log_softmax(click_logits_1d, dim=-1)[click_idx]
+                        total_log_prob = total_log_prob + click_lp
+            except Exception:
+                pass  # If ClickHead replay fails, still use LookHead log_probs
+
+        # KL penalty against reference model
+        kl_penalty = torch.tensor(0.0, device=device)
+        if self.ga.kl_coeff > 0 and self.ref_model is not None:
+            # Simple parameter-space KL approximation:
+            # sum of squared diff between current and ref params
+            for p, p_ref in zip(self.model.dual_head.parameters(),
+                                self.ref_model.dual_head.parameters()):
+                kl_penalty = kl_penalty + ((p - p_ref.detach()) ** 2).sum()
+            kl_penalty = self.ga.kl_coeff * kl_penalty
+
+        # GRPO loss: -advantage * total_log_prob + KL penalty
         advantage = traj.reward
-        loss = -advantage * total_log_prob
+        loss = -advantage * total_log_prob + kl_penalty
 
         return loss
 
