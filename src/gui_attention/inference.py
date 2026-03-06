@@ -288,16 +288,23 @@ def run_saccade_inference(
         attended_source = "high" if info.resolution == "high" else "low"
         state.record(global_x, global_y, attended_source)
 
-        # Continue saccading regardless of attended source; stop only at max_rounds.
-        focus_x, focus_y = global_x, global_y
-        round_preds.append((focus_x, focus_y))
-        last_look_point = (global_x, global_y)
-        last_look_dims = (nw_a, nh_a)
-
+        # Save state for ClickHead
         last_vis_embeds = vis_embeds
         last_vis_ranges = vis_ranges
         last_grid_dims = grid_dims
         last_anchor = anchor
+
+        if attended_source == "high":
+            # LookHead chose crop → model thinks target is in crop → stop & use ClickHead
+            last_look_point = (global_x, global_y)
+            last_look_dims = (nw_a, nh_a)
+            break
+        else:
+            # LookHead chose low-res → saccade to new position
+            focus_x, focus_y = global_x, global_y
+            round_preds.append((focus_x, focus_y))
+            last_look_point = (global_x, global_y)
+            last_look_dims = (nw_a, nh_a)
 
     # Final prediction: ClickHead on all accumulated crop tokens.
     if (
