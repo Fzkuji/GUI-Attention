@@ -124,7 +124,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --save_steps 500 \
     --save_total_limit 3 \
     --bf16 true \
-    --gradient_checkpointing false \
+    --gradient_checkpointing true \
     --report_to none \
     $RESUME_ARG \
     2>&1 | tee "$LOG_DIR/train_v15_dual.txt"

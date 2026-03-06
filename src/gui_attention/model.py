@@ -100,6 +100,8 @@ def build_model(
         attn_implementation=attn_implementation,
         torch_dtype=torch_dtype,
     )
+    backbone.config.use_cache = False
+
     if gradient_checkpointing:
         backbone.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}

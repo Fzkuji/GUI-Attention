@@ -305,13 +305,14 @@ class SaccadeTrainer:
     # -- multi-round saccade forward ----------------------------------------
 
     def _forward_sample(self, sample):
-        """Multi-round training with KV cache incremental forward.
+        """Multi-round training with LookHead + optional ClickHead.
 
-        Each round: build full context → compute M-RoPE position_ids →
-        forward only NEW tokens with past_key_values → accumulate hidden
-        states → compute LookHead/ClickHead/LM losses with full gradients.
+        All rounds use LookHead for saccade. When GT is in crop → break.
+        After click_phase_step, ClickHead also runs on ALL accumulated
+        crop visual tokens for precise positioning.
 
         Returns (total_loss, num_valid_rounds, round_preds, click_pred).
+          click_pred: (x, y) from ClickHead if available, else None.
         """
         device = _get_model_device(self.model)
         try:
@@ -328,33 +329,24 @@ class SaccadeTrainer:
         if self.sa.use_dual_tokens:
             look_id = self.model.config.look_pad_token_id
             click_id = self.model.config.click_pad_token_id
+            # Use all three as anchor sources (look_pad, click_pad, pointer_pad)
             pp_id = [look_id, click_id, pp_id]
         merge = _get_visual_module(self.model).spatial_merge_size
-        rope_backbone = _get_backbone_for_rope(self.model)
 
         self.builder.reset()
         self.model.train()
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         n_valid = 0
         round_preds = []
-        click_pred = None
+        click_pred = None  # ClickHead prediction (global coords)
 
-        # Track all crop info for ClickHead
+        # Track all crop info for ClickHead at the end
+        # Each entry: (vis_embeds_slice, grid_h, grid_w, crop_bbox)
         all_crop_info = []
-        crop_bboxes = []  # (crop_bbox, gt_in_crop)
-        crop_hit_round = None
-        nh0, nw0 = None, None
+        crop_hit_round = None  # which round first covered GT (None = never)
 
         max_rounds = self.max_rounds
         pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
-
-        # KV cache state
-        past_kv = None
-        prev_seq_len = 0
-        prev_n_pixels = 0
-        prev_n_images = 0
-        accumulated_hs = []     # list of (1, new_seq_len, d) tensors
-        accumulated_vis = []    # list of (n_vis, d) tensors
 
         for ri in range(max_rounds):
             if ri == 0:
@@ -364,6 +356,7 @@ class SaccadeTrainer:
                     use_dual_tokens=self.sa.use_dual_tokens,
                 )
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
+                # Enable grad on pixel_values for gradient checkpointing
                 if inp.get("pixel_values") is not None:
                     inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
 
@@ -372,47 +365,27 @@ class SaccadeTrainer:
                 if self.sa.lm_loss_weight > 0:
                     lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
 
-                # Compute M-RoPE position_ids
-                position_ids, rope_deltas = rope_backbone.get_rope_index(
-                    inp["input_ids"], inp.get("image_grid_thw"), None,
-                    inp.get("attention_mask"),
-                )
-                position_ids = position_ids.to(device)
-
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
                     labels=lm_labels,
-                    position_ids=position_ids,
-                    use_cache=True,
                 )
-                past_kv = outputs.past_key_values
-                prev_seq_len = inp["input_ids"].shape[1]
-                prev_n_pixels = inp["pixel_values"].shape[0] if inp.get("pixel_values") is not None else 0
-                prev_n_images = inp["image_grid_thw"].shape[0] if inp.get("image_grid_thw") is not None else 0
-
                 last_hs = outputs.hidden_states[-1]
-                accumulated_hs.append(last_hs)
 
                 # LM loss
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
                     total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
-                # Visual embeds (pre-LLM ViT output)
+                # Visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
-                accumulated_vis.append(vis_embeds)
-
-                # Use accumulated hidden states for vis_ranges and anchor
-                combined_hs = torch.cat(accumulated_hs, dim=1)
-                combined_vis = torch.cat(accumulated_vis, dim=0)
                 _, vis_ranges = extract_visual_hidden_states(
-                    combined_hs, inp["input_ids"], img_tok)
+                    last_hs, inp["input_ids"], img_tok)
                 anchor = extract_anchor_hidden_states(
-                    combined_hs, inp["input_ids"], pp_id, n=0)
+                    last_hs, inp["input_ids"], pp_id, n=0)
 
                 if vis_embeds is None or anchor is None:
                     break
@@ -424,13 +397,14 @@ class SaccadeTrainer:
                 look_labels = compute_binary_labels(nh0, nw0, bbox_gt,
                                                     soft=False).to(device).unsqueeze(0)
                 attn, look_loss, _ = self.model.dual_head.look(
-                    combined_vis, anchor, labels=look_labels)
+                    vis_embeds, anchor, labels=look_labels)
 
                 if look_loss is not None:
                     total_loss = total_loss + self.sa.look_loss_weight * look_loss
                     n_valid += 1
 
                 with torch.no_grad():
+                    # Decode prediction from LookHead attention
                     _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
                     low_attn = attn.squeeze(0)[vis_ranges[0][0]:vis_ranges[0][0]+vis_ranges[0][1]]
                     pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
@@ -441,7 +415,7 @@ class SaccadeTrainer:
                                                     crop_size=self.sa.crop_size,
                                                     crop_upscale=self.sa.crop_upscale)
                     if point_in_bbox(gt_cx, gt_cy, virtual_bbox):
-                        crop_hit_round = 1
+                        crop_hit_round = 1  # round 0's crop = crop round 1
 
             else:
                 # ===== Round ri: Crop =====
@@ -450,11 +424,29 @@ class SaccadeTrainer:
                                                   crop_size=self.sa.crop_size,
                                                   crop_upscale=self.sa.crop_upscale)
                 gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
-                crop_bboxes.append((crop_bbox, gt_in_crop))
                 if gt_in_crop and crop_hit_round is None:
-                    crop_hit_round = ri
+                    crop_hit_round = ri  # first round that covered GT
 
-                # Extend context with new crop (builder tracks full context)
+                # Re-build full context: low-res + all crops
+                self.builder.reset()
+                r_inputs, cur_text, cur_images = self.builder.build_round0(
+                    sample, sample["instruction"],
+                    use_dual_tokens=self.sa.use_dual_tokens,
+                )
+                for prev_ri in range(1, ri):
+                    prev_px, prev_py = round_preds[prev_ri - 1]
+                    prev_crop, prev_bbox = crop_image(img, prev_px, prev_py,
+                                                       crop_size=self.sa.crop_size,
+                                                       crop_upscale=self.sa.crop_upscale)
+                    # Previous crops were always "look" (not the final click)
+                    prev_gt_in = point_in_bbox(gt_cx, gt_cy, prev_bbox)
+                    try:
+                        r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                            cur_text, cur_images, prev_crop, prev_bbox,
+                            gt_in_crop=prev_gt_in, use_dual_tokens=self.sa.use_dual_tokens,
+                        )
+                    except Exception:
+                        break
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
@@ -463,78 +455,41 @@ class SaccadeTrainer:
                 except Exception:
                     break
 
-                full_inp = {k: v.to(device) for k, v in r_inputs.items()}
+                inp = {k: v.to(device) for k, v in r_inputs.items()}
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
 
-                # Compute M-RoPE position_ids on FULL context, slice new part
-                full_position_ids, _ = rope_backbone.get_rope_index(
-                    full_inp["input_ids"], full_inp.get("image_grid_thw"), None,
-                    full_inp.get("attention_mask"),
-                )
-                full_position_ids = full_position_ids.to(device)
-                new_position_ids = full_position_ids[:, :, prev_seq_len:]
-
-                # Extract incremental tokens
-                new_input_ids = full_inp["input_ids"][:, prev_seq_len:]
-                new_attention_mask = full_inp["attention_mask"] if full_inp.get("attention_mask") is not None else None
-
-                # Extract incremental pixel_values and image_grid_thw
-                cur_n_pixels = full_inp["pixel_values"].shape[0] if full_inp.get("pixel_values") is not None else 0
-                cur_n_images = full_inp["image_grid_thw"].shape[0] if full_inp.get("image_grid_thw") is not None else 0
-                new_pixel_values = full_inp["pixel_values"][prev_n_pixels:] if cur_n_pixels > prev_n_pixels else None
-                new_image_grid_thw = full_inp["image_grid_thw"][prev_n_images:] if cur_n_images > prev_n_images else None
-
-                if new_pixel_values is not None:
-                    new_pixel_values = new_pixel_values.requires_grad_(True)
-
-                # LM labels on full context, but model only sees new tokens
+                # LM labels
                 lm_labels = None
                 if self.sa.lm_loss_weight > 0:
-                    full_lm_labels = make_lm_labels(full_inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
-                    lm_labels = full_lm_labels[:, prev_seq_len:]
+                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
 
-                # Incremental forward with KV cache
                 outputs = self.model(
-                    input_ids=new_input_ids,
-                    attention_mask=new_attention_mask,
-                    pixel_values=new_pixel_values,
-                    image_grid_thw=new_image_grid_thw,
+                    input_ids=inp["input_ids"],
+                    attention_mask=inp.get("attention_mask"),
+                    pixel_values=inp["pixel_values"],
+                    image_grid_thw=inp.get("image_grid_thw"),
                     labels=lm_labels,
-                    position_ids=new_position_ids,
-                    past_key_values=past_kv,
-                    use_cache=True,
                 )
-                past_kv = outputs.past_key_values
-                prev_seq_len = full_inp["input_ids"].shape[1]
-                prev_n_pixels = cur_n_pixels
-                prev_n_images = cur_n_images
-
-                new_hs = outputs.hidden_states[-1]
-                accumulated_hs.append(new_hs)
+                last_hs = outputs.hidden_states[-1]
 
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
                     total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
-                # New crop visual embeds
-                if new_pixel_values is not None and new_image_grid_thw is not None:
-                    new_vis = self.model.extract_visual_embeds(
-                        new_input_ids, new_pixel_values, new_image_grid_thw)
-                    accumulated_vis.append(new_vis)
-
-                # Combined hidden states + visual embeds
-                combined_hs = torch.cat(accumulated_hs, dim=1)
-                combined_vis = torch.cat(accumulated_vis, dim=0)
+                vis_embeds = self.model.extract_visual_embeds(
+                    inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
                 _, vis_ranges = extract_visual_hidden_states(
-                    combined_hs, full_inp["input_ids"], img_tok)
+                    last_hs, inp["input_ids"], img_tok)
                 anchor = extract_anchor_hidden_states(
-                    combined_hs, full_inp["input_ids"], pp_id, n=ri)
+                    last_hs, inp["input_ids"], pp_id, n=ri)
 
-                if combined_vis is None or anchor is None or len(vis_ranges) < ri + 1:
+                if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
                     break
 
-                grid_dims = self.builder.get_image_grid_dims(full_inp["image_grid_thw"], merge)
+                grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 n_low = vis_ranges[0][1]
-                n_total = combined_vis.shape[0]
+                n_total = vis_embeds.shape[0]
                 latest_img_idx = len(vis_ranges) - 1
 
                 # Mask: current crop overlap in low-res + old crop tokens
@@ -545,7 +500,7 @@ class SaccadeTrainer:
                     off_prev, ntok_prev = vis_ranges[prev_i]
                     full_mask[off_prev:off_prev + ntok_prev] = True
 
-                # Save crop info for ClickHead
+                # Save crop info for ClickHead later
                 offset_hi, n_hi = vis_ranges[latest_img_idx]
                 nh_high, nw_high = grid_dims[latest_img_idx]
                 all_crop_info.append({
@@ -569,22 +524,27 @@ class SaccadeTrainer:
                     else:
                         high_labels = torch.zeros(n_hi)
 
+                    # LookHead: labels on crop tokens (coarse: which crop has GT)
                     look_full_labels = torch.zeros(1, n_total, device=device)
                     look_full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
 
                     attn, look_loss, _ = self.model.dual_head.look(
-                        combined_vis, anchor, labels=look_full_labels, mask=full_mask)
+                        vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                     if look_loss is not None:
                         total_loss = total_loss + self.sa.look_loss_weight * look_loss
                         n_valid += 1
 
-                    # ClickHead on ALL crop tokens
+                    # ClickHead (after click_phase_step): precise position on ALL crop tokens
                     if self.in_click_phase and all_crop_info:
+                        # Concatenate all crop visual tokens
                         crop_vis_list = []
                         click_label_list = []
+                        crop_global_bboxes = []  # for mapping back to global coords
                         for ci in all_crop_info:
-                            ci_vis = combined_vis[ci["offset"]:ci["offset"] + ci["n_tokens"]]
+                            ci_vis = vis_embeds[ci["offset"]:ci["offset"] + ci["n_tokens"]]
                             crop_vis_list.append(ci_vis)
+                            crop_global_bboxes.append(ci["crop_bbox"])
+
                             if ci["gt_in_crop"]:
                                 cbx1, cby1, cbx2, cby2 = ci["crop_bbox"]
                                 cbw, cbh = cbx2 - cbx1, cby2 - cby1
@@ -603,7 +563,7 @@ class SaccadeTrainer:
                                 ci_labels = torch.zeros(ci["n_tokens"])
                             click_label_list.append(ci_labels)
 
-                        combined_crop_vis = torch.cat(crop_vis_list, dim=0)
+                        combined_crop_vis = torch.cat(crop_vis_list, dim=0)  # (sum_n_crop_tokens, d)
                         combined_click_labels = torch.cat(click_label_list, dim=0).to(device).unsqueeze(0)
 
                         click_attn, click_loss, _ = self.model.dual_head.click(
@@ -612,11 +572,13 @@ class SaccadeTrainer:
                             total_loss = total_loss + self.sa.click_loss_weight * click_loss
                             self.metrics["click_loss"].append(click_loss.item())
 
+                        # Decode ClickHead prediction → global coords
                         with torch.no_grad():
                             click_1d = click_attn.squeeze(0)
                             global_argmax = click_1d.argmax().item()
+                            # Find which crop this token belongs to
                             running = 0
-                            for ci in all_crop_info:
+                            for ci_idx, ci in enumerate(all_crop_info):
                                 if running + ci["n_tokens"] > global_argmax:
                                     local_tok = global_argmax - running
                                     ci_nw, ci_nh = ci["grid_w"], ci["grid_h"]
@@ -630,7 +592,7 @@ class SaccadeTrainer:
                                     break
                                 running += ci["n_tokens"]
 
-                    # Record prediction and break
+                    # Record LookHead prediction and break
                     with torch.no_grad():
                         img_idx, local_idx = identify_attended_image(
                             attn.squeeze(0), vis_ranges)
@@ -648,22 +610,23 @@ class SaccadeTrainer:
                     break
 
                 else:
-                    # GT not in crop → saccade
+                    # GT not in crop → saccade, LookHead labels on low-res
                     low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
                     low_labels[this_crop_mask] = 0.0
 
                     if low_labels.sum() > 0:
                         look_full_labels = torch.zeros(1, n_total, device=device)
                         look_full_labels[0, :n_low] = low_labels.to(device)
+
                         attn, look_loss, _ = self.model.dual_head.look(
-                            combined_vis, anchor, labels=look_full_labels, mask=full_mask)
+                            vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                         if look_loss is not None:
                             total_loss = total_loss + self.sa.look_loss_weight * look_loss
                             n_valid += 1
                     else:
                         with torch.no_grad():
                             attn, _, _ = self.model.dual_head.look(
-                                combined_vis, anchor, mask=full_mask)
+                                vis_embeds, anchor, mask=full_mask)
 
                 # Record prediction for saccade rounds
                 with torch.no_grad():
@@ -682,7 +645,7 @@ class SaccadeTrainer:
                     else:
                         break
 
-        # crop_rounds metric
+        # crop_rounds: how many rounds to first cover GT (lower = better)
         if crop_hit_round is not None:
             self.metrics["crop_rounds"].append(crop_hit_round)
         else:
@@ -690,8 +653,8 @@ class SaccadeTrainer:
 
         # Track total visual tokens
         try:
-            total_vis = sum(v.shape[0] for v in accumulated_vis)
-            self.metrics["vis_tokens"].append(total_vis)
+            n_img_tokens = (inp["input_ids"][0] == img_tok).sum().item()
+            self.metrics["vis_tokens"].append(n_img_tokens)
         except Exception:
             pass
 
