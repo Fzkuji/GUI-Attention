@@ -11,7 +11,8 @@ DEFAULT_POINTER_PAD_TOKEN = "<|pointer_pad|>"
 
 # Dual-action tokens: look (explore) vs click (commit)
 DEFAULT_LOOK_PAD_TOKEN = "<|look_pad|>"
-DEFAULT_CLICK_PAD_TOKEN = "<|click_pad|>"
+# Reuse GUI-Actor's pointer_pad for ClickHead anchor (pretrained embedding)
+DEFAULT_CLICK_PAD_TOKEN = "<|pointer_pad|>"
 
 ADDITIONAL_SPECIAL_TOKENS = [
     DEFAULT_POINTER_START_TOKEN,
@@ -91,7 +92,7 @@ LOOK_SUFFIX = (
 CLICK_SUFFIX = (
     "<|im_start|>assistant\n"
     "I found the target in this region."
-    "<|pointer_start|><|click_pad|><|pointer_end|>"
+    "<|pointer_start|><|pointer_pad|><|pointer_end|>"
     "<|im_end|>\n"
 )
 
