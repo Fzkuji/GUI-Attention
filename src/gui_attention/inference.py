@@ -222,6 +222,85 @@ def run_saccade_inference(
                 break
         if rebuild_failed:
             break
+        # Round 1 (first crop): force look — model must see crop before deciding
+        # Round 2+: autoregressive generation — model decides look vs click
+        force_look = (ri == 1)
+
+        if force_look:
+            # Build context with LOOK_SUFFIX (same as training when gt_in_crop=False)
+            try:
+                ri_inputs, cur_text, cur_images = builder.extend_with_crop(
+                    cur_text, cur_images, cropped, crop_bbox,
+                    gt_in_crop=False, use_dual_tokens=use_dual_tokens,
+                )
+            except Exception:
+                break
+
+            inp = {k: v.to(device) for k, v in ri_inputs.items()}
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=inp["input_ids"],
+                    attention_mask=inp.get("attention_mask"),
+                    pixel_values=inp.get("pixel_values"),
+                    image_grid_thw=inp.get("image_grid_thw"),
+                )
+
+            last_hs = outputs.hidden_states[-1]
+            vis_embeds = model.extract_visual_embeds(
+                inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
+            _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
+            anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=ri)
+
+            if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
+                break
+
+            grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
+
+            # Mask: current crop overlap on low-res + old crop tokens
+            this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox).to(device)
+            n_low = vis_ranges[0][1]
+            n_total = vis_embeds.shape[0]
+            latest_img_idx = len(vis_ranges) - 1
+            full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
+            full_mask[:n_low] = this_crop_mask
+            for prev_i in range(1, latest_img_idx):
+                off_prev, ntok_prev = vis_ranges[prev_i]
+                full_mask[off_prev:off_prev + ntok_prev] = True
+
+            total_vis_tokens = n_total
+
+            # Save state for ClickHead
+            last_vis_embeds = vis_embeds
+            last_vis_ranges = vis_ranges
+            last_grid_dims = grid_dims
+            last_anchor = anchor
+
+            # LookHead → saccade to next position
+            attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
+            attn_1d = attn_ri.squeeze(0)
+
+            img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
+            if img_idx >= len(grid_dims) or img_idx >= len(builder.image_infos):
+                break
+            info = builder.image_infos[img_idx]
+
+            nh_a, nw_a = grid_dims[img_idx]
+            off_a, n_a = vis_ranges[img_idx]
+            img_attn = attn_1d[off_a:off_a + n_a]
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+
+            bx1, by1, bx2, by2 = info.global_bbox
+            global_x = bx1 + lx * (bx2 - bx1)
+            global_y = by1 + ly * (by2 - by1)
+
+            focus_x, focus_y = global_x, global_y
+            round_preds.append((focus_x, focus_y))
+            last_look_point = (global_x, global_y)
+            last_look_dims = (nw_a, nh_a)
+            continue  # Skip to next round
+
+        # Round 2+: autoregressive generation
         # Build context ending with generation prompt (no suffix)
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
