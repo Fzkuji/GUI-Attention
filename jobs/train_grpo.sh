@@ -29,12 +29,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH=src:$PYTHONPATH
 export HF_HUB_OFFLINE=1
 
-# SFT checkpoint to start from
-SFT_CKPT="${SFT_CKPT:-}"
-if [ -z "$SFT_CKPT" ]; then
-    echo "ERROR: Set SFT_CKPT=/path/to/sft/checkpoint"
-    exit 1
-fi
+# SFT checkpoint to start from (edit this path directly)
+SFT_CKPT="$RESULT_DIR/ours_v15_dual/checkpoint-500"
 
 # Auto-detect datasets (same as train.sh)
 declare -a ALL_DATASETS=(
