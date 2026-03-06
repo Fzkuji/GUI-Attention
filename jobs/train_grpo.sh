@@ -85,8 +85,8 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --low_res_max_pixels 1001600 \
     --crop_size 308 \
     --crop_upscale 3 \
-    --max_saccade_rounds 6 \
-    --group_size 4 \
+    --max_saccade_rounds 4 \
+    --group_size 8 \
     --reward_hit 1.0 \
     --reward_round_penalty 0.05 \
     --kl_coeff 0.01 \
@@ -102,7 +102,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_lr 5e-6 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 1 \
     --weight_decay 0.0 \
     --warmup_ratio 0.05 \
     --logging_steps 10 \
