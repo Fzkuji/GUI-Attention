@@ -563,8 +563,9 @@ class SaccadeTrainer:
                     total_loss = total_loss + self.sa.look_loss_weight * look_loss
                     n_valid += 1
 
-            # ClickHead on ALL crop tokens
-            if self.in_click_phase and crop_bboxes:
+            # ClickHead on ALL crop tokens (only if GT is in at least one crop)
+            any_gt_in_crop = any(cg for _, cg in crop_bboxes)
+            if self.in_click_phase and crop_bboxes and any_gt_in_crop:
                 all_crop_info = []
                 for ci_idx in range(len(crop_bboxes)):
                     img_idx_ci = ci_idx + 1  # crops start at index 1
