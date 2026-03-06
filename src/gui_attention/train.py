@@ -305,10 +305,11 @@ class SaccadeTrainer:
     # -- multi-round saccade forward ----------------------------------------
 
     def _forward_sample(self, sample):
-        """Two-phase multi-round training with LookHead + ClickHead.
+        """Multi-round training with KV cache incremental forward.
 
-        Phase 1 (no_grad): Run saccade rounds to determine trajectory.
-        Phase 2 (with grad): One forward on final context → compute all losses.
+        Each round: build full context → compute M-RoPE position_ids →
+        forward only NEW tokens with past_key_values → accumulate hidden
+        states → compute LookHead/ClickHead/LM losses with full gradients.
 
         Returns (total_loss, num_valid_rounds, round_preds, click_pred).
         """
@@ -329,204 +330,233 @@ class SaccadeTrainer:
             click_id = self.model.config.click_pad_token_id
             pp_id = [look_id, click_id, pp_id]
         merge = _get_visual_module(self.model).spatial_merge_size
+        rope_backbone = _get_backbone_for_rope(self.model)
 
-        max_rounds = self.max_rounds
-
-        # ===== PHASE 1: no_grad — determine trajectory =====
+        self.builder.reset()
+        self.model.train()
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        n_valid = 0
         round_preds = []
-        crop_bboxes = []  # (crop_bbox, gt_in_crop) per crop round
-        break_round = max_rounds  # which round we stop at
+        click_pred = None
+
+        # Track all crop info for ClickHead
+        all_crop_info = []
+        crop_bboxes = []  # (crop_bbox, gt_in_crop)
         crop_hit_round = None
         nh0, nw0 = None, None
 
-        self.model.eval()
-        with torch.no_grad():
-            for ri in range(max_rounds):
-                # Check if PREVIOUS round's crop covered GT → break
-                # (we needed to forward this round's context first to get
-                #  the LookHead prediction, matching old code's behavior)
-                if ri > 0 and crop_bboxes and crop_bboxes[-1][1]:
-                    break  # GT found in last crop, stop
+        max_rounds = self.max_rounds
+        pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
 
-                self.builder.reset()
+        # KV cache state
+        past_kv = None
+        prev_seq_len = 0
+        prev_n_pixels = 0
+        prev_n_images = 0
+        accumulated_hs = []     # list of (1, new_seq_len, d) tensors
+        accumulated_vis = []    # list of (n_vis, d) tensors
+
+        for ri in range(max_rounds):
+            if ri == 0:
+                # ===== Round 0: Low-res full image =====
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
                     use_dual_tokens=self.sa.use_dual_tokens,
                 )
-                # Add all previous crops
-                for prev_i, (prev_bbox, prev_gt_in) in enumerate(crop_bboxes):
-                    prev_px, prev_py = round_preds[prev_i]
-                    prev_crop, _ = crop_image(img, prev_px, prev_py,
-                                              crop_size=self.sa.crop_size,
-                                              crop_upscale=self.sa.crop_upscale)
-                    try:
-                        r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                            cur_text, cur_images, prev_crop, prev_bbox,
-                            gt_in_crop=prev_gt_in, use_dual_tokens=self.sa.use_dual_tokens,
-                        )
-                    except Exception:
-                        break
-
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
+
+                # LM labels
+                lm_labels = None
+                if self.sa.lm_loss_weight > 0:
+                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+
+                # Compute M-RoPE position_ids
+                position_ids, rope_deltas = rope_backbone.get_rope_index(
+                    inp["input_ids"], inp.get("image_grid_thw"), None,
+                    inp.get("attention_mask"),
+                )
+                position_ids = position_ids.to(device)
 
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
+                    labels=lm_labels,
+                    position_ids=position_ids,
+                    use_cache=True,
                 )
-                last_hs = outputs.hidden_states[-1]
+                past_kv = outputs.past_key_values
+                prev_seq_len = inp["input_ids"].shape[1]
+                prev_n_pixels = inp["pixel_values"].shape[0] if inp.get("pixel_values") is not None else 0
+                prev_n_images = inp["image_grid_thw"].shape[0] if inp.get("image_grid_thw") is not None else 0
 
+                last_hs = outputs.hidden_states[-1]
+                accumulated_hs.append(last_hs)
+
+                # LM loss
+                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
+                    total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
+                    self.metrics["lm_loss"].append(outputs.loss.item())
+
+                # Visual embeds (pre-LLM ViT output)
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
+                accumulated_vis.append(vis_embeds)
+
+                # Use accumulated hidden states for vis_ranges and anchor
+                combined_hs = torch.cat(accumulated_hs, dim=1)
+                combined_vis = torch.cat(accumulated_vis, dim=0)
                 _, vis_ranges = extract_visual_hidden_states(
-                    last_hs, inp["input_ids"], img_tok)
+                    combined_hs, inp["input_ids"], img_tok)
                 anchor = extract_anchor_hidden_states(
-                    last_hs, inp["input_ids"], pp_id, n=ri if ri > 0 else 0)
+                    combined_hs, inp["input_ids"], pp_id, n=0)
 
                 if vis_embeds is None or anchor is None:
                     break
 
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
-                if ri == 0:
-                    nh0, nw0 = grid_dims[0]
+                nh0, nw0 = grid_dims[0]
 
-                # Build mask for LookHead
-                n_total = vis_embeds.shape[0]
-                n_low = vis_ranges[0][1]
-                full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-                if ri > 0:
-                    latest_crop_bbox = crop_bboxes[-1][0]
-                    this_crop_mask = compute_overlap_mask(nh0, nw0, latest_crop_bbox)
-                    full_mask[:n_low] = this_crop_mask.to(device)
-                    latest_img_idx = len(vis_ranges) - 1
-                    for prev_i in range(1, latest_img_idx):
-                        off_prev, ntok_prev = vis_ranges[prev_i]
-                        full_mask[off_prev:off_prev + ntok_prev] = True
+                # LookHead: binary labels on GT region
+                look_labels = compute_binary_labels(nh0, nw0, bbox_gt,
+                                                    soft=False).to(device).unsqueeze(0)
+                attn, look_loss, _ = self.model.dual_head.look(
+                    combined_vis, anchor, labels=look_labels)
 
-                attn, _, _ = self.model.dual_head.look(
-                    vis_embeds, anchor, mask=full_mask if ri > 0 else None)
+                if look_loss is not None:
+                    total_loss = total_loss + self.sa.look_loss_weight * look_loss
+                    n_valid += 1
 
-                # Decode LookHead prediction
-                _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
-                if ri == 0:
+                with torch.no_grad():
+                    _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
                     low_attn = attn.squeeze(0)[vis_ranges[0][0]:vis_ranges[0][0]+vis_ranges[0][1]]
                     pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
-                else:
-                    img_idx = 0
-                    for ii, (off_ii, n_ii) in enumerate(vis_ranges):
-                        if off_ii <= local_idx < off_ii + n_ii:
-                            img_idx = ii
-                            break
-                    if img_idx < len(grid_dims) and img_idx < len(self.builder.image_infos):
-                        nh_a, nw_a = grid_dims[img_idx]
-                        off_a, n_a = vis_ranges[img_idx]
-                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
-                        local_in_img = local_idx - off_a
-                        lx, ly = token_to_spatial(local_in_img, nw_a, nh_a, attn_weights=img_attn)
-                        info = self.builder.image_infos[img_idx]
-                        bx1, by1, bx2, by2 = info.global_bbox
-                        pred_x = bx1 + lx * (bx2 - bx1)
-                        pred_y = by1 + ly * (by2 - by1)
-                    else:
-                        pred_x, pred_y = 0.5, 0.5
+                    round_preds.append((pred_x, pred_y))
 
-                round_preds.append((pred_x, pred_y))
+                    # Virtual crop_hit for round 0
+                    _, virtual_bbox = crop_image(img, pred_x, pred_y,
+                                                    crop_size=self.sa.crop_size,
+                                                    crop_upscale=self.sa.crop_upscale)
+                    if point_in_bbox(gt_cx, gt_cy, virtual_bbox):
+                        crop_hit_round = 1
 
-                # Generate next crop from prediction
-                if ri < max_rounds - 1:
-                    _, next_bbox = crop_image(img, pred_x, pred_y,
-                                              crop_size=self.sa.crop_size,
-                                              crop_upscale=self.sa.crop_upscale)
-                    gt_in_next = point_in_bbox(gt_cx, gt_cy, next_bbox)
-                    crop_bboxes.append((next_bbox, gt_in_next))
-                    if gt_in_next and crop_hit_round is None:
-                        crop_hit_round = ri + 1
-                    # Don't break here — next iteration will forward this
-                    # crop's context, then break at the top of the loop
+            else:
+                # ===== Round ri: Crop =====
+                crop_cx, crop_cy = pred_x, pred_y
+                cropped, crop_bbox = crop_image(img, crop_cx, crop_cy,
+                                                  crop_size=self.sa.crop_size,
+                                                  crop_upscale=self.sa.crop_upscale)
+                gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
+                crop_bboxes.append((crop_bbox, gt_in_crop))
+                if gt_in_crop and crop_hit_round is None:
+                    crop_hit_round = ri
 
-        # ===== PHASE 2: with grad — one forward on final context =====
-        self.model.train()
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        n_valid = 0
-        click_pred = None
+                # Extend context with new crop (builder tracks full context)
+                try:
+                    r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                        cur_text, cur_images, cropped, crop_bbox,
+                        gt_in_crop=gt_in_crop, use_dual_tokens=self.sa.use_dual_tokens,
+                    )
+                except Exception:
+                    break
 
-        # Build final context: low-res + all crops from trajectory
-        self.builder.reset()
-        r_inputs, cur_text, cur_images = self.builder.build_round0(
-            sample, sample["instruction"],
-            use_dual_tokens=self.sa.use_dual_tokens,
-        )
-        for ci, (cb, cg) in enumerate(crop_bboxes):
-            px, py = round_preds[ci]
-            c_img, _ = crop_image(img, px, py,
-                                  crop_size=self.sa.crop_size,
-                                  crop_upscale=self.sa.crop_upscale)
-            try:
-                r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                    cur_text, cur_images, c_img, cb,
-                    gt_in_crop=cg, use_dual_tokens=self.sa.use_dual_tokens,
+                full_inp = {k: v.to(device) for k, v in r_inputs.items()}
+
+                # Compute M-RoPE position_ids on FULL context, slice new part
+                full_position_ids, _ = rope_backbone.get_rope_index(
+                    full_inp["input_ids"], full_inp.get("image_grid_thw"), None,
+                    full_inp.get("attention_mask"),
                 )
-            except Exception:
-                break
+                full_position_ids = full_position_ids.to(device)
+                new_position_ids = full_position_ids[:, :, prev_seq_len:]
 
-        inp = {k: v.to(device) for k, v in r_inputs.items()}
-        if inp.get("pixel_values") is not None:
-            inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
+                # Extract incremental tokens
+                new_input_ids = full_inp["input_ids"][:, prev_seq_len:]
+                new_attention_mask = full_inp["attention_mask"] if full_inp.get("attention_mask") is not None else None
 
-        # LM labels (on last round)
-        final_round = len(crop_bboxes)
-        lm_labels = None
-        if self.sa.lm_loss_weight > 0:
-            lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=final_round).to(device)
+                # Extract incremental pixel_values and image_grid_thw
+                cur_n_pixels = full_inp["pixel_values"].shape[0] if full_inp.get("pixel_values") is not None else 0
+                cur_n_images = full_inp["image_grid_thw"].shape[0] if full_inp.get("image_grid_thw") is not None else 0
+                new_pixel_values = full_inp["pixel_values"][prev_n_pixels:] if cur_n_pixels > prev_n_pixels else None
+                new_image_grid_thw = full_inp["image_grid_thw"][prev_n_images:] if cur_n_images > prev_n_images else None
 
-        outputs = self.model(
-            input_ids=inp["input_ids"],
-            attention_mask=inp.get("attention_mask"),
-            pixel_values=inp["pixel_values"],
-            image_grid_thw=inp.get("image_grid_thw"),
-            labels=lm_labels,
-        )
-        last_hs = outputs.hidden_states[-1]
+                if new_pixel_values is not None:
+                    new_pixel_values = new_pixel_values.requires_grad_(True)
 
-        # LM loss
-        if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
-            total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
-            self.metrics["lm_loss"].append(outputs.loss.item())
+                # LM labels on full context, but model only sees new tokens
+                lm_labels = None
+                if self.sa.lm_loss_weight > 0:
+                    full_lm_labels = make_lm_labels(full_inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+                    lm_labels = full_lm_labels[:, prev_seq_len:]
 
-        # Visual embeds + anchor
-        vis_embeds = self.model.extract_visual_embeds(
-            inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
-        _, vis_ranges = extract_visual_hidden_states(
-            last_hs, inp["input_ids"], img_tok)
-        anchor = extract_anchor_hidden_states(
-            last_hs, inp["input_ids"], pp_id, n=final_round)
+                # Incremental forward with KV cache
+                outputs = self.model(
+                    input_ids=new_input_ids,
+                    attention_mask=new_attention_mask,
+                    pixel_values=new_pixel_values,
+                    image_grid_thw=new_image_grid_thw,
+                    labels=lm_labels,
+                    position_ids=new_position_ids,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+                past_kv = outputs.past_key_values
+                prev_seq_len = full_inp["input_ids"].shape[1]
+                prev_n_pixels = cur_n_pixels
+                prev_n_images = cur_n_images
 
-        if vis_embeds is not None and anchor is not None:
-            grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
-            if nh0 is None and len(grid_dims) > 0:
-                nh0, nw0 = grid_dims[0]
-            n_total = vis_embeds.shape[0]
-            n_low = vis_ranges[0][1] if vis_ranges else 0
+                new_hs = outputs.hidden_states[-1]
+                accumulated_hs.append(new_hs)
 
-            # LookHead loss on final round's context
-            if crop_bboxes:
-                last_cb, last_gt_in = crop_bboxes[-1]
+                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
+                    total_loss = total_loss + self.sa.lm_loss_weight * outputs.loss
+                    self.metrics["lm_loss"].append(outputs.loss.item())
+
+                # New crop visual embeds
+                if new_pixel_values is not None and new_image_grid_thw is not None:
+                    new_vis = self.model.extract_visual_embeds(
+                        new_input_ids, new_pixel_values, new_image_grid_thw)
+                    accumulated_vis.append(new_vis)
+
+                # Combined hidden states + visual embeds
+                combined_hs = torch.cat(accumulated_hs, dim=1)
+                combined_vis = torch.cat(accumulated_vis, dim=0)
+                _, vis_ranges = extract_visual_hidden_states(
+                    combined_hs, full_inp["input_ids"], img_tok)
+                anchor = extract_anchor_hidden_states(
+                    combined_hs, full_inp["input_ids"], pp_id, n=ri)
+
+                if combined_vis is None or anchor is None or len(vis_ranges) < ri + 1:
+                    break
+
+                grid_dims = self.builder.get_image_grid_dims(full_inp["image_grid_thw"], merge)
+                n_low = vis_ranges[0][1]
+                n_total = combined_vis.shape[0]
                 latest_img_idx = len(vis_ranges) - 1
 
-                # Build mask
-                this_crop_mask = compute_overlap_mask(nh0, nw0, last_cb)
+                # Mask: current crop overlap in low-res + old crop tokens
+                this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
                 for prev_i in range(1, latest_img_idx):
                     off_prev, ntok_prev = vis_ranges[prev_i]
                     full_mask[off_prev:off_prev + ntok_prev] = True
 
-                if last_gt_in and latest_img_idx < len(grid_dims):
-                    # GT in last crop → LookHead labels on crop tokens
-                    offset_hi, n_hi = vis_ranges[latest_img_idx]
-                    nh_high, nw_high = grid_dims[latest_img_idx]
-                    cbx1, cby1, cbx2, cby2 = last_cb
+                # Save crop info for ClickHead
+                offset_hi, n_hi = vis_ranges[latest_img_idx]
+                nh_high, nw_high = grid_dims[latest_img_idx]
+                all_crop_info.append({
+                    "offset": offset_hi, "n_tokens": n_hi,
+                    "grid_h": nh_high, "grid_w": nw_high,
+                    "crop_bbox": crop_bbox, "gt_in_crop": gt_in_crop,
+                })
+
+                if gt_in_crop:
+                    # GT in crop → LookHead labels on crop patch
+                    cbx1, cby1, cbx2, cby2 = crop_bbox
                     cbw, cbh = cbx2 - cbx1, cby2 - cby1
                     if cbw > 0 and cbh > 0:
                         local_gt = (
@@ -538,108 +568,130 @@ class SaccadeTrainer:
                         high_labels = compute_binary_labels(nh_high, nw_high, local_gt, soft=False)
                     else:
                         high_labels = torch.zeros(n_hi)
+
                     look_full_labels = torch.zeros(1, n_total, device=device)
                     look_full_labels[0, offset_hi:offset_hi + n_hi] = high_labels.to(device)
-                else:
-                    # GT not in last crop → LookHead labels on low-res
-                    low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
-                    low_labels[this_crop_mask] = 0.0
-                    look_full_labels = torch.zeros(1, n_total, device=device)
-                    if low_labels.sum() > 0:
-                        look_full_labels[0, :n_low] = low_labels.to(device)
 
-                attn, look_loss, _ = self.model.dual_head.look(
-                    vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
-                if look_loss is not None:
-                    total_loss = total_loss + self.sa.look_loss_weight * look_loss
-                    n_valid += 1
-            else:
-                # No crops (only round 0)
-                look_labels = compute_binary_labels(nh0, nw0, bbox_gt,
-                                                    soft=False).to(device).unsqueeze(0)
-                attn, look_loss, _ = self.model.dual_head.look(
-                    vis_embeds, anchor, labels=look_labels)
-                if look_loss is not None:
-                    total_loss = total_loss + self.sa.look_loss_weight * look_loss
-                    n_valid += 1
+                    attn, look_loss, _ = self.model.dual_head.look(
+                        combined_vis, anchor, labels=look_full_labels, mask=full_mask)
+                    if look_loss is not None:
+                        total_loss = total_loss + self.sa.look_loss_weight * look_loss
+                        n_valid += 1
 
-            # ClickHead on ALL crop tokens (only if GT is in at least one crop)
-            any_gt_in_crop = any(cg for _, cg in crop_bboxes)
-            if self.in_click_phase and crop_bboxes and any_gt_in_crop:
-                all_crop_info = []
-                for ci_idx in range(len(crop_bboxes)):
-                    img_idx_ci = ci_idx + 1  # crops start at index 1
-                    if img_idx_ci < len(vis_ranges) and img_idx_ci < len(grid_dims):
-                        off_ci, n_ci = vis_ranges[img_idx_ci]
-                        nh_ci, nw_ci = grid_dims[img_idx_ci]
-                        all_crop_info.append({
-                            "offset": off_ci, "n_tokens": n_ci,
-                            "grid_h": nh_ci, "grid_w": nw_ci,
-                            "crop_bbox": crop_bboxes[ci_idx][0],
-                            "gt_in_crop": crop_bboxes[ci_idx][1],
-                        })
-
-                if all_crop_info:
-                    crop_vis_list = []
-                    click_label_list = []
-                    for ci in all_crop_info:
-                        ci_vis = vis_embeds[ci["offset"]:ci["offset"] + ci["n_tokens"]]
-                        crop_vis_list.append(ci_vis)
-                        if ci["gt_in_crop"]:
-                            cbx1, cby1, cbx2, cby2 = ci["crop_bbox"]
-                            cbw, cbh = cbx2 - cbx1, cby2 - cby1
-                            if cbw > 0 and cbh > 0:
-                                local_gt_ci = (
-                                    max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
-                                    max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
-                                    max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
-                                    max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
-                                )
-                                ci_labels = compute_binary_labels(
-                                    ci["grid_h"], ci["grid_w"], local_gt_ci, soft=False)
+                    # ClickHead on ALL crop tokens
+                    if self.in_click_phase and all_crop_info:
+                        crop_vis_list = []
+                        click_label_list = []
+                        for ci in all_crop_info:
+                            ci_vis = combined_vis[ci["offset"]:ci["offset"] + ci["n_tokens"]]
+                            crop_vis_list.append(ci_vis)
+                            if ci["gt_in_crop"]:
+                                cbx1, cby1, cbx2, cby2 = ci["crop_bbox"]
+                                cbw, cbh = cbx2 - cbx1, cby2 - cby1
+                                if cbw > 0 and cbh > 0:
+                                    local_gt_ci = (
+                                        max(0.0, min(1.0, (bbox_gt[0] - cbx1) / cbw)),
+                                        max(0.0, min(1.0, (bbox_gt[1] - cby1) / cbh)),
+                                        max(0.0, min(1.0, (bbox_gt[2] - cbx1) / cbw)),
+                                        max(0.0, min(1.0, (bbox_gt[3] - cby1) / cbh)),
+                                    )
+                                    ci_labels = compute_binary_labels(
+                                        ci["grid_h"], ci["grid_w"], local_gt_ci, soft=False)
+                                else:
+                                    ci_labels = torch.zeros(ci["n_tokens"])
                             else:
                                 ci_labels = torch.zeros(ci["n_tokens"])
-                        else:
-                            ci_labels = torch.zeros(ci["n_tokens"])
-                        click_label_list.append(ci_labels)
+                            click_label_list.append(ci_labels)
 
-                    combined_crop_vis = torch.cat(crop_vis_list, dim=0)
-                    combined_click_labels = torch.cat(click_label_list, dim=0).to(device).unsqueeze(0)
+                        combined_crop_vis = torch.cat(crop_vis_list, dim=0)
+                        combined_click_labels = torch.cat(click_label_list, dim=0).to(device).unsqueeze(0)
 
-                    click_attn, click_loss, _ = self.model.dual_head.click(
-                        combined_crop_vis, anchor, labels=combined_click_labels)
-                    if click_loss is not None:
-                        total_loss = total_loss + self.sa.click_loss_weight * click_loss
-                        self.metrics["click_loss"].append(click_loss.item())
+                        click_attn, click_loss, _ = self.model.dual_head.click(
+                            combined_crop_vis, anchor, labels=combined_click_labels)
+                        if click_loss is not None:
+                            total_loss = total_loss + self.sa.click_loss_weight * click_loss
+                            self.metrics["click_loss"].append(click_loss.item())
 
-                    # Decode ClickHead prediction
+                        with torch.no_grad():
+                            click_1d = click_attn.squeeze(0)
+                            global_argmax = click_1d.argmax().item()
+                            running = 0
+                            for ci in all_crop_info:
+                                if running + ci["n_tokens"] > global_argmax:
+                                    local_tok = global_argmax - running
+                                    ci_nw, ci_nh = ci["grid_w"], ci["grid_h"]
+                                    lx = ((local_tok % ci_nw) + 0.5) / ci_nw
+                                    ly = ((local_tok // ci_nw) + 0.5) / ci_nh
+                                    bx1, by1, bx2, by2 = ci["crop_bbox"]
+                                    click_pred = (
+                                        bx1 + lx * (bx2 - bx1),
+                                        by1 + ly * (by2 - by1),
+                                    )
+                                    break
+                                running += ci["n_tokens"]
+
+                    # Record prediction and break
                     with torch.no_grad():
-                        click_1d = click_attn.squeeze(0)
-                        global_argmax = click_1d.argmax().item()
-                        running = 0
-                        for ci in all_crop_info:
-                            if running + ci["n_tokens"] > global_argmax:
-                                local_tok = global_argmax - running
-                                ci_nw, ci_nh = ci["grid_w"], ci["grid_h"]
-                                lx = ((local_tok % ci_nw) + 0.5) / ci_nw
-                                ly = ((local_tok // ci_nw) + 0.5) / ci_nh
-                                bx1, by1, bx2, by2 = ci["crop_bbox"]
-                                click_pred = (
-                                    bx1 + lx * (bx2 - bx1),
-                                    by1 + ly * (by2 - by1),
-                                )
-                                break
-                            running += ci["n_tokens"]
+                        img_idx, local_idx = identify_attended_image(
+                            attn.squeeze(0), vis_ranges)
+                        if img_idx < len(grid_dims):
+                            nh_a, nw_a = grid_dims[img_idx]
+                            off_a, n_a = vis_ranges[img_idx]
+                            img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                            info = self.builder.image_infos[img_idx]
+                            bx1, by1, bx2, by2 = info.global_bbox
+                            round_preds.append((
+                                bx1 + lx * (bx2 - bx1),
+                                by1 + ly * (by2 - by1),
+                            ))
+                    break
 
-        # Metrics
+                else:
+                    # GT not in crop → saccade
+                    low_labels = compute_binary_labels(nh0, nw0, bbox_gt, soft=False)
+                    low_labels[this_crop_mask] = 0.0
+
+                    if low_labels.sum() > 0:
+                        look_full_labels = torch.zeros(1, n_total, device=device)
+                        look_full_labels[0, :n_low] = low_labels.to(device)
+                        attn, look_loss, _ = self.model.dual_head.look(
+                            combined_vis, anchor, labels=look_full_labels, mask=full_mask)
+                        if look_loss is not None:
+                            total_loss = total_loss + self.sa.look_loss_weight * look_loss
+                            n_valid += 1
+                    else:
+                        with torch.no_grad():
+                            attn, _, _ = self.model.dual_head.look(
+                                combined_vis, anchor, mask=full_mask)
+
+                # Record prediction for saccade rounds
+                with torch.no_grad():
+                    img_idx, local_idx = identify_attended_image(
+                        attn.squeeze(0), vis_ranges)
+                    if img_idx < len(grid_dims):
+                        nh_a, nw_a = grid_dims[img_idx]
+                        off_a, n_a = vis_ranges[img_idx]
+                        img_attn = attn.squeeze(0)[off_a:off_a+n_a]
+                        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+                        info = self.builder.image_infos[img_idx]
+                        bx1, by1, bx2, by2 = info.global_bbox
+                        pred_x = bx1 + lx * (bx2 - bx1)
+                        pred_y = by1 + ly * (by2 - by1)
+                        round_preds.append((pred_x, pred_y))
+                    else:
+                        break
+
+        # crop_rounds metric
         if crop_hit_round is not None:
             self.metrics["crop_rounds"].append(crop_hit_round)
         else:
             self.metrics["crop_rounds"].append(max_rounds)
 
+        # Track total visual tokens
         try:
-            n_img_tokens = (inp["input_ids"][0] == img_tok).sum().item()
-            self.metrics["vis_tokens"].append(n_img_tokens)
+            total_vis = sum(v.shape[0] for v in accumulated_vis)
+            self.metrics["vis_tokens"].append(total_vis)
         except Exception:
             pass
 
