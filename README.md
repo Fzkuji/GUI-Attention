@@ -176,7 +176,7 @@ RESULT_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/results
 cd $CODE && git pull
 NUM_GPUS=8 bash jobs/train.sh
 # Output: $RESULT_DIR/ours_v15_dual/
-# Resume: automatically from last checkpoint in output_dir
+# To resume: RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
 ```
 
 ### Eval ScreenSpot-Pro (our model)

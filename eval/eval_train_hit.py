@@ -34,7 +34,7 @@ from gui_attention.constants import (
     DEFAULT_POINTER_END_TOKEN,
     GROUNDING_SYSTEM_MESSAGE,
 )
-from gui_attention.dual_head import VisionHead_MultiPatch
+from gui_attention.dual_head import _AttentionHead
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ def load_gui_actor_model(model_path, device="cuda:0"):
 
     # Build pointer head (same architecture as GUI-Actor's VisionHead_MultiPatch)
     d_model = backbone.config.hidden_size
-    pointer_head = VisionHead_MultiPatch(d_model=d_model, projection_dim=d_model)
+    pointer_head = _AttentionHead(d_model=d_model, projection_dim=d_model)
 
     # Load pointer head weights from safetensors
     import glob
