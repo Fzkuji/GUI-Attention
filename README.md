@@ -153,6 +153,63 @@ jobs/
   eval_all_screenspot.sh
 ```
 
+## Server Quick Reference (Tencent 8×H20)
+
+Paths:
+```
+CODE=/mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
+MODEL_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/models
+DATA_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/data
+RESULT_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/results
+```
+
+### Train (v15 SFT)
+```bash
+cd $CODE && git pull
+NUM_GPUS=8 bash jobs/train.sh
+# Output: $RESULT_DIR/ours_v15_dual/
+# Resume: automatically from last checkpoint in output_dir
+```
+
+### Eval ScreenSpot-Pro (our model)
+```bash
+cd $CODE
+torchrun --nproc_per_node=8 eval/eval_screenspot.py \
+    --dataset pro \
+    --data_dir $DATA_DIR/ScreenSpot-Pro \
+    --checkpoint $RESULT_DIR/ours_v15_dual/checkpoint-500 \
+    --base_model $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
+    --max_rounds 6 \
+    --use_dual_tokens
+```
+
+### Eval ScreenSpot-Pro (GUI-Actor baseline)
+```bash
+cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Actor
+rm -f screenspot-Pro_all_preds_StandardResize.txt  # must delete or script silently exits
+PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/screenSpot_pro.py \
+    --model_name_or_path $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
+    --data_path $DATA_DIR/ScreenSpot-Pro \
+    --model_type qwen25vl
+```
+
+### Eval on training data (single-round hit rate)
+```bash
+cd $CODE
+PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/eval_train_hit.py \
+    --model_path $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
+    --data_path $DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json \
+    --image_folder $DATA_DIR,$DATA_DIR,$DATA_DIR,$DATA_DIR \
+    --max_samples 2000
+```
+
+### Continue training from checkpoint
+```bash
+cd $CODE && git pull
+NUM_GPUS=8 bash jobs/train.sh
+# HuggingFace Trainer auto-detects checkpoint in output_dir and resumes
+```
+
 ## Results (v15 checkpoint-500)
 
 | Benchmark | Hit@1 | Overlap@1 |
