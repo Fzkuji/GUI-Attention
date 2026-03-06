@@ -52,13 +52,15 @@ Key config in `jobs/train.sh`:
 
 To resume from checkpoint:
 ```bash
-# Add --resume_ckpt to train.sh, or HuggingFace Trainer auto-resumes from output_dir
-NUM_GPUS=8 bash jobs/train.sh
+# Set RESUME_CKPT env var (train.sh passes it as --resume_ckpt)
+RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
 ```
 
 ## Evaluation
 
 All eval scripts also use **GUI-Actor as base model**.
+
+**Important**: Use `--no_adaptive_crop` to match training (fixed crop_size=308×3=924). Default `adaptive_crop=True` uses 756² pixel budget which differs from training.
 
 ```bash
 # ScreenSpot-Pro (8 GPU, DDP)
@@ -67,16 +69,18 @@ torchrun --nproc_per_node=8 eval/eval_screenspot.py \
     --data_dir /path/to/ScreenSpot-Pro \
     --checkpoint /path/to/checkpoint-500 \
     --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --max_rounds 6 \
-    --use_dual_tokens
+    --rounds 6 \
+    --use_dual_tokens \
+    --no_adaptive_crop
 
 # ScreenSpot v1 (downloads from HuggingFace)
 torchrun --nproc_per_node=8 eval/eval_screenspot.py \
     --dataset v1 \
     --checkpoint /path/to/checkpoint-500 \
     --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --max_rounds 6 \
-    --use_dual_tokens
+    --rounds 6 \
+    --use_dual_tokens \
+    --no_adaptive_crop
 
 # ScreenSpot v2
 torchrun --nproc_per_node=8 eval/eval_screenspot.py \
@@ -84,8 +88,12 @@ torchrun --nproc_per_node=8 eval/eval_screenspot.py \
     --data_dir /path/to/v2_data \
     --checkpoint /path/to/checkpoint-500 \
     --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --max_rounds 6 \
-    --use_dual_tokens
+    --rounds 6 \
+    --use_dual_tokens \
+    --no_adaptive_crop
+
+# Or use the batch script:
+CHECKPOINT=/path/to/checkpoint NUM_GPUS=8 bash jobs/eval_all_screenspot.sh
 ```
 
 ### Evaluate GUI-Actor baseline (no saccade)
@@ -179,8 +187,9 @@ torchrun --nproc_per_node=8 eval/eval_screenspot.py \
     --data_dir $DATA_DIR/ScreenSpot-Pro \
     --checkpoint $RESULT_DIR/ours_v15_dual/checkpoint-500 \
     --base_model $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
-    --max_rounds 6 \
-    --use_dual_tokens
+    --rounds 6 \
+    --use_dual_tokens \
+    --no_adaptive_crop
 ```
 
 ### Eval ScreenSpot-Pro (GUI-Actor baseline)
@@ -206,8 +215,8 @@ PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/eval_train_hit.py \
 ### Continue training from checkpoint
 ```bash
 cd $CODE && git pull
-NUM_GPUS=8 bash jobs/train.sh
-# HuggingFace Trainer auto-detects checkpoint in output_dir and resumes
+RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
+# Must set RESUME_CKPT explicitly; no auto-resume from output_dir
 ```
 
 ## Results (v15 checkpoint-500)

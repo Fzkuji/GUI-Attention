@@ -407,6 +407,6 @@ def run_saccade_inference(
         "topk_points": [final_point],
         "n_width": nw_final,
         "n_height": nh_final,
-        "num_rounds": len(state.history),
+        "num_rounds": len(round_preds),  # round_preds has one entry per round (0-indexed)
         "total_vis_tokens": total_vis_tokens,
     }
