@@ -129,6 +129,12 @@ def build_model(
     backbone.config.pointer_pad_token_id = tokenizer.convert_tokens_to_ids(
         ADDITIONAL_SPECIAL_TOKENS[2]
     )
+    backbone.config.look_pad_token_id = tokenizer.convert_tokens_to_ids(
+        ADDITIONAL_SPECIAL_TOKENS[3]
+    )
+    backbone.config.click_pad_token_id = tokenizer.convert_tokens_to_ids(
+        ADDITIONAL_SPECIAL_TOKENS[4]
+    )
 
     if use_lora:
         target_modules = [m.strip() for m in lora_target_modules.split(",")]
@@ -291,6 +297,12 @@ class Qwen25VLWithDualHead(nn.Module):
         )
         backbone.config.pointer_pad_token_id = tokenizer.convert_tokens_to_ids(
             ADDITIONAL_SPECIAL_TOKENS[2]
+        )
+        backbone.config.look_pad_token_id = tokenizer.convert_tokens_to_ids(
+            ADDITIONAL_SPECIAL_TOKENS[3]
+        )
+        backbone.config.click_pad_token_id = tokenizer.convert_tokens_to_ids(
+            ADDITIONAL_SPECIAL_TOKENS[4]
         )
 
         # Load weights: detect LoRA vs full model

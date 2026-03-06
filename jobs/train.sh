@@ -104,6 +104,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
     --click_phase_step 0 \
+    --use_dual_tokens true \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \

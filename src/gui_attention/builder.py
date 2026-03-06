@@ -18,10 +18,13 @@ from transformers import AutoProcessor
 
 from gui_attention.constants import (
     CHAT_TEMPLATE,
+    CLICK_SUFFIX,
     GROUNDING_SYSTEM_MESSAGE,
     HIGH_RES_MAX_PIXELS,
+    LOOK_SUFFIX,
     LOW_RES_MAX_PIXELS,
     PLACEHOLDER_SUFFIX,
+    ROUND0_SUFFIX,
 )
 
 
@@ -74,8 +77,11 @@ class MultiRoundInputBuilder:
 
     # ----- round 0: low-res full image ------------------------------------
 
-    def build_round0(self, image_or_path, instruction: str):
+    def build_round0(self, image_or_path, instruction: str, use_dual_tokens: bool = False):
         """Build round-0 inputs (full image at low resolution).
+
+        Args:
+            use_dual_tokens: if True, use <look_pad> for round 0 instead of <pointer_pad>.
 
         Returns (inputs_dict, raw_text, images_list).
         """
@@ -93,7 +99,7 @@ class MultiRoundInputBuilder:
         text = self._get_processor(max_px).apply_chat_template(
             conv, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE,
         )
-        text += PLACEHOLDER_SUFFIX
+        text += ROUND0_SUFFIX if use_dual_tokens else PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)
 
         resized_r0 = _presize_image(images[0], max_px, self.min_pixels)
@@ -109,23 +115,31 @@ class MultiRoundInputBuilder:
     # ----- subsequent rounds: high-res crop -------------------------------
 
     def extend_with_crop(self, prev_text: str, prev_images: list,
-                         crop_pil: Image.Image, crop_bbox: tuple):
+                         crop_pil: Image.Image, crop_bbox: tuple,
+                         gt_in_crop: bool = False, use_dual_tokens: bool = False):
         """Append a high-res crop.
 
         Args:
             crop_bbox: (x1, y1, x2, y2) normalised in original image coords.
+            gt_in_crop: whether GT is in this crop (used for dual token selection).
+            use_dual_tokens: if True, use <look_pad> or <click_pad> based on gt_in_crop.
 
         Returns (inputs_dict, raw_text, images_list).
         """
         max_px = self.high_res_max_pixels
         round_num = len(self.image_infos)
 
+        if use_dual_tokens:
+            suffix = CLICK_SUFFIX if gt_in_crop else LOOK_SUFFIX
+        else:
+            suffix = PLACEHOLDER_SUFFIX
+
         zoom_text = (
             f"\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
             f"[Zoomed region round {round_num} around "
             f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
             f"<|im_end|>\n"
-            + PLACEHOLDER_SUFFIX
+            + suffix
         )
         new_text = prev_text + zoom_text
         new_images = prev_images + [crop_pil]

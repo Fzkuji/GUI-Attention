@@ -9,10 +9,16 @@ DEFAULT_POINTER_START_TOKEN = "<|pointer_start|>"
 DEFAULT_POINTER_END_TOKEN = "<|pointer_end|>"
 DEFAULT_POINTER_PAD_TOKEN = "<|pointer_pad|>"
 
+# Dual-action tokens: look (explore) vs click (commit)
+DEFAULT_LOOK_PAD_TOKEN = "<|look_pad|>"
+DEFAULT_CLICK_PAD_TOKEN = "<|click_pad|>"
+
 ADDITIONAL_SPECIAL_TOKENS = [
     DEFAULT_POINTER_START_TOKEN,
     DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
+    DEFAULT_LOOK_PAD_TOKEN,
+    DEFAULT_CLICK_PAD_TOKEN,
 ]
 
 # ---------------------------------------------------------------------------
@@ -68,7 +74,31 @@ HIGH_RES_MAX_PIXELS = 5_720_064  # Same as GUI-Actor (~5.7M)
 # ---------------------------------------------------------------------------
 # Placeholder suffix appended after each round's image+instruction
 # ---------------------------------------------------------------------------
+# Legacy (single pointer_pad for backward compat)
 PLACEHOLDER_SUFFIX = (
     "<|im_start|>assistant<|recipient|>os\n"
     "pyautogui.click(<|pointer_start|><|pointer_pad|><|pointer_end|>)"
+)
+
+# Dual-action suffixes: look (explore) vs click (commit)
+LOOK_SUFFIX = (
+    "<|im_start|>assistant\n"
+    "The target is not in the current view. Let me look at another region."
+    "<|pointer_start|><|look_pad|><|pointer_end|>"
+    "<|im_end|>\n"
+)
+
+CLICK_SUFFIX = (
+    "<|im_start|>assistant\n"
+    "I found the target in this region."
+    "<|pointer_start|><|click_pad|><|pointer_end|>"
+    "<|im_end|>\n"
+)
+
+# Round 0: always look (explore the full image first)
+ROUND0_SUFFIX = (
+    "<|im_start|>assistant\n"
+    "Let me examine the screen to find the target."
+    "<|pointer_start|><|look_pad|><|pointer_end|>"
+    "<|im_end|>\n"
 )

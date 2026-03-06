@@ -99,6 +99,7 @@ class ScriptArgs:
     crop_jitter: float = field(default=0.05, metadata={"help": "Random jitter for crop center (fraction of image)"})
     max_saccade_rounds: int = field(default=6, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades)."})
     click_phase_step: int = field(default=3000, metadata={"help": "Step to start training ClickHead. Before this, only LookHead trains."})
+    use_dual_tokens: bool = field(default=False, metadata={"help": "Use <look_pad>/<click_pad> dual tokens instead of <pointer_pad>."})
     # Loss weights
     lm_loss_weight: float = field(default=0.1, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
@@ -325,6 +326,11 @@ class SaccadeTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
+        if self.sa.use_dual_tokens:
+            look_id = self.model.config.look_pad_token_id
+            click_id = self.model.config.click_pad_token_id
+            # Use all three as anchor sources (look_pad, click_pad, pointer_pad)
+            pp_id = [look_id, click_id, pp_id]
         merge = _get_visual_module(self.model).spatial_merge_size
 
         self.builder.reset()
@@ -347,6 +353,7 @@ class SaccadeTrainer:
                 # ===== Round 0: Low-res full image =====
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
+                    use_dual_tokens=self.sa.use_dual_tokens,
                 )
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 # Enable grad on pixel_values for gradient checkpointing
@@ -424,21 +431,26 @@ class SaccadeTrainer:
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
+                    use_dual_tokens=self.sa.use_dual_tokens,
                 )
                 for prev_ri in range(1, ri):
                     prev_px, prev_py = round_preds[prev_ri - 1]
                     prev_crop, prev_bbox = crop_image(img, prev_px, prev_py,
                                                        crop_size=self.sa.crop_size,
                                                        crop_upscale=self.sa.crop_upscale)
+                    # Previous crops were always "look" (not the final click)
+                    prev_gt_in = point_in_bbox(gt_cx, gt_cy, prev_bbox)
                     try:
                         r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                             cur_text, cur_images, prev_crop, prev_bbox,
+                            gt_in_crop=prev_gt_in, use_dual_tokens=self.sa.use_dual_tokens,
                         )
                     except Exception:
                         break
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
+                        gt_in_crop=gt_in_crop, use_dual_tokens=self.sa.use_dual_tokens,
                     )
                 except Exception:
                     break
