@@ -741,8 +741,9 @@ class SaccadeTrainer:
                 if micro % ga == 0:
                     if self.world_size > 1:
                         for p in self.model.parameters():
-                            if p.grad is not None:
-                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                            if p.grad is None:
+                                p.grad = torch.zeros_like(p)
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
                     if any(p.grad is not None for p in self.model.parameters()):
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                         self.optimizer.step()
