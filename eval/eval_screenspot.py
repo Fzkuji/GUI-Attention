@@ -47,7 +47,9 @@ from gui_attention.model import Qwen25VLWithDualHead
 
 DOMAIN_MAP = {
     "windows": "desktop", "macos": "desktop", "linux": "desktop",
+    "desktop": "desktop",
     "ios": "mobile", "android": "mobile",
+    "mobile": "mobile",
     "web": "web",
 }
 
