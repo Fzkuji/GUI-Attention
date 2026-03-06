@@ -412,6 +412,7 @@ def evaluate_sample(sample, model, tokenizer, builder, args, device, tmp_dir, ra
         crop_size=args.crop_size,
         crop_upscale=args.crop_upscale,
         device=str(device),
+        use_dual_tokens=args.use_dual_tokens,
     )
     t_elapsed = time.time() - t_start
 
@@ -514,17 +515,20 @@ def main():
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
 
     # Saccade
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--crop_ratio", type=float, default=0.0)
-    parser.add_argument("--crop_size", type=int, default=252)
+    parser.add_argument("--crop_size", type=int, default=308)
     parser.add_argument("--crop_upscale", type=int, default=3)
+    parser.add_argument("--use_dual_tokens", dest="use_dual_tokens", action="store_true")
+    parser.add_argument("--no_use_dual_tokens", dest="use_dual_tokens", action="store_false")
+    parser.set_defaults(use_dual_tokens=True)
     parser.add_argument("--adaptive_crop", action="store_true", default=True,
                         help="Use 3x3 adaptive crop (default: True)")
     parser.add_argument("--no_adaptive_crop", action="store_true",
                         help="Disable adaptive crop, use fixed crop_size")
 
     # Resolution
-    parser.add_argument("--low_res_max_pixels", type=int, default=400000)
+    parser.add_argument("--low_res_max_pixels", type=int, default=1001600)
 
     # Misc
     parser.add_argument("--save_path", type=str, default=None)
@@ -554,6 +558,7 @@ def main():
         print(f"  checkpoint:  {args.checkpoint}")
         print(f"  base_model:  {args.base_model}")
         print(f"  rounds:      {args.rounds}")
+        print(f"  dual_tokens: {args.use_dual_tokens}")
         print(f"  adaptive:    {args.adaptive_crop}")
         if not args.adaptive_crop:
             up = args.crop_size * args.crop_upscale

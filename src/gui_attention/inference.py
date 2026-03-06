@@ -1,10 +1,9 @@
 """Inference utilities for saccade foveation with Dual Head.
 
 Multi-round saccade:
-  Round 0: low-res full image → LookHead → argmax → crop around it
-  Round N: low-res + ALL historical crops (visible) → LookHead
-           → argmax in high-res crop → ClickHead on crop tokens → precise (x,y) → stop
-           → argmax in low-res → saccade (continue)
+  Round 0: low-res full image → LookHead
+  Round N: low-res + ALL historical crops (visible) → LookHead → saccade
+  End: ClickHead on ALL accumulated crop tokens for final precise (x, y)
 """
 
 from typing import List, Tuple
@@ -101,18 +100,18 @@ def run_saccade_inference(
     device: str = "cuda:0",
     activation_threshold: float = 0.3,
     use_click_head: bool = True,
+    use_dual_tokens: bool = True,
 ) -> dict:
     """Multi-round saccade inference with LookHead + ClickHead.
 
-    Round 0: low-res full image → LookHead → BFS region → crop center.
+    Round 0: low-res full image → LookHead → argmax token decode.
     Round 1+: low-res + all crops (visible) → LookHead
-              → argmax in high-res → ClickHead on crop → precise (x,y) → stop
-              → argmax in low-res → saccade.
+              → decode attended token to global point → continue saccade.
+    After all rounds, run ClickHead once on all crop tokens for final output.
 
     Args:
-        use_click_head: if True, use ClickHead for precise positioning when
-                       LookHead selects a high-res crop. If False, use
-                       LookHead's attention directly (Phase 1 behavior).
+        use_click_head: if True, run final ClickHead over accumulated crops.
+                        If False, return the last LookHead prediction.
 
     Returns:
         dict with topk_points, n_width, n_height, num_rounds, total_vis_tokens.
@@ -124,10 +123,10 @@ def run_saccade_inference(
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
     # Support dual tokens: anchor can be look_pad, click_pad, or pointer_pad
-    if hasattr(model.config, 'look_pad_token_id') and hasattr(model.config, 'click_pad_token_id'):
+    if use_dual_tokens and hasattr(model.config, 'look_pad_token_id') and hasattr(model.config, 'click_pad_token_id'):
         look_id = model.config.look_pad_token_id
         click_id = model.config.click_pad_token_id
-        pp_id = list(set([look_id, click_id, pp_id]))  # deduplicate
+        pp_id = [look_id, click_id, pp_id]
 
     # Find visual module for merge_size
     _backbone = model.backbone
@@ -143,10 +142,10 @@ def run_saccade_inference(
         raise AttributeError(f"Cannot find visual module in {type(_inner)}")
     merge = _visual.spatial_merge_size
 
-    img_w, img_h = image.size
-
     # Round 0: low-res only
-    r0_inputs, cur_text, cur_images = builder.build_round0(image_path, instruction)
+    r0_inputs, _, _ = builder.build_round0(
+        image_path, instruction, use_dual_tokens=use_dual_tokens
+    )
     inp = {k: v.to(device) for k, v in r0_inputs.items()}
 
     with torch.no_grad():
@@ -175,27 +174,62 @@ def run_saccade_inference(
 
     n_low = vis_ranges[0][1]
     low_attn = attn_1d[:n_low]
-    best_pt, _, _ = get_prediction_region_point(low_attn, nw0, nh0, activation_threshold)
-    focus_x, focus_y = best_pt
+    best_idx = low_attn.argmax().item()
+    focus_x, focus_y = token_to_spatial(best_idx, nw0, nh0, attn_weights=low_attn)
 
-    decision = saccade.decide_round0(state, focus_x, focus_y)
+    saccade.decide_round0(state, focus_x, focus_y)
     nw_final, nh_final = nw0, nh0
     final_point = (focus_x, focus_y)
     total_vis_tokens = vis_embeds.shape[0] if vis_embeds is not None else 0
+    last_look_point = final_point
+    last_look_dims = (nw0, nh0)
+    round_preds = [final_point]
+
+    # Keep the latest full context for final ClickHead on accumulated crops.
+    last_vis_embeds = None
+    last_vis_ranges = None
+    last_grid_dims = None
+    last_anchor = None
 
     for ri in range(1, max_rounds):
-        if not saccade.should_continue(state, ri):
-            break
-
         # Crop around current focus
         cropped, crop_bbox = crop_image(image, focus_x, focus_y,
                                         crop_size=crop_size,
                                         crop_upscale=crop_upscale)
 
-        # Extend context
+        # Rebuild full context to match training: low-res + all historical crops + latest crop.
+        builder.reset()
+        ri_inputs, cur_text, cur_images = builder.build_round0(
+            image_path, instruction, use_dual_tokens=use_dual_tokens
+        )
+        rebuild_failed = False
+        for prev_ri in range(1, ri):
+            prev_px, prev_py = round_preds[prev_ri - 1]
+            prev_crop, prev_bbox = crop_image(
+                image, prev_px, prev_py, crop_size=crop_size, crop_upscale=crop_upscale
+            )
+            try:
+                ri_inputs, cur_text, cur_images = builder.extend_with_crop(
+                    cur_text,
+                    cur_images,
+                    prev_crop,
+                    prev_bbox,
+                    gt_in_crop=None,
+                    use_dual_tokens=use_dual_tokens,
+                )
+            except Exception:
+                rebuild_failed = True
+                break
+        if rebuild_failed:
+            break
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                cur_text, cur_images, cropped, crop_bbox,
+                cur_text,
+                cur_images,
+                cropped,
+                crop_bbox,
+                gt_in_crop=None,
+                use_dual_tokens=use_dual_tokens,
             )
         except Exception:
             break
@@ -216,97 +250,105 @@ def run_saccade_inference(
         _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
         anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=ri)
 
-        if vis_embeds is None or anchor is None or len(vis_ranges) < 2:
+        if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
             break
 
         grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
-        nh_low, nw_low = grid_dims[0]
 
-        # Mask: current crop overlap on low-res
-        this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
+        # Mask: current crop overlap on low-res + old crop tokens
+        this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox).to(device)
         n_low = vis_ranges[0][1]
-        n_total = sum(r[1] for r in vis_ranges)
+        n_total = vis_embeds.shape[0]
+        latest_img_idx = len(vis_ranges) - 1
         full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
         full_mask[:n_low] = this_crop_mask
+        for prev_i in range(1, latest_img_idx):
+            off_prev, ntok_prev = vis_ranges[prev_i]
+            full_mask[off_prev:off_prev + ntok_prev] = True
 
         total_vis_tokens = n_total
+        # Forced saccade mode: always run LookHead every round.
+        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
+        attn_1d = attn_ri.squeeze(0)
 
-        # --- Stop decision via dual token logits ---
-        # Check if model predicts <click_pad> (stop) or <look_pad> (continue)
-        # by comparing logits at the last token position
-        model_wants_click = False
-        if hasattr(model.config, 'click_pad_token_id') and hasattr(model.config, 'look_pad_token_id'):
-            logits = outputs.logits[0, -1]  # last token logits
-            click_logit = logits[model.config.click_pad_token_id].item()
-            look_logit = logits[model.config.look_pad_token_id].item()
-            model_wants_click = click_logit > look_logit
-
-        if model_wants_click and use_click_head:
-            # Model decided to click — use ClickHead on ALL crop tokens
-            crop_vis_list = []
-            crop_meta = []  # (n_tokens, grid_w, grid_h, global_bbox)
-            for ci_idx in range(1, len(vis_ranges)):
-                ci_off, ci_n = vis_ranges[ci_idx]
-                ci_info = builder.image_infos[ci_idx]
-                if ci_info.resolution == "high":
-                    crop_vis_list.append(vis_embeds[ci_off:ci_off + ci_n])
-                    ci_nh, ci_nw = grid_dims[ci_idx] if ci_idx < len(grid_dims) else (1, 1)
-                    crop_meta.append((ci_n, ci_nw, ci_nh, ci_info.global_bbox))
-
-            if crop_vis_list:
-                combined_crop_vis = torch.cat(crop_vis_list, dim=0)
-                click_attn, _, _ = model.dual_head.click(combined_crop_vis, anchor)
-                click_1d = click_attn.squeeze(0)
-
-                # Find which crop token has highest attention
-                global_argmax = click_1d.argmax().item()
-                running = 0
-                for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
-                    if running + ci_n > global_argmax:
-                        local_tok = global_argmax - running
-                        lx = ((local_tok % ci_nw) + 0.5) / ci_nw
-                        ly = ((local_tok // ci_nw) + 0.5) / ci_nh
-                        bx1, by1, bx2, by2 = ci_bbox
-                        global_x = bx1 + lx * (bx2 - bx1)
-                        global_y = by1 + ly * (by2 - by1)
-                        break
-                    running += ci_n
-                else:
-                    global_x, global_y = focus_x, focus_y
-            else:
-                global_x, global_y = focus_x, focus_y
-
-            nw_final, nh_final = nw_low, nh_low
-            final_point = (global_x, global_y)
-            state.stopped = True
+        img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
+        if img_idx >= len(grid_dims) or img_idx >= len(builder.image_infos):
             break
+        info = builder.image_infos[img_idx]
 
+        nh_a, nw_a = grid_dims[img_idx]
+        off_a, n_a = vis_ranges[img_idx]
+        img_attn = attn_1d[off_a:off_a + n_a]
+        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+
+        bx1, by1, bx2, by2 = info.global_bbox
+        global_x = bx1 + lx * (bx2 - bx1)
+        global_y = by1 + ly * (by2 - by1)
+
+        attended_source = "high" if info.resolution == "high" else "low"
+        state.record(global_x, global_y, attended_source)
+
+        # Continue saccading regardless of attended source; stop only at max_rounds.
+        focus_x, focus_y = global_x, global_y
+        round_preds.append((focus_x, focus_y))
+        last_look_point = (global_x, global_y)
+        last_look_dims = (nw_a, nh_a)
+
+        last_vis_embeds = vis_embeds
+        last_vis_ranges = vis_ranges
+        last_grid_dims = grid_dims
+        last_anchor = anchor
+
+    # Final prediction: ClickHead on all accumulated crop tokens.
+    if (
+        use_click_head
+        and last_vis_embeds is not None
+        and last_anchor is not None
+        and last_vis_ranges is not None
+        and last_grid_dims is not None
+        and len(last_vis_ranges) > 1
+    ):
+        crop_vis_list = []
+        crop_meta = []  # (n_tokens, grid_w, grid_h, global_bbox)
+        for ci_idx in range(1, len(last_vis_ranges)):
+            if ci_idx >= len(last_grid_dims) or ci_idx >= len(builder.image_infos):
+                continue
+            ci_off, ci_n = last_vis_ranges[ci_idx]
+            ci_info = builder.image_infos[ci_idx]
+            if ci_info.resolution != "high":
+                continue
+            ci_nh, ci_nw = last_grid_dims[ci_idx]
+            crop_vis_list.append(last_vis_embeds[ci_off:ci_off + ci_n])
+            crop_meta.append((ci_n, ci_nw, ci_nh, ci_info.global_bbox))
+
+        if crop_vis_list:
+            combined_crop_vis = torch.cat(crop_vis_list, dim=0)
+            click_attn, _, _ = model.dual_head.click(combined_crop_vis, last_anchor)
+            click_1d = click_attn.squeeze(0)
+            global_argmax = click_1d.argmax().item()
+
+            running = 0
+            for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
+                if running + ci_n > global_argmax:
+                    local_tok = global_argmax - running
+                    lx = ((local_tok % ci_nw) + 0.5) / ci_nw
+                    ly = ((local_tok // ci_nw) + 0.5) / ci_nh
+                    bx1, by1, bx2, by2 = ci_bbox
+                    final_point = (
+                        bx1 + lx * (bx2 - bx1),
+                        by1 + ly * (by2 - by1),
+                    )
+                    # Return clicked crop grid dims, not low-res dims.
+                    nw_final, nh_final = ci_nw, ci_nh
+                    break
+                running += ci_n
         else:
-            # Model decided to look (saccade) — use LookHead to find next focus
-            attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-            attn_1d = attn_ri.squeeze(0)
-
-            img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
-            info = builder.image_infos[img_idx]
-
-            if img_idx < len(grid_dims):
-                nh_a, nw_a = grid_dims[img_idx]
-            else:
-                break
-
-            off_a, n_a = vis_ranges[img_idx]
-            img_attn = attn_1d[off_a:off_a + n_a]
-            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-
-            bx1, by1, bx2, by2 = info.global_bbox
-            global_x = bx1 + lx * (bx2 - bx1)
-            global_y = by1 + ly * (by2 - by1)
-
-            nw_final, nh_final = nw_a, nh_a
-            final_point = (global_x, global_y)
-
-            # Saccade: update focus
-            focus_x, focus_y = global_x, global_y
+            final_point = last_look_point
+            nw_final, nh_final = last_look_dims
+    else:
+        # Fallback when no crop exists: use last LookHead prediction.
+        final_point = last_look_point
+        nw_final, nh_final = last_look_dims
 
     return {
         "topk_points": [final_point],
