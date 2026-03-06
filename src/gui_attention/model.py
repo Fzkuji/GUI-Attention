@@ -208,6 +208,10 @@ class Qwen25VLWithDualHead(nn.Module):
             base = backbone
         return base
 
+    def generate(self, **kwargs):
+        """Delegate to backbone's generate() for autoregressive decoding."""
+        return self.backbone.generate(**kwargs)
+
     def forward(self, input_ids, attention_mask=None, pixel_values=None,
                 image_grid_thw=None, **kwargs):
         """Run backbone forward pass with hidden state output."""
