@@ -349,14 +349,14 @@ class SaccadeTrainer:
         pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
         ga_scale = max(self.args.gradient_accumulation_steps, 1)
 
-        def _backward_immediate(loss_tensor):
-            """Backward immediately to release computation graph.
+        def _backward_round(round_loss):
+            """Backward the accumulated loss for this round, then release graph.
             Gradients accumulate on parameters across rounds."""
             nonlocal total_loss_value
-            if loss_tensor is not None and loss_tensor.requires_grad:
-                scaled = loss_tensor / (max_rounds * ga_scale)
+            if round_loss is not None and round_loss.requires_grad:
+                scaled = round_loss / (max_rounds * ga_scale)
                 scaled.backward()
-                total_loss_value += loss_tensor.item()
+                total_loss_value += round_loss.item()
 
         for ri in range(max_rounds):
             if ri == 0:
@@ -384,9 +384,10 @@ class SaccadeTrainer:
                 )
                 last_hs = outputs.hidden_states[-1]
 
-                # LM loss — backward immediately
+                # Accumulate round loss, backward at end of round
+                round_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
-                    _backward_immediate(self.sa.lm_loss_weight * outputs.loss)
+                    round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
                 # Visual embeds (pre-LLM)
@@ -410,8 +411,11 @@ class SaccadeTrainer:
                     vis_embeds, anchor, labels=look_labels)
 
                 if look_loss is not None:
-                    _backward_immediate(self.sa.look_loss_weight * look_loss)
+                    round_loss = round_loss + self.sa.look_loss_weight * look_loss
                     n_valid += 1
+
+                # Backward round 0 loss — releases computation graph
+                _backward_round(round_loss)
 
                 with torch.no_grad():
                     # Decode prediction from LookHead attention
@@ -483,8 +487,10 @@ class SaccadeTrainer:
                 )
                 last_hs = outputs.hidden_states[-1]
 
+                # Accumulate round loss for this crop round
+                round_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
-                    _backward_immediate(self.sa.lm_loss_weight * outputs.loss)
+                    round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
                     self.metrics["lm_loss"].append(outputs.loss.item())
 
                 vis_embeds = self.model.extract_visual_embeds(
@@ -495,6 +501,7 @@ class SaccadeTrainer:
                     last_hs, inp["input_ids"], pp_id, n=ri)
 
                 if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
+                    _backward_round(round_loss)
                     break
 
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
@@ -541,7 +548,7 @@ class SaccadeTrainer:
                     attn, look_loss, _ = self.model.dual_head.look(
                         vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                     if look_loss is not None:
-                        _backward_immediate(self.sa.look_loss_weight * look_loss)
+                        round_loss = round_loss + self.sa.look_loss_weight * look_loss
                         n_valid += 1
 
                     # ClickHead (after click_phase_step): precise position on ALL crop tokens
@@ -579,7 +586,7 @@ class SaccadeTrainer:
                         click_attn, click_loss, _ = self.model.dual_head.click(
                             combined_crop_vis, anchor, labels=combined_click_labels)
                         if click_loss is not None:
-                            _backward_immediate(self.sa.click_loss_weight * click_loss)
+                            round_loss = round_loss + self.sa.click_loss_weight * click_loss
                             self.metrics["click_loss"].append(click_loss.item())
 
                         # Decode ClickHead prediction → global coords
@@ -601,6 +608,9 @@ class SaccadeTrainer:
                                     )
                                     break
                                 running += ci["n_tokens"]
+
+                    # Backward round loss before break
+                    _backward_round(round_loss)
 
                     # Record LookHead prediction and break
                     with torch.no_grad():
@@ -631,12 +641,15 @@ class SaccadeTrainer:
                         attn, look_loss, _ = self.model.dual_head.look(
                             vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                         if look_loss is not None:
-                            _backward_immediate(self.sa.look_loss_weight * look_loss)
+                            round_loss = round_loss + self.sa.look_loss_weight * look_loss
                             n_valid += 1
                     else:
                         with torch.no_grad():
                             attn, _, _ = self.model.dual_head.look(
                                 vis_embeds, anchor, mask=full_mask)
+
+                    # Backward round loss for saccade round
+                    _backward_round(round_loss)
 
                 # Record prediction for saccade rounds
                 with torch.no_grad():
