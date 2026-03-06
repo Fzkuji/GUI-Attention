@@ -116,20 +116,26 @@ class MultiRoundInputBuilder:
 
     def extend_with_crop(self, prev_text: str, prev_images: list,
                          crop_pil: Image.Image, crop_bbox: tuple,
-                         gt_in_crop: bool = False, use_dual_tokens: bool = False):
+                         gt_in_crop: bool = False, use_dual_tokens: bool = False,
+                         for_generation: bool = False):
         """Append a high-res crop.
 
         Args:
             crop_bbox: (x1, y1, x2, y2) normalised in original image coords.
             gt_in_crop: whether GT is in this crop (used for dual token selection).
             use_dual_tokens: if True, use <look_pad> or <click_pad> based on gt_in_crop.
+            for_generation: if True, end with generation prompt (no suffix) for
+                           autoregressive decoding. Model decides look vs click.
 
         Returns (inputs_dict, raw_text, images_list).
         """
         max_px = self.high_res_max_pixels
         round_num = len(self.image_infos)
 
-        if use_dual_tokens:
+        if for_generation:
+            # No suffix — let model generate and decide look vs click
+            suffix = "<|im_start|>assistant\n"
+        elif use_dual_tokens:
             suffix = CLICK_SUFFIX if gt_in_crop else LOOK_SUFFIX
         else:
             suffix = PLACEHOLDER_SUFFIX

@@ -222,6 +222,7 @@ def run_saccade_inference(
                 break
         if rebuild_failed:
             break
+        # Build context ending with generation prompt (no suffix)
         try:
             ri_inputs, cur_text, cur_images = builder.extend_with_crop(
                 cur_text,
@@ -230,11 +231,59 @@ def run_saccade_inference(
                 crop_bbox,
                 gt_in_crop=None,
                 use_dual_tokens=use_dual_tokens,
+                for_generation=True,
             )
         except Exception:
             break
 
         inp = {k: v.to(device) for k, v in ri_inputs.items()}
+
+        # Autoregressive generation: let model decide look vs click
+        click_pad_id = getattr(model.config, 'click_pad_token_id',
+                               model.config.pointer_pad_token_id)
+        look_pad_id = getattr(model.config, 'look_pad_token_id', None)
+
+        with torch.no_grad():
+            gen_ids = model.generate(
+                input_ids=inp["input_ids"],
+                attention_mask=inp.get("attention_mask"),
+                pixel_values=inp.get("pixel_values"),
+                image_grid_thw=inp.get("image_grid_thw"),
+                max_new_tokens=30,
+                do_sample=False,
+            )
+        # Extract only newly generated tokens
+        new_tokens = gen_ids[0, inp["input_ids"].shape[1]:]
+        new_token_list = new_tokens.tolist()
+
+        # Check which pad token the model generated
+        model_chose_click = click_pad_id in new_token_list
+        model_chose_look = look_pad_id in new_token_list if look_pad_id else False
+
+        # Now do a full forward to get hidden states for the action heads
+        # Use the FULL generated sequence (input + generated) to match training
+        # But we need the suffix to be included for proper anchor extraction
+        # Re-build with the correct suffix based on model's decision
+        builder.reset()
+        ri_inputs_full, cur_text, cur_images = builder.build_round0(
+            image_path, instruction, use_dual_tokens=use_dual_tokens
+        )
+        for prev_ri in range(1, ri):
+            prev_px, prev_py = round_preds[prev_ri - 1]
+            prev_crop, prev_bbox = crop_image(
+                image, prev_px, prev_py, crop_size=crop_size, crop_upscale=crop_upscale
+            )
+            ri_inputs_full, cur_text, cur_images = builder.extend_with_crop(
+                cur_text, cur_images, prev_crop, prev_bbox,
+                gt_in_crop=False, use_dual_tokens=use_dual_tokens,
+            )
+        # Current crop with correct suffix
+        ri_inputs_full, cur_text, cur_images = builder.extend_with_crop(
+            cur_text, cur_images, cropped, crop_bbox,
+            gt_in_crop=model_chose_click, use_dual_tokens=use_dual_tokens,
+        )
+
+        inp = {k: v.to(device) for k, v in ri_inputs_full.items()}
 
         with torch.no_grad():
             outputs = model(
@@ -267,26 +316,6 @@ def run_saccade_inference(
             full_mask[off_prev:off_prev + ntok_prev] = True
 
         total_vis_tokens = n_total
-        # Forced saccade mode: always run LookHead every round.
-        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-        attn_1d = attn_ri.squeeze(0)
-
-        img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
-        if img_idx >= len(grid_dims) or img_idx >= len(builder.image_infos):
-            break
-        info = builder.image_infos[img_idx]
-
-        nh_a, nw_a = grid_dims[img_idx]
-        off_a, n_a = vis_ranges[img_idx]
-        img_attn = attn_1d[off_a:off_a + n_a]
-        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-
-        bx1, by1, bx2, by2 = info.global_bbox
-        global_x = bx1 + lx * (bx2 - bx1)
-        global_y = by1 + ly * (by2 - by1)
-
-        attended_source = "high" if info.resolution == "high" else "low"
-        state.record(global_x, global_y, attended_source)
 
         # Save state for ClickHead
         last_vis_embeds = vis_embeds
@@ -294,13 +323,30 @@ def run_saccade_inference(
         last_grid_dims = grid_dims
         last_anchor = anchor
 
-        if attended_source == "high":
-            # LookHead chose crop → model thinks target is in crop → stop & use ClickHead
-            last_look_point = (global_x, global_y)
-            last_look_dims = (nw_a, nh_a)
+        if model_chose_click:
+            # Model generated <pointer_pad> → ClickHead → stop
+            last_look_point = (focus_x, focus_y)
+            last_look_dims = (nw0, nh0)
             break
         else:
-            # LookHead chose low-res → saccade to new position
+            # Model generated <look_pad> (or neither) → LookHead → saccade
+            attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
+            attn_1d = attn_ri.squeeze(0)
+
+            img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
+            if img_idx >= len(grid_dims) or img_idx >= len(builder.image_infos):
+                break
+            info = builder.image_infos[img_idx]
+
+            nh_a, nw_a = grid_dims[img_idx]
+            off_a, n_a = vis_ranges[img_idx]
+            img_attn = attn_1d[off_a:off_a + n_a]
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+
+            bx1, by1, bx2, by2 = info.global_bbox
+            global_x = bx1 + lx * (bx2 - bx1)
+            global_y = by1 + ly * (by2 - by1)
+
             focus_x, focus_y = global_x, global_y
             round_preds.append((focus_x, focus_y))
             last_look_point = (global_x, global_y)
