@@ -121,7 +121,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
-    --save_steps 1000 \
+    --save_steps 500 \
     --save_total_limit 3 \
     --bf16 true \
     --gradient_checkpointing true \
