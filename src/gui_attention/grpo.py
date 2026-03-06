@@ -68,6 +68,7 @@ class GRPOArgs:
     group_size: int = field(default=4, metadata={"help": "Number of trajectories per sample (G)"})
     reward_hit: float = field(default=1.0, metadata={"help": "Reward for clicking in GT bbox"})
     reward_round_penalty: float = field(default=0.05, metadata={"help": "Penalty per round used"})
+    reward_overlap_penalty: float = field(default=0.1, metadata={"help": "Penalty weight for crop overlap (IoU with previous crops)"})
     kl_coeff: float = field(default=0.01, metadata={"help": "KL penalty coefficient against reference"})
     clip_eps: float = field(default=0.2, metadata={"help": "PPO-style clipping epsilon"})
     temperature: float = field(default=1.0, metadata={"help": "Sampling temperature for attention distributions"})
@@ -432,10 +433,34 @@ class GRPOTrainer:
 
     # -- compute rewards ------------------------------------------------------
 
+    @staticmethod
+    def _bbox_iou(a, b):
+        """IoU between two (x1, y1, x2, y2) bboxes."""
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _compute_overlap_penalty(self, crop_bboxes):
+        """Sum of max IoU with any previous crop, for each crop."""
+        total = 0.0
+        for i, bbox in enumerate(crop_bboxes):
+            if i == 0:
+                continue
+            max_iou = max(self._bbox_iou(bbox, crop_bboxes[j]) for j in range(i))
+            total += max_iou
+        return total
+
     def _compute_rewards(self, trajectories: list):
         """Compute rewards for a group of trajectories (same sample).
 
         reward = hit * reward_hit - round_penalty * n_rounds
+                 - overlap_penalty * sum_of_max_ious
         Then group-normalize (GRPO).
         """
         for traj in trajectories:
@@ -443,6 +468,9 @@ class GRPOTrainer:
             if traj.hit:
                 r += self.ga.reward_hit
             r -= self.ga.reward_round_penalty * traj.n_rounds
+            # Overlap penalty: penalize revisiting same areas
+            if traj.crop_bboxes and self.ga.reward_overlap_penalty > 0:
+                r -= self.ga.reward_overlap_penalty * self._compute_overlap_penalty(traj.crop_bboxes)
             traj.reward = r
 
         # Group normalization
