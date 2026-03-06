@@ -115,6 +115,10 @@ class ScriptArgs:
     max_samples_per_dataset: Optional[str] = field(default=None, metadata={
         "help": "Comma-separated per-dataset max samples, e.g. '0,0,0,60000,0'. 0=no limit."
     })
+    # ClickHead initialization from GUI-Actor
+    click_head_from: Optional[str] = field(default=None, metadata={
+        "help": "Path to GUI-Actor checkpoint (safetensors dir) to init ClickHead from pointer_head weights"
+    })
     # Resume
     resume_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
 
@@ -829,6 +833,7 @@ def main():
         torch_dtype=torch.bfloat16 if ta.bf16 else None,
         gradient_checkpointing=ta.gradient_checkpointing,
         use_lora=sa.use_lora,
+        click_head_from=sa.click_head_from,
     )
 
     # Load checkpoint if resuming

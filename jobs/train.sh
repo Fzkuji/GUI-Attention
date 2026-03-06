@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# v14 Training: Dual Head (LookHead + ClickHead)
+# v15 Training: Dual Head (LookHead + ClickHead)
 #
-# Multi-round from step 0, both heads train together.
-# No warmup phases — LookHead + ClickHead learn simultaneously.
+# ClickHead initialized from GUI-Actor pointer head (43% ScreenSpot-Pro).
+# Multi-round from step 0; LookHead trains alone first, ClickHead joins at step 1000.
 #
 # Config: LoRA + 1M low-res + 308px crop + mask old crops
 #
@@ -77,28 +77,33 @@ if [ -n "$RESUME_CKPT" ]; then
     RESUME_ARG="--resume_ckpt $RESUME_CKPT"
 fi
 
+CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-$MODEL_DIR/GUI-AIMA-3B}"
+
 echo "============================================================"
-echo "  GUI-Attention v14 Training (Dual Head: LookHead + ClickHead)"
-echo "  Multi-round from step 0; LookHead only → step 3000: +ClickHead"
+echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
+echo "  ClickHead initialized from GUI-Actor pointer head"
+echo "  Multi-round from step 0; LookHead only → step 1000: +ClickHead"
 echo "  GPUs: $NUM_GPUS"
-echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
-echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v14_dual}"
+echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-AIMA-3B}"
+echo "  ClickHead from: $CLICK_HEAD_FROM"
+echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v15_dual}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
     src/gui_attention/train.py \
-    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}" \
+    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/GUI-AIMA-3B}" \
+    --click_head_from "$CLICK_HEAD_FROM" \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
     --max_samples_per_dataset "$PER_DS_LIMITS" \
-    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v14_dual}" \
+    --output_dir "${OUTPUT_DIR:-$RESULT_DIR/ours_v15_dual}" \
     --min_pixels 3136 \
     --low_res_max_pixels 1001600 \
     --crop_size 308 \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
-    --click_phase_step 3000 \
+    --click_phase_step 1000 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
@@ -115,10 +120,10 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
-    --save_steps 5000 \
+    --save_steps 1000 \
     --save_total_limit 3 \
     --bf16 true \
     --gradient_checkpointing true \
     --report_to none \
     $RESUME_ARG \
-    2>&1 | tee "$LOG_DIR/train_v14_dual.txt"
+    2>&1 | tee "$LOG_DIR/train_v15_dual.txt"

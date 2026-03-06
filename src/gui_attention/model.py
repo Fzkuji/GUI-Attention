@@ -19,6 +19,47 @@ from gui_attention.constants import ADDITIONAL_SPECIAL_TOKENS
 from gui_attention.dual_head import DualActionHead
 
 
+def _load_click_head_from_pointer(dual_head, checkpoint_path):
+    """Load GUI-Actor pointer_head weights into ClickHead.
+
+    GUI-Actor stores pointer head params as 'pointer_head.*' in the main
+    model safetensors. This maps them to 'click_head.*' in DualActionHead.
+
+    Key mapping (GUI-Actor VisionHead_MultiPatch → our _AttentionHead):
+        pointer_head.self_attention.* → click_head.self_attention.*
+        pointer_head.layer_norm.* → click_head.layer_norm.*
+        pointer_head.mlp_v.* → click_head.mlp_v.*
+        pointer_head.mlp_t.* → click_head.mlp_t.*
+    """
+    from safetensors.torch import load_file
+    import glob
+
+    # Find safetensors files
+    if os.path.isdir(checkpoint_path):
+        sf_files = glob.glob(os.path.join(checkpoint_path, "*.safetensors"))
+    else:
+        sf_files = [checkpoint_path]
+
+    pointer_state = {}
+    for sf in sf_files:
+        state = load_file(sf)
+        for k, v in state.items():
+            if k.startswith("pointer_head."):
+                # Map pointer_head.X → click_head.X
+                new_key = k.replace("pointer_head.", "click_head.", 1)
+                pointer_state[new_key] = v
+
+    if pointer_state:
+        missing, unexpected = dual_head.load_state_dict(pointer_state, strict=False)
+        # Only look_head keys should be missing (expected)
+        actual_missing = [k for k in missing if not k.startswith("look_head.")]
+        print(f"  ClickHead loaded from pointer_head: {len(pointer_state)} params")
+        if actual_missing:
+            print(f"  WARNING: unexpected missing keys: {actual_missing}")
+    else:
+        print(f"  WARNING: No pointer_head.* keys found in {checkpoint_path}")
+
+
 def build_model(
     model_name_or_path: str,
     lora_r: int = 32,
@@ -28,8 +69,14 @@ def build_model(
     attn_implementation: str = "flash_attention_2",
     gradient_checkpointing: bool = True,
     use_lora: bool = True,
+    click_head_from: str = None,
 ):
     """Build Qwen2.5-VL with optional LoRA and DualActionHead.
+
+    Args:
+        click_head_from: path to a GUI-Actor style checkpoint (safetensors)
+            to load pointer head weights into ClickHead. The pointer head
+            keys are mapped: pointer_head.* → click_head.*
 
     Returns:
         model: Qwen25VLWithDualHead (the wrapper).
@@ -97,6 +144,11 @@ def build_model(
     # Build dual action head (match backbone dtype)
     d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
     dual_head = DualActionHead(d_model=d_model, projection_dim=d_model)
+
+    # Load ClickHead from GUI-Actor pointer head if specified
+    if click_head_from:
+        _load_click_head_from_pointer(dual_head, click_head_from)
+
     dual_head = dual_head.to(torch_dtype)
 
     # Processor
