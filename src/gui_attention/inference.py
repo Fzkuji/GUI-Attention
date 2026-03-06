@@ -231,23 +231,18 @@ def run_saccade_inference(
 
         total_vis_tokens = n_total
 
-        # LookHead: decide where attention goes
-        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-        attn_1d = attn_ri.squeeze(0)
+        # --- Stop decision via dual token logits ---
+        # Check if model predicts <click_pad> (stop) or <look_pad> (continue)
+        # by comparing logits at the last token position
+        model_wants_click = False
+        if hasattr(model.config, 'click_pad_token_id') and hasattr(model.config, 'look_pad_token_id'):
+            logits = outputs.logits[0, -1]  # last token logits
+            click_logit = logits[model.config.click_pad_token_id].item()
+            look_logit = logits[model.config.look_pad_token_id].item()
+            model_wants_click = click_logit > look_logit
 
-        img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
-        info = builder.image_infos[img_idx]
-
-        if img_idx < len(grid_dims):
-            nh_a, nw_a = grid_dims[img_idx]
-        else:
-            break
-
-        attended_source = "high" if info.resolution == "high" else "low"
-
-        if attended_source == "high" and use_click_head:
-            # LookHead chose a high-res crop → ClickHead on ALL crop tokens
-            # Collect all high-res crop tokens
+        if model_wants_click and use_click_head:
+            # Model decided to click — use ClickHead on ALL crop tokens
             crop_vis_list = []
             crop_meta = []  # (n_tokens, grid_w, grid_h, global_bbox)
             for ci_idx in range(1, len(vis_ranges)):
@@ -277,23 +272,28 @@ def run_saccade_inference(
                         break
                     running += ci_n
                 else:
-                    # Fallback: use LookHead attention
-                    off_a, n_a = vis_ranges[img_idx]
-                    img_attn = attn_1d[off_a:off_a + n_a]
-                    lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-                    bx1, by1, bx2, by2 = info.global_bbox
-                    global_x = bx1 + lx * (bx2 - bx1)
-                    global_y = by1 + ly * (by2 - by1)
+                    global_x, global_y = focus_x, focus_y
             else:
-                # No crop tokens available, fallback to LookHead
-                off_a, n_a = vis_ranges[img_idx]
-                img_attn = attn_1d[off_a:off_a + n_a]
-                lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-                bx1, by1, bx2, by2 = info.global_bbox
-                global_x = bx1 + lx * (bx2 - bx1)
-                global_y = by1 + ly * (by2 - by1)
+                global_x, global_y = focus_x, focus_y
+
+            nw_final, nh_final = nw_low, nh_low
+            final_point = (global_x, global_y)
+            state.stopped = True
+            break
+
         else:
-            # Use LookHead attention directly
+            # Model decided to look (saccade) — use LookHead to find next focus
+            attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
+            attn_1d = attn_ri.squeeze(0)
+
+            img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
+            info = builder.image_infos[img_idx]
+
+            if img_idx < len(grid_dims):
+                nh_a, nw_a = grid_dims[img_idx]
+            else:
+                break
+
             off_a, n_a = vis_ranges[img_idx]
             img_attn = attn_1d[off_a:off_a + n_a]
             lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
@@ -302,16 +302,11 @@ def run_saccade_inference(
             global_x = bx1 + lx * (bx2 - bx1)
             global_y = by1 + ly * (by2 - by1)
 
-        decision = saccade.decide_saccade(state, attended_source, global_x, global_y)
+            nw_final, nh_final = nw_a, nh_a
+            final_point = (global_x, global_y)
 
-        nw_final, nh_final = nw_a, nh_a
-        final_point = (global_x, global_y)
-
-        if decision["action"] == "stop":
-            break
-
-        # Saccade: update focus
-        focus_x, focus_y = global_x, global_y
+            # Saccade: update focus
+            focus_x, focus_y = global_x, global_y
 
     return {
         "topk_points": [final_point],
