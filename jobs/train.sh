@@ -3,7 +3,7 @@
 # v15 Training: Dual Head (LookHead + ClickHead)
 #
 # ClickHead initialized from GUI-Actor pointer head (43% ScreenSpot-Pro).
-# Multi-round from step 0; LookHead trains alone first, ClickHead joins at step 1000.
+# Both heads train from step 0 (no warmup — ClickHead already has ability).
 #
 # Config: LoRA + 1M low-res + 308px crop + mask old crops
 #
@@ -82,7 +82,7 @@ CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-$MODEL_DIR/GUI-AIMA-3B}"
 echo "============================================================"
 echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
 echo "  ClickHead initialized from GUI-Actor pointer head"
-echo "  Multi-round from step 0; LookHead only → step 1000: +ClickHead"
+echo "  Both heads from step 0 (no warmup phases)"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-AIMA-3B}"
 echo "  ClickHead from: $CLICK_HEAD_FROM"
@@ -103,7 +103,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 3 \
     --crop_jitter 0.05 \
     --max_saccade_rounds 6 \
-    --click_phase_step 1000 \
+    --click_phase_step 0 \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
