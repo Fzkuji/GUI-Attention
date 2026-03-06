@@ -22,14 +22,14 @@ from gui_attention.dual_head import DualActionHead
 def _load_click_head_from_pointer(dual_head, checkpoint_path):
     """Load GUI-Actor pointer_head weights into ClickHead.
 
-    GUI-Actor stores pointer head params as 'pointer_head.*' in the main
-    model safetensors. This maps them to 'click_head.*' in DualActionHead.
+    GUI-Actor (microsoft/GUI-Actor-3B-Qwen2.5-VL) stores the pointer head as
+    'multi_patch_pointer_head.*' with different naming than our _AttentionHead.
 
     Key mapping (GUI-Actor VisionHead_MultiPatch → our _AttentionHead):
-        pointer_head.self_attention.* → click_head.self_attention.*
-        pointer_head.layer_norm.* → click_head.layer_norm.*
-        pointer_head.mlp_v.* → click_head.mlp_v.*
-        pointer_head.mlp_t.* → click_head.mlp_t.*
+        multi_patch_pointer_head.self_attention.* → click_head.self_attention.*
+        multi_patch_pointer_head.layer_norm.*     → click_head.layer_norm.*
+        multi_patch_pointer_head.projection_enc.* → click_head.mlp_v.*
+        multi_patch_pointer_head.projection_dec.* → click_head.mlp_t.*
     """
     from safetensors.torch import load_file
     import glob
@@ -44,20 +44,28 @@ def _load_click_head_from_pointer(dual_head, checkpoint_path):
     for sf in sf_files:
         state = load_file(sf)
         for k, v in state.items():
-            if k.startswith("pointer_head."):
-                # Map pointer_head.X → click_head.X
-                new_key = k.replace("pointer_head.", "click_head.", 1)
+            if k.startswith("multi_patch_pointer_head."):
+                # Strip prefix
+                suffix = k[len("multi_patch_pointer_head."):]
+                # Rename: projection_enc → mlp_v, projection_dec → mlp_t
+                if suffix.startswith("projection_enc."):
+                    suffix = suffix.replace("projection_enc.", "mlp_v.", 1)
+                elif suffix.startswith("projection_dec."):
+                    suffix = suffix.replace("projection_dec.", "mlp_t.", 1)
+                new_key = f"click_head.{suffix}"
                 pointer_state[new_key] = v
 
     if pointer_state:
         missing, unexpected = dual_head.load_state_dict(pointer_state, strict=False)
         # Only look_head keys should be missing (expected)
         actual_missing = [k for k in missing if not k.startswith("look_head.")]
-        print(f"  ClickHead loaded from pointer_head: {len(pointer_state)} params")
+        print(f"  ClickHead loaded from GUI-Actor pointer_head: {len(pointer_state)} params")
         if actual_missing:
-            print(f"  WARNING: unexpected missing keys: {actual_missing}")
+            print(f"  WARNING: unexpected missing click_head keys: {actual_missing}")
+        if unexpected:
+            print(f"  WARNING: unexpected keys: {unexpected}")
     else:
-        print(f"  WARNING: No pointer_head.* keys found in {checkpoint_path}")
+        print(f"  WARNING: No multi_patch_pointer_head.* keys found in {checkpoint_path}")
 
 
 def build_model(
