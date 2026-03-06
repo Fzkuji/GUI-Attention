@@ -100,6 +100,11 @@ def run_saccade_with_recording(
 
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
+    # Support dual tokens
+    if hasattr(model.config, 'look_pad_token_id') and hasattr(model.config, 'click_pad_token_id'):
+        look_id = model.config.look_pad_token_id
+        click_id = model.config.click_pad_token_id
+        pp_id = list(set([look_id, click_id, pp_id]))
     _backbone = model.backbone
     if hasattr(_backbone, "base_model") and hasattr(_backbone.base_model, "model"):
         _inner = _backbone.base_model.model

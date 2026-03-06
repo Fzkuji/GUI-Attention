@@ -123,6 +123,11 @@ def run_saccade_inference(
 
     img_tok = model.config.image_token_id
     pp_id = model.config.pointer_pad_token_id
+    # Support dual tokens: anchor can be look_pad, click_pad, or pointer_pad
+    if hasattr(model.config, 'look_pad_token_id') and hasattr(model.config, 'click_pad_token_id'):
+        look_id = model.config.look_pad_token_id
+        click_id = model.config.click_pad_token_id
+        pp_id = list(set([look_id, click_id, pp_id]))  # deduplicate
 
     # Find visual module for merge_size
     _backbone = model.backbone

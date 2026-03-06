@@ -196,6 +196,11 @@ class GRPOTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
+        # Support dual tokens
+        if hasattr(self.model.config, "look_pad_token_id") and hasattr(self.model.config, "click_pad_token_id"):
+            look_id = self.model.config.look_pad_token_id
+            click_id = self.model.config.click_pad_token_id
+            pp_id = list(set([look_id, click_id, pp_id]))
         merge = _get_visual_module(self.model).spatial_merge_size
 
         self.builder.reset()
@@ -520,6 +525,11 @@ class GRPOTrainer:
 
         img_tok = self.model.config.image_token_id
         pp_id = self.model.config.pointer_pad_token_id
+        # Support dual tokens
+        if hasattr(self.model.config, "look_pad_token_id") and hasattr(self.model.config, "click_pad_token_id"):
+            look_id = self.model.config.look_pad_token_id
+            click_id = self.model.config.click_pad_token_id
+            pp_id = list(set([look_id, click_id, pp_id]))
         merge = _get_visual_module(self.model).spatial_merge_size
 
         try:
