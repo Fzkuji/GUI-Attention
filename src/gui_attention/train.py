@@ -342,6 +342,12 @@ class SaccadeTrainer:
         self.model.eval()
         with torch.no_grad():
             for ri in range(max_rounds):
+                # Check if PREVIOUS round's crop covered GT → break
+                # (we needed to forward this round's context first to get
+                #  the LookHead prediction, matching old code's behavior)
+                if ri > 0 and crop_bboxes and crop_bboxes[-1][1]:
+                    break  # GT found in last crop, stop
+
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
@@ -427,23 +433,17 @@ class SaccadeTrainer:
 
                 round_preds.append((pred_x, pred_y))
 
-                # Check if next crop would contain GT
-                _, next_bbox = crop_image(img, pred_x, pred_y,
-                                          crop_size=self.sa.crop_size,
-                                          crop_upscale=self.sa.crop_upscale)
-                gt_in_next = point_in_bbox(gt_cx, gt_cy, next_bbox)
-
-                if ri == 0 and gt_in_next and crop_hit_round is None:
-                    crop_hit_round = 1
-
+                # Generate next crop from prediction
                 if ri < max_rounds - 1:
-                    # This prediction becomes the next crop
+                    _, next_bbox = crop_image(img, pred_x, pred_y,
+                                              crop_size=self.sa.crop_size,
+                                              crop_upscale=self.sa.crop_upscale)
+                    gt_in_next = point_in_bbox(gt_cx, gt_cy, next_bbox)
                     crop_bboxes.append((next_bbox, gt_in_next))
                     if gt_in_next and crop_hit_round is None:
                         crop_hit_round = ri + 1
-                    if gt_in_next:
-                        break_round = ri + 1
-                        break
+                    # Don't break here — next iteration will forward this
+                    # crop's context, then break at the top of the loop
 
         # ===== PHASE 2: with grad — one forward on final context =====
         self.model.train()
