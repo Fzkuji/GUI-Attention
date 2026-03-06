@@ -84,14 +84,14 @@ echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
 echo "  ClickHead initialized from GUI-Actor pointer head"
 echo "  Both heads from step 0 (no warmup phases)"
 echo "  GPUs: $NUM_GPUS"
-echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}"
+echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
 echo "  ClickHead from: $CLICK_HEAD_FROM"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v15_dual}"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
     src/gui_attention/train.py \
-    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/Qwen2.5-VL-3B-Instruct}" \
+    --model_name_or_path "${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}" \
     --click_head_from "$CLICK_HEAD_FROM" \
     --data_path "$DATA_PATHS" \
     --image_folder "$IMAGE_FOLDERS" \
