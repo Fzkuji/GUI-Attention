@@ -93,9 +93,12 @@ def load_screenspot_v1(data_dir=None):
             w, h = img.size
             bbox = [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h]
 
-        platform = ex.get("data_type", ex.get("platform", "web"))
-        domain = DOMAIN_MAP.get(platform.lower().split("-")[0] if platform else "web", "web")
-        ui_type = ex.get("ui_type", "text")
+        # v1 uses `data_type` for element type (text/icon) and `data_source`
+        # for platform/domain (windows/macos/android/web/...).
+        platform = ex.get("data_source", ex.get("data_souce", ex.get("platform", "web")))
+        platform_key = platform.lower().split("-")[0] if isinstance(platform, str) and platform else "web"
+        domain = DOMAIN_MAP.get(platform_key, "web")
+        ui_type = ex.get("data_type", ex.get("ui_type", "text"))
 
         samples.append({
             "image": ex["image"],
@@ -574,6 +577,8 @@ def main():
     # Load data
     if is_main:
         print(f"Loading {args.dataset} data...")
+        if args.dataset == "v1" and args.data_dir:
+            print("  Warning: --data_dir is ignored for dataset=v1; v1 is loaded from HuggingFace.")
     if args.dataset == "v1":
         samples = load_screenspot_v1(args.data_dir)
     elif args.dataset == "v2":
