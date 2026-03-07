@@ -313,14 +313,17 @@ class SaccadeTrainer:
         After click_phase_step, ClickHead also runs on ALL accumulated
         crop visual tokens for precise positioning.
 
-        Returns (total_loss, num_valid_rounds, round_preds, click_pred).
+        Returns (total_loss, num_valid_rounds, round_preds, click_pred, loss_parts).
           click_pred: (x, y) from ClickHead if available, else None.
+          loss_parts: diagnostic per-sample decomposition after the same
+            normalization as total_loss, with keys total/lm/look/click.
         """
         device = _get_model_device(self.model)
         try:
             img = Image.open(sample["image_path"]).convert("RGB")
         except Exception:
-            return torch.tensor(0.0, device=device, requires_grad=True), 0, [], None
+            zero_parts = {"total": 0.0, "lm": 0.0, "look": 0.0, "click": 0.0}
+            return torch.tensor(0.0, device=device, requires_grad=True), 0, [], None, zero_parts
 
         bbox_gt = sample["bbox_gt"]
         gt_cx = (bbox_gt[0] + bbox_gt[2]) / 2
@@ -338,6 +341,9 @@ class SaccadeTrainer:
         self.builder.reset()
         self.model.train()
         total_loss_value = 0.0  # scalar for logging only
+        lm_loss_value = 0.0
+        look_loss_value = 0.0
+        click_loss_value = 0.0
         n_valid = 0
         round_preds = []
         round_responses = []
@@ -396,7 +402,7 @@ class SaccadeTrainer:
                 round_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
                     round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
-                    self.metrics["lm_loss"].append(outputs.loss.item())
+                    lm_loss_value += self.sa.lm_loss_weight * outputs.loss.item()
 
                 # Visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
@@ -420,7 +426,7 @@ class SaccadeTrainer:
 
                 if look_loss is not None:
                     round_loss = round_loss + self.sa.look_loss_weight * look_loss
-                    self.metrics["look_loss"].append(look_loss.item())
+                    look_loss_value += self.sa.look_loss_weight * look_loss.item()
                     n_valid += 1
 
                 # Backward round 0 loss — releases computation graph
@@ -522,7 +528,7 @@ class SaccadeTrainer:
                 round_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
                     round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
-                    self.metrics["lm_loss"].append(outputs.loss.item())
+                    lm_loss_value += self.sa.lm_loss_weight * outputs.loss.item()
 
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
@@ -580,7 +586,7 @@ class SaccadeTrainer:
                         vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                     if look_loss is not None:
                         round_loss = round_loss + self.sa.look_loss_weight * look_loss
-                        self.metrics["look_loss"].append(look_loss.item())
+                        look_loss_value += self.sa.look_loss_weight * look_loss.item()
                         n_valid += 1
 
                     # ClickHead (after click_phase_step): precise position on ALL crop tokens
@@ -619,7 +625,7 @@ class SaccadeTrainer:
                             combined_crop_vis, anchor, labels=combined_click_labels)
                         if click_loss is not None:
                             round_loss = round_loss + self.sa.click_loss_weight * click_loss
-                            self.metrics["click_loss"].append(click_loss.item())
+                            click_loss_value += self.sa.click_loss_weight * click_loss.item()
 
                         # Decode ClickHead prediction → global coords
                         with torch.no_grad():
@@ -674,7 +680,7 @@ class SaccadeTrainer:
                             vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                         if look_loss is not None:
                             round_loss = round_loss + self.sa.look_loss_weight * look_loss
-                            self.metrics["look_loss"].append(look_loss.item())
+                            look_loss_value += self.sa.look_loss_weight * look_loss.item()
                             n_valid += 1
                     else:
                         with torch.no_grad():
@@ -714,13 +720,21 @@ class SaccadeTrainer:
         except Exception:
             pass
 
-        # Loss was already backward'd each round; return scalar for logging
-        return total_loss_value / max(n_valid, 1), n_valid, round_preds, click_pred
+        # Loss was already backward'd each round; return a sample-level
+        # decomposition with a shared denominator so total = lm + look + click.
+        denom = max(n_valid, 1)
+        loss_parts = {
+            "total": (lm_loss_value + look_loss_value + click_loss_value) / denom,
+            "lm": lm_loss_value / denom,
+            "look": look_loss_value / denom,
+            "click": click_loss_value / denom,
+        }
+        return loss_parts["total"], n_valid, round_preds, click_pred, loss_parts
 
     # -- train step -----------------------------------------------------------
 
     def _train_step(self, sample):
-        loss, nv, round_preds, click_pred = self._forward_sample(sample)
+        loss, nv, round_preds, click_pred, loss_parts = self._forward_sample(sample)
         # Backward already called per-round inside _forward_sample
 
         gcx = (sample["bbox_gt"][0] + sample["bbox_gt"][2]) / 2
@@ -740,7 +754,10 @@ class SaccadeTrainer:
                    and sample["bbox_gt"][1] <= final_py <= sample["bbox_gt"][3])
             self.metrics["hit_rate"].append(1 if hit else 0)
         if nv > 0:
-            self.metrics["total_loss"].append(loss)
+            self.metrics["total_loss"].append(loss_parts["total"])
+            self.metrics["lm_loss"].append(loss_parts["lm"])
+            self.metrics["look_loss"].append(loss_parts["look"])
+            self.metrics["click_loss"].append(loss_parts["click"])
         return loss if nv > 0 else 0.0, nv
 
     def train_step(self, batch):
