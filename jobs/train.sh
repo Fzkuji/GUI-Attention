@@ -32,6 +32,10 @@ Options:
   --lm_loss_weight FLOAT
   --look_loss_weight FLOAT
   --click_loss_weight FLOAT
+  --lm_reasoning_token_weight FLOAT
+  --lm_format_token_weight FLOAT
+  --lm_look_token_weight FLOAT
+  --lm_click_token_weight FLOAT
   --help
 
 Environment variables are still supported, but CLI flags take precedence.
@@ -48,6 +52,10 @@ APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
 LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-0.5}"
 LOOK_LOSS_WEIGHT="${LOOK_LOSS_WEIGHT:-1.0}"
 CLICK_LOSS_WEIGHT="${CLICK_LOSS_WEIGHT:-2.0}"
+LM_REASONING_TOKEN_WEIGHT="${LM_REASONING_TOKEN_WEIGHT:-0.2}"
+LM_FORMAT_TOKEN_WEIGHT="${LM_FORMAT_TOKEN_WEIGHT:-1.0}"
+LM_LOOK_TOKEN_WEIGHT="${LM_LOOK_TOKEN_WEIGHT:-1.5}"
+LM_CLICK_TOKEN_WEIGHT="${LM_CLICK_TOKEN_WEIGHT:-2.0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -89,6 +97,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --click_loss_weight)
             CLICK_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --lm_reasoning_token_weight)
+            LM_REASONING_TOKEN_WEIGHT="$2"
+            shift 2
+            ;;
+        --lm_format_token_weight)
+            LM_FORMAT_TOKEN_WEIGHT="$2"
+            shift 2
+            ;;
+        --lm_look_token_weight)
+            LM_LOOK_TOKEN_WEIGHT="$2"
+            shift 2
+            ;;
+        --lm_click_token_weight)
+            LM_CLICK_TOKEN_WEIGHT="$2"
             shift 2
             ;;
         --help|-h)
@@ -203,6 +227,10 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lm_loss_weight "$LM_LOSS_WEIGHT" \
     --look_loss_weight "$LOOK_LOSS_WEIGHT" \
     --click_loss_weight "$CLICK_LOSS_WEIGHT" \
+    --lm_reasoning_token_weight "$LM_REASONING_TOKEN_WEIGHT" \
+    --lm_format_token_weight "$LM_FORMAT_TOKEN_WEIGHT" \
+    --lm_look_token_weight "$LM_LOOK_TOKEN_WEIGHT" \
+    --lm_click_token_weight "$LM_CLICK_TOKEN_WEIGHT" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \

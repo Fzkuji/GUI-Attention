@@ -42,8 +42,15 @@ from gui_attention.modeling.attention import (
 from gui_attention.inputs.builder import MultiRoundInputBuilder
 from gui_attention.inputs.crop import crop_image, point_in_bbox
 from gui_attention.inputs.labels import compute_binary_labels, compute_overlap_mask
-from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS
-from gui_attention.constants import IGNORE_INDEX
+from gui_attention.constants import (
+    DEFAULT_LOOK_PAD_TOKEN,
+    DEFAULT_POINTER_END_TOKEN,
+    DEFAULT_POINTER_PAD_TOKEN,
+    DEFAULT_POINTER_START_TOKEN,
+    HIGH_RES_MAX_PIXELS,
+    IGNORE_INDEX,
+    LOW_RES_MAX_PIXELS,
+)
 from gui_attention.modeling.model import Qwen25VLWithDualHead, build_model
 
 
@@ -52,10 +59,26 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # -- LM Labels ---------------------------------------------------------------
 
-def make_lm_labels(input_ids, tokenizer, round_idx=0):
-    """Create LM labels for a specific round's assistant response only."""
+def make_lm_labels_and_weights(
+    input_ids,
+    tokenizer,
+    round_idx=0,
+    *,
+    reasoning_weight=0.2,
+    format_weight=1.0,
+    look_weight=1.5,
+    click_weight=2.0,
+):
+    """Create per-round LM labels plus token weights for weighted CE."""
     labels = torch.full_like(input_ids, IGNORE_INDEX)
+    weights = torch.zeros_like(input_ids, dtype=torch.float32)
     im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    pointer_start_id = tokenizer.convert_tokens_to_ids(DEFAULT_POINTER_START_TOKEN)
+    pointer_end_id = tokenizer.convert_tokens_to_ids(DEFAULT_POINTER_END_TOKEN)
+    look_pad_id = tokenizer.convert_tokens_to_ids(DEFAULT_LOOK_PAD_TOKEN)
+    click_pad_id = tokenizer.convert_tokens_to_ids(DEFAULT_POINTER_PAD_TOKEN)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
     ids = input_ids[0].tolist()
     seq_len = len(ids)
 
@@ -79,8 +102,42 @@ def make_lm_labels(input_ids, tokenizer, round_idx=0):
     if round_idx < len(assistant_turns):
         start, end = assistant_turns[round_idx]
         labels[0, start:end] = input_ids[0, start:end]
+        weights[0, start:end] = reasoning_weight
 
-    return labels
+        format_token_ids = {
+            tid for tid in (pointer_start_id, pointer_end_id, im_end_id, eos_id)
+            if tid is not None and tid >= 0
+        }
+        for tid in format_token_ids:
+            weights[input_ids == tid] = format_weight
+        if look_pad_id is not None and look_pad_id >= 0:
+            weights[input_ids == look_pad_id] = look_weight
+        if click_pad_id is not None and click_pad_id >= 0:
+            weights[input_ids == click_pad_id] = click_weight
+
+    weights = weights * (labels != IGNORE_INDEX).float()
+    return labels, weights
+
+
+def compute_weighted_lm_loss(logits, labels, weights):
+    """Weighted token-level CE on the current round's assistant response."""
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    shift_weights = weights[..., 1:].contiguous()
+
+    valid_mask = shift_labels != IGNORE_INDEX
+    if not valid_mask.any():
+        return None
+
+    per_token = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=IGNORE_INDEX,
+    ).view_as(shift_labels)
+
+    denom = shift_weights[valid_mask].sum().clamp_min(1e-6)
+    return (per_token[valid_mask] * shift_weights[valid_mask]).sum() / denom
 
 
 # -- Arguments ----------------------------------------------------------------
@@ -106,6 +163,10 @@ class ScriptArgs:
     lm_loss_weight: float = field(default=0.5, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
     click_loss_weight: float = field(default=2.0, metadata={"help": "Weight for ClickHead KL loss."})
+    lm_reasoning_token_weight: float = field(default=0.2, metadata={"help": "Weight for ordinary reasoning tokens in LM loss."})
+    lm_format_token_weight: float = field(default=1.0, metadata={"help": "Weight for pointer boundary and EOS tokens in LM loss."})
+    lm_look_token_weight: float = field(default=1.5, metadata={"help": "Weight for <look_pad> in LM loss."})
+    lm_click_token_weight: float = field(default=2.0, metadata={"help": "Weight for <pointer_pad> click token in LM loss."})
     # LoRA
     use_lora: bool = field(default=True)
     lora_r: int = field(default=32)
@@ -386,23 +447,35 @@ class SaccadeTrainer:
 
                 # LM labels
                 lm_labels = None
+                lm_weights = None
                 if self.sa.lm_loss_weight > 0:
-                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+                    lm_labels, lm_weights = make_lm_labels_and_weights(
+                        inp["input_ids"],
+                        self.tokenizer,
+                        round_idx=ri,
+                        reasoning_weight=self.sa.lm_reasoning_token_weight,
+                        format_weight=self.sa.lm_format_token_weight,
+                        look_weight=self.sa.lm_look_token_weight,
+                        click_weight=self.sa.lm_click_token_weight,
+                    )
+                    lm_labels = lm_labels.to(device)
+                    lm_weights = lm_weights.to(device)
 
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
-                    labels=lm_labels,
                 )
                 last_hs = outputs.hidden_states[-1]
 
                 # Accumulate round loss, backward at end of round
                 round_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
-                    round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
-                    lm_loss_value += self.sa.lm_loss_weight * outputs.loss.item()
+                if self.sa.lm_loss_weight > 0 and lm_labels is not None and lm_weights is not None:
+                    lm_loss = compute_weighted_lm_loss(outputs.logits, lm_labels, lm_weights)
+                    if lm_loss is not None:
+                        round_loss = round_loss + self.sa.lm_loss_weight * lm_loss
+                        lm_loss_value += self.sa.lm_loss_weight * lm_loss.item()
 
                 # Visual embeds (pre-LLM)
                 vis_embeds = self.model.extract_visual_embeds(
@@ -512,23 +585,35 @@ class SaccadeTrainer:
 
                 # LM labels
                 lm_labels = None
+                lm_weights = None
                 if self.sa.lm_loss_weight > 0:
-                    lm_labels = make_lm_labels(inp["input_ids"], self.tokenizer, round_idx=ri).to(device)
+                    lm_labels, lm_weights = make_lm_labels_and_weights(
+                        inp["input_ids"],
+                        self.tokenizer,
+                        round_idx=ri,
+                        reasoning_weight=self.sa.lm_reasoning_token_weight,
+                        format_weight=self.sa.lm_format_token_weight,
+                        look_weight=self.sa.lm_look_token_weight,
+                        click_weight=self.sa.lm_click_token_weight,
+                    )
+                    lm_labels = lm_labels.to(device)
+                    lm_weights = lm_weights.to(device)
 
                 outputs = self.model(
                     input_ids=inp["input_ids"],
                     attention_mask=inp.get("attention_mask"),
                     pixel_values=inp["pixel_values"],
                     image_grid_thw=inp.get("image_grid_thw"),
-                    labels=lm_labels,
                 )
                 last_hs = outputs.hidden_states[-1]
 
                 # Accumulate round loss for this crop round
                 round_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                if self.sa.lm_loss_weight > 0 and outputs.loss is not None:
-                    round_loss = round_loss + self.sa.lm_loss_weight * outputs.loss
-                    lm_loss_value += self.sa.lm_loss_weight * outputs.loss.item()
+                if self.sa.lm_loss_weight > 0 and lm_labels is not None and lm_weights is not None:
+                    lm_loss = compute_weighted_lm_loss(outputs.logits, lm_labels, lm_weights)
+                    if lm_loss is not None:
+                        round_loss = round_loss + self.sa.lm_loss_weight * lm_loss
+                        lm_loss_value += self.sa.lm_loss_weight * lm_loss.item()
 
                 vis_embeds = self.model.extract_visual_embeds(
                     inp["input_ids"], inp["pixel_values"], inp.get("image_grid_thw"))
@@ -792,6 +877,9 @@ class SaccadeTrainer:
             print(f"  click_phase_step={self.sa.click_phase_step} (ClickHead starts at step {self.sa.click_phase_step})")
             print(f"  lm_loss_weight={self.sa.lm_loss_weight}  look_loss_weight={self.sa.look_loss_weight}  "
                   f"click_loss_weight={self.sa.click_loss_weight}")
+            print(f"  lm_token_weights: reason={self.sa.lm_reasoning_token_weight} "
+                  f"format={self.sa.lm_format_token_weight} "
+                  f"look={self.sa.lm_look_token_weight} click={self.sa.lm_click_token_weight}")
             print(f"  head_lr={self.sa.action_head_lr}  backbone_lr={self.sa.lora_lr}")
             if self.sa.use_lora:
                 print(f"  lora_r={self.sa.lora_r}  lora_alpha={self.sa.lora_alpha}")
