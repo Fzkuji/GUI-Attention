@@ -539,6 +539,8 @@ def main():
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--use_cache", action="store_true",
+                        help="Reuse existing preds/metrics under save_path instead of rerunning evaluation")
 
     args = parser.parse_args()
 
@@ -628,11 +630,13 @@ def main():
     pred_path = os.path.join(args.save_path, f"{ckpt_name}_preds.json")
     metric_path = os.path.join(args.save_path, f"{ckpt_name}_metric.txt")
 
-    if os.path.exists(pred_path) and is_main:
+    if args.use_cache and os.path.exists(pred_path) and is_main:
         print(f"Loading cached predictions from {pred_path}")
         with open(pred_path, "r") as f:
             results = json.load(f)
     else:
+        if is_main and os.path.exists(pred_path):
+            print(f"Overwriting existing predictions at {pred_path}")
         t0 = time.time()
         with torch.no_grad():
             local_results = evaluate_all(samples, model, tokenizer, builder,
@@ -680,11 +684,13 @@ def main():
 
     # Metrics
     if is_main:
-        if os.path.exists(metric_path):
+        if args.use_cache and os.path.exists(metric_path):
             print(f"Metrics already exist at {metric_path}")
             with open(metric_path, "r") as f:
                 print(f.read())
         else:
+            if os.path.exists(metric_path):
+                print(f"Overwriting existing metrics at {metric_path}")
             print("\n=== Metrics ===")
 
             # Assign Pro categories if needed
