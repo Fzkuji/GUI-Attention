@@ -26,6 +26,11 @@ from gui_attention.constants import (
     PLACEHOLDER_SUFFIX,
     ROUND0_SUFFIX,
 )
+from gui_attention.reasoning import (
+    REASONING_ASSISTANT_PREFIX,
+    get_reasoning_guide,
+    wrap_assistant_content,
+)
 
 
 @dataclass
@@ -77,7 +82,16 @@ class MultiRoundInputBuilder:
 
     # ----- round 0: low-res full image ------------------------------------
 
-    def build_round0(self, image_or_path, instruction: str, use_dual_tokens: bool = False):
+    def build_round0(
+        self,
+        image_or_path,
+        instruction: str,
+        use_dual_tokens: bool = False,
+        *,
+        free_reasoning: bool = False,
+        for_generation: bool = False,
+        assistant_response: Optional[str] = None,
+    ):
         """Build round-0 inputs (full image at low resolution).
 
         Args:
@@ -89,17 +103,28 @@ class MultiRoundInputBuilder:
             image_or_path = image_or_path["image_path"]
 
         max_px = self.low_res_max_pixels
+        user_text = instruction
+        if free_reasoning:
+            user_text = instruction.rstrip() + get_reasoning_guide(allow_click=False)
+
         conv = [
             {"role": "system", "content": [{"type": "text", "text": GROUNDING_SYSTEM_MESSAGE}]},
             {"role": "user", "content": [
                 {"type": "image", "image": image_or_path},
-                {"type": "text", "text": instruction},
+                {"type": "text", "text": user_text},
             ]},
         ]
         text = self._get_processor(max_px).apply_chat_template(
             conv, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE,
         )
-        text += ROUND0_SUFFIX if use_dual_tokens else PLACEHOLDER_SUFFIX
+        if assistant_response is not None:
+            text += wrap_assistant_content(assistant_response)
+        elif for_generation and free_reasoning:
+            text += REASONING_ASSISTANT_PREFIX
+        elif for_generation:
+            text += "<|im_start|>assistant\n"
+        else:
+            text += ROUND0_SUFFIX if use_dual_tokens else PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)
 
         resized_r0 = _presize_image(images[0], max_px, self.min_pixels)
@@ -114,10 +139,19 @@ class MultiRoundInputBuilder:
 
     # ----- subsequent rounds: high-res crop -------------------------------
 
-    def extend_with_crop(self, prev_text: str, prev_images: list,
-                         crop_pil: Image.Image, crop_bbox: tuple,
-                         gt_in_crop: bool = False, use_dual_tokens: bool = False,
-                         for_generation: bool = False):
+    def extend_with_crop(
+        self,
+        prev_text: str,
+        prev_images: list,
+        crop_pil: Image.Image,
+        crop_bbox: tuple,
+        gt_in_crop: bool = False,
+        use_dual_tokens: bool = False,
+        for_generation: bool = False,
+        *,
+        free_reasoning: bool = False,
+        assistant_response: Optional[str] = None,
+    ):
         """Append a high-res crop.
 
         Args:
@@ -132,7 +166,11 @@ class MultiRoundInputBuilder:
         max_px = self.high_res_max_pixels
         round_num = len(self.image_infos)
 
-        if for_generation:
+        if assistant_response is not None:
+            suffix = wrap_assistant_content(assistant_response)
+        elif for_generation and free_reasoning:
+            suffix = REASONING_ASSISTANT_PREFIX
+        elif for_generation:
             # No suffix — let model generate and decide look vs click
             suffix = "<|im_start|>assistant\n"
         elif use_dual_tokens:
@@ -140,10 +178,15 @@ class MultiRoundInputBuilder:
         else:
             suffix = PLACEHOLDER_SUFFIX
 
+        zoom_hint = ""
+        if free_reasoning:
+            zoom_hint = get_reasoning_guide(allow_click=True)
+
         zoom_text = (
             f"\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
             f"[Zoomed region round {round_num} around "
             f"({crop_bbox[0]:.2f},{crop_bbox[1]:.2f})-({crop_bbox[2]:.2f},{crop_bbox[3]:.2f})]"
+            f"{zoom_hint}"
             f"<|im_end|>\n"
             + suffix
         )

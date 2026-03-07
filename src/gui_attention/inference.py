@@ -9,6 +9,7 @@ Multi-round saccade:
 from typing import List, Tuple
 
 import torch
+from transformers import StoppingCriteriaList
 
 from gui_attention.attention import (
     extract_anchor_hidden_states,
@@ -20,6 +21,11 @@ from gui_attention.builder import MultiRoundInputBuilder
 from gui_attention.crop import crop_image
 from gui_attention.foveation import SaccadeLoop
 from gui_attention.labels import compute_overlap_mask
+from gui_attention.reasoning import (
+    ActionSpanStoppingCriteria,
+    decode_reasoning_content,
+    parse_reasoning_action,
+)
 
 
 def get_prediction_region_point(
@@ -101,6 +107,7 @@ def run_saccade_inference(
     activation_threshold: float = 0.3,
     use_click_head: bool = True,
     use_dual_tokens: bool = True,
+    reasoning_max_new_tokens: int = 48,
 ) -> dict:
     """Multi-round saccade inference with LookHead + ClickHead.
 
@@ -127,6 +134,10 @@ def run_saccade_inference(
         look_id = model.config.look_pad_token_id
         click_id = model.config.click_pad_token_id
         pp_id = [look_id, click_id, pp_id]
+    else:
+        look_id = getattr(model.config, "look_pad_token_id", None)
+        click_id = getattr(model.config, "click_pad_token_id", model.config.pointer_pad_token_id)
+    pointer_end_id = model.config.pointer_end_token_id
 
     # Find visual module for merge_size
     _backbone = model.backbone
@@ -142,11 +153,101 @@ def run_saccade_inference(
         raise AttributeError(f"Cannot find visual module in {type(_inner)}")
     merge = _visual.spatial_merge_size
 
-    # Round 0: low-res only
-    r0_inputs, _, _ = builder.build_round0(
-        image_path, instruction, use_dual_tokens=use_dual_tokens
-    )
-    inp = {k: v.to(device) for k, v in r0_inputs.items()}
+    def _to_device(inputs):
+        return {k: v.to(device) for k, v in inputs.items()}
+
+    def _build_context(history_used_responses, history_points, *, current_crop=None, current_bbox=None,
+                       current_response=None, for_generation=False):
+        builder.reset()
+        if history_used_responses:
+            inputs, cur_text, cur_images = builder.build_round0(
+                image_path,
+                instruction,
+                use_dual_tokens=use_dual_tokens,
+                free_reasoning=True,
+                assistant_response=history_used_responses[0],
+            )
+        else:
+            inputs, cur_text, cur_images = builder.build_round0(
+                image_path,
+                instruction,
+                use_dual_tokens=use_dual_tokens,
+                free_reasoning=True,
+                for_generation=(for_generation and current_crop is None),
+                assistant_response=(current_response if current_crop is None else None),
+            )
+
+        for hist_idx in range(1, len(history_used_responses)):
+            prev_px, prev_py = history_points[hist_idx - 1]
+            prev_crop, prev_bbox = crop_image(
+                image,
+                prev_px,
+                prev_py,
+                crop_size=crop_size,
+                crop_upscale=crop_upscale,
+            )
+            inputs, cur_text, cur_images = builder.extend_with_crop(
+                cur_text,
+                cur_images,
+                prev_crop,
+                prev_bbox,
+                use_dual_tokens=use_dual_tokens,
+                free_reasoning=True,
+                assistant_response=history_used_responses[hist_idx],
+            )
+
+        if current_crop is not None:
+            inputs, cur_text, cur_images = builder.extend_with_crop(
+                cur_text,
+                cur_images,
+                current_crop,
+                current_bbox,
+                use_dual_tokens=use_dual_tokens,
+                free_reasoning=True,
+                assistant_response=current_response,
+                for_generation=for_generation,
+            )
+        return inputs, cur_text, cur_images
+
+    def _generate_reasoning(inputs, *, allow_click: bool):
+        inp = _to_device(inputs)
+        stop = StoppingCriteriaList([
+            ActionSpanStoppingCriteria(
+                prompt_len=inp["input_ids"].shape[1],
+                pointer_end_token_id=pointer_end_id,
+                allowed_action_token_ids=[look_id, click_id],
+            )
+        ])
+        with torch.no_grad():
+            gen_ids = model.generate(
+                input_ids=inp["input_ids"],
+                attention_mask=inp.get("attention_mask"),
+                pixel_values=inp.get("pixel_values"),
+                image_grid_thw=inp.get("image_grid_thw"),
+                max_new_tokens=reasoning_max_new_tokens,
+                do_sample=False,
+                stopping_criteria=stop,
+            )
+        new_ids = gen_ids[0, inp["input_ids"].shape[1]:].tolist()
+        raw_content = decode_reasoning_content(tokenizer, new_ids)
+        parsed = parse_reasoning_action(raw_content, allow_click=allow_click)
+        return parsed, new_ids
+
+    round_actions = []
+    round_raw_responses = []
+    round_used_responses = []
+    round_format_oks = []
+
+    # Round 0: generate reasoning, then always look on low-res.
+    r0_prompt, _, _ = _build_context([], [], for_generation=True)
+    parsed0, _ = _generate_reasoning(r0_prompt, allow_click=False)
+    round_actions.append(parsed0.action)
+    round_raw_responses.append(parsed0.raw_content)
+    round_used_responses.append(parsed0.used_content)
+    round_format_oks.append(parsed0.format_ok)
+
+    r0_inputs, _, _ = _build_context([], [], current_response=parsed0.used_content)
+    inp = _to_device(r0_inputs)
 
     with torch.no_grad():
         outputs = model(
@@ -163,12 +264,19 @@ def run_saccade_inference(
     anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=0)
 
     if vis_embeds is None or anchor is None:
-        return {"topk_points": [(0.5, 0.5)], "n_width": 1, "n_height": 1, "num_rounds": 0}
+        return {
+            "topk_points": [(0.5, 0.5)],
+            "n_width": 1,
+            "n_height": 1,
+            "num_rounds": 0,
+            "round_actions": round_actions,
+            "reasoning_texts": round_raw_responses,
+            "format_ok_rate": 0.0,
+        }
 
     grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
     nh0, nw0 = grid_dims[0]
 
-    # LookHead on low-res
     attn0, _, _ = model.dual_head.look(vis_embeds, anchor)
     attn_1d = attn0.squeeze(0)
 
@@ -192,98 +300,38 @@ def run_saccade_inference(
     last_anchor = None
 
     for ri in range(1, max_rounds):
-        # Crop around current focus
         cropped, crop_bbox = crop_image(image, focus_x, focus_y,
                                         crop_size=crop_size,
                                         crop_upscale=crop_upscale)
-
-        # Rebuild full context to match training: low-res + all historical crops + latest crop.
-        builder.reset()
-        ri_inputs, cur_text, cur_images = builder.build_round0(
-            image_path, instruction, use_dual_tokens=use_dual_tokens
-        )
-        rebuild_failed = False
-        for prev_ri in range(1, ri):
-            prev_px, prev_py = round_preds[prev_ri - 1]
-            prev_crop, prev_bbox = crop_image(
-                image, prev_px, prev_py, crop_size=crop_size, crop_upscale=crop_upscale
-            )
-            try:
-                ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                    cur_text,
-                    cur_images,
-                    prev_crop,
-                    prev_bbox,
-                    gt_in_crop=None,
-                    use_dual_tokens=use_dual_tokens,
-                )
-            except Exception:
-                rebuild_failed = True
-                break
-        if rebuild_failed:
-            break
-        # Build context ending with generation prompt (no suffix)
+        history_responses = list(round_used_responses)
         try:
-            ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                cur_text,
-                cur_images,
-                cropped,
-                crop_bbox,
-                gt_in_crop=None,
-                use_dual_tokens=use_dual_tokens,
+            ri_prompt, _, _ = _build_context(
+                history_responses,
+                round_preds,
+                current_crop=cropped,
+                current_bbox=crop_bbox,
                 for_generation=True,
             )
         except Exception:
             break
+        parsed, _ = _generate_reasoning(ri_prompt, allow_click=True)
+        round_actions.append(parsed.action)
+        round_raw_responses.append(parsed.raw_content)
+        round_used_responses.append(parsed.used_content)
+        round_format_oks.append(parsed.format_ok)
 
-        inp = {k: v.to(device) for k, v in ri_inputs.items()}
-
-        # Autoregressive generation: let model decide look vs click
-        click_pad_id = getattr(model.config, 'click_pad_token_id',
-                               model.config.pointer_pad_token_id)
-        look_pad_id = getattr(model.config, 'look_pad_token_id', None)
-
-        with torch.no_grad():
-            gen_ids = model.generate(
-                input_ids=inp["input_ids"],
-                attention_mask=inp.get("attention_mask"),
-                pixel_values=inp.get("pixel_values"),
-                image_grid_thw=inp.get("image_grid_thw"),
-                max_new_tokens=30,
-                do_sample=False,
+        try:
+            ri_inputs_full, _, _ = _build_context(
+                history_responses,
+                round_preds,
+                current_crop=cropped,
+                current_bbox=crop_bbox,
+                current_response=parsed.used_content,
             )
-        # Extract only newly generated tokens
-        new_tokens = gen_ids[0, inp["input_ids"].shape[1]:]
-        new_token_list = new_tokens.tolist()
+        except Exception:
+            break
 
-        # Check which pad token the model generated
-        model_chose_click = click_pad_id in new_token_list
-        model_chose_look = look_pad_id in new_token_list if look_pad_id else False
-
-        # Now do a full forward to get hidden states for the action heads
-        # Use the FULL generated sequence (input + generated) to match training
-        # But we need the suffix to be included for proper anchor extraction
-        # Re-build with the correct suffix based on model's decision
-        builder.reset()
-        ri_inputs_full, cur_text, cur_images = builder.build_round0(
-            image_path, instruction, use_dual_tokens=use_dual_tokens
-        )
-        for prev_ri in range(1, ri):
-            prev_px, prev_py = round_preds[prev_ri - 1]
-            prev_crop, prev_bbox = crop_image(
-                image, prev_px, prev_py, crop_size=crop_size, crop_upscale=crop_upscale
-            )
-            ri_inputs_full, cur_text, cur_images = builder.extend_with_crop(
-                cur_text, cur_images, prev_crop, prev_bbox,
-                gt_in_crop=False, use_dual_tokens=use_dual_tokens,
-            )
-        # Current crop with correct suffix
-        ri_inputs_full, cur_text, cur_images = builder.extend_with_crop(
-            cur_text, cur_images, cropped, crop_bbox,
-            gt_in_crop=model_chose_click, use_dual_tokens=use_dual_tokens,
-        )
-
-        inp = {k: v.to(device) for k, v in ri_inputs_full.items()}
+        inp = _to_device(ri_inputs_full)
 
         with torch.no_grad():
             outputs = model(
@@ -323,13 +371,11 @@ def run_saccade_inference(
         last_grid_dims = grid_dims
         last_anchor = anchor
 
-        if model_chose_click:
-            # Model generated <pointer_pad> → ClickHead → stop
+        if parsed.action == "click":
             last_look_point = (focus_x, focus_y)
             last_look_dims = (nw0, nh0)
             break
         else:
-            # Model generated <look_pad> (or neither) → LookHead → saccade
             attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
             attn_1d = attn_ri.squeeze(0)
 
@@ -407,6 +453,13 @@ def run_saccade_inference(
         "topk_points": [final_point],
         "n_width": nw_final,
         "n_height": nh_final,
-        "num_rounds": len(round_preds),  # round_preds has one entry per round (0-indexed)
+        "num_rounds": len(round_actions),
         "total_vis_tokens": total_vis_tokens,
+        "round_actions": round_actions,
+        "reasoning_texts": round_raw_responses,
+        "used_reasoning_texts": round_used_responses,
+        "format_ok_rate": (
+            sum(1 for ok in round_format_oks if ok) / len(round_format_oks)
+            if round_format_oks else 0.0
+        ),
     }

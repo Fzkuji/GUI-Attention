@@ -14,6 +14,11 @@ set -e
 
 NUM_GPUS="${NUM_GPUS:-8}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
+SAVE_STEPS="${SAVE_STEPS:-500}"
+REASONING_MAX_NEW_TOKENS="${REASONING_MAX_NEW_TOKENS:-48}"
+REWARD_ROUND_PENALTY="${REWARD_ROUND_PENALTY:-0.02}"
+REWARD_FORMAT="${REWARD_FORMAT:-0.05}"
+REWARD_MALFORMED_PENALTY="${REWARD_MALFORMED_PENALTY:-0.05}"
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CODE_DIR=$(dirname "$SCRIPT_DIR")
@@ -31,8 +36,8 @@ export PYTHONPATH=src:$PYTHONPATH
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# SFT checkpoint to start from (edit this path directly)
-SFT_CKPT="$RESULT_DIR/ours_v15_dual/checkpoint-500"
+# SFT checkpoint to start from
+SFT_CKPT="${SFT_CKPT:-$RESULT_DIR/ours_v15_dual/checkpoint-500}"
 
 # Auto-detect datasets (same as train.sh)
 declare -a ALL_DATASETS=(
@@ -70,6 +75,8 @@ echo "  SFT checkpoint: $SFT_CKPT"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_grpo}"
+echo "  group_size: $GROUP_SIZE  reasoning_max_new_tokens: $REASONING_MAX_NEW_TOKENS"
+echo "  reward_round_penalty: $REWARD_ROUND_PENALTY  reward_format: $REWARD_FORMAT  malformed_penalty: $REWARD_MALFORMED_PENALTY"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -85,11 +92,14 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_size 308 \
     --crop_upscale 3 \
     --max_saccade_rounds 6 \
+    --reasoning_max_new_tokens "$REASONING_MAX_NEW_TOKENS" \
     --use_dual_tokens true \
     --group_size "$GROUP_SIZE" \
     --reward_hit 1.0 \
     --reward_proximity_weight 0.25 \
-    --reward_round_penalty 0.05 \
+    --reward_round_penalty "$REWARD_ROUND_PENALTY" \
+    --reward_format "$REWARD_FORMAT" \
+    --reward_malformed_penalty "$REWARD_MALFORMED_PENALTY" \
     --kl_coeff 0.01 \
     --temperature 1.0 \
     --look_sft_weight 0.1 \
@@ -108,7 +118,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
-    --save_steps 500 \
+    --save_steps "$SAVE_STEPS" \
     --save_total_limit 3 \
     --bf16 true \
     --gradient_checkpointing true \
