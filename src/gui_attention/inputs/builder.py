@@ -27,7 +27,7 @@ from gui_attention.constants import (
     PLACEHOLDER_SUFFIX,
     ROUND0_SUFFIX,
 )
-from gui_attention.reasoning import (
+from gui_attention.runtime.reasoning import (
     REASONING_ASSISTANT_PREFIX,
     get_reasoning_guide,
     sample_sft_reasoning_content,
@@ -249,7 +249,7 @@ class MultiRoundInputBuilder:
 
     def _update_visual_ranges(self, input_ids_1d: torch.Tensor):
         """Scan input_ids to find contiguous image-token blocks and update image_infos."""
-        from gui_attention.attention import find_image_visual_ranges
+        from gui_attention.modeling.attention import find_image_visual_ranges
         img_tok = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         ranges = find_image_visual_ranges(input_ids_1d, img_tok)
         for i, info in enumerate(self.image_infos):

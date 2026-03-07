@@ -11,17 +11,17 @@ from typing import List, Tuple
 import torch
 from transformers import StoppingCriteriaList
 
-from gui_attention.attention import (
+from gui_attention.modeling.attention import (
     extract_anchor_hidden_states,
     extract_visual_hidden_states,
     identify_attended_image,
     token_to_spatial,
 )
-from gui_attention.builder import MultiRoundInputBuilder
-from gui_attention.crop import crop_image
-from gui_attention.foveation import SaccadeLoop
-from gui_attention.labels import compute_overlap_mask
-from gui_attention.reasoning import (
+from gui_attention.inputs.builder import MultiRoundInputBuilder
+from gui_attention.inputs.crop import crop_image
+from gui_attention.inputs.labels import compute_overlap_mask
+from gui_attention.runtime.foveation import SaccadeLoop
+from gui_attention.runtime.reasoning import (
     ActionSpanStoppingCriteria,
     decode_reasoning_content,
     parse_reasoning_action,

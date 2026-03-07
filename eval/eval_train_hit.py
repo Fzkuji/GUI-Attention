@@ -30,7 +30,7 @@ from gui_attention.constants import (
     DEFAULT_POINTER_START_TOKEN,
     GROUNDING_SYSTEM_MESSAGE,
 )
-from gui_attention.dual_head import _AttentionHead
+from gui_attention.modeling.dual_head import _AttentionHead
 
 
 # ---------------------------------------------------------------------------

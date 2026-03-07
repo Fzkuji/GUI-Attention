@@ -51,7 +51,7 @@ from PIL import Image
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 if TYPE_CHECKING:
-    from gui_attention.builder import MultiRoundInputBuilder
+    from gui_attention.inputs.builder import MultiRoundInputBuilder
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def run_saccade_with_recording(
     reasoning_max_new_tokens: int = 48,
 ) -> dict:
     """Run the current inference pipeline and return its trace for plotting."""
-    from gui_attention.inference import run_saccade_inference
+    from gui_attention.runtime.inference import run_saccade_inference
 
     del crop_ratio, crop_target_pixels  # legacy args kept for CLI compatibility
     return run_saccade_inference(
@@ -362,8 +362,8 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="Device")
     args = parser.parse_args()
 
-    from gui_attention.builder import MultiRoundInputBuilder
-    from gui_attention.model import Qwen25VLWithDualHead
+    from gui_attention.inputs.builder import MultiRoundInputBuilder
+    from gui_attention.modeling.model import Qwen25VLWithDualHead
 
     # Load model
     print(f"Loading model from {args.checkpoint} (base: {args.base_model})")

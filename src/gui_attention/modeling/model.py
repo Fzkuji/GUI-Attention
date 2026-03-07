@@ -16,7 +16,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
 from gui_attention.constants import ADDITIONAL_SPECIAL_TOKENS
-from gui_attention.dual_head import DualActionHead
+from gui_attention.modeling.dual_head import DualActionHead
 
 
 def _load_click_head_from_pointer(dual_head, checkpoint_path):

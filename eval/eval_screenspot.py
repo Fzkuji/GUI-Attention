@@ -37,9 +37,9 @@ import torch.distributed as dist
 from PIL import Image
 from tqdm import tqdm
 
-from gui_attention.builder import MultiRoundInputBuilder
-from gui_attention.inference import run_saccade_inference
-from gui_attention.model import Qwen25VLWithDualHead
+from gui_attention.inputs.builder import MultiRoundInputBuilder
+from gui_attention.modeling.model import Qwen25VLWithDualHead
+from gui_attention.runtime.inference import run_saccade_inference
 
 # ---------------------------------------------------------------------------
 # Constants
