@@ -103,7 +103,7 @@ class ScriptArgs:
     free_reasoning_sft: bool = field(default=True, metadata={"help": "Bootstrap SFT with brief reasoning + action span outputs instead of the old fixed assistant string."})
     append_assistant_eos: bool = field(default=True, metadata={"help": "Append tokenizer EOS after supervised assistant turns to teach the model where to stop."})
     # Loss weights
-    lm_loss_weight: float = field(default=0.1, metadata={"help": "Weight for LM (next-token prediction) loss."})
+    lm_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
     click_loss_weight: float = field(default=1.0, metadata={"help": "Weight for ClickHead KL loss."})
     # LoRA
