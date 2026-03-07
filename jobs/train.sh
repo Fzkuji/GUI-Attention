@@ -16,7 +16,80 @@
 
 set -e
 
+usage() {
+    cat <<'EOF'
+Usage:
+  bash jobs/train.sh [options]
+
+Options:
+  --num_gpus N
+  --resume_ckpt PATH
+  --base_model PATH
+  --click_head_from PATH
+  --output_dir PATH
+  --free_reasoning_sft true|false
+  --append_assistant_eos true|false
+  --lm_loss_weight FLOAT
+  --help
+
+Environment variables are still supported, but CLI flags take precedence.
+EOF
+}
+
 NUM_GPUS="${NUM_GPUS:-8}"
+BASE_MODEL="${BASE_MODEL:-}"
+RESUME_CKPT="${RESUME_CKPT:-}"
+CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
+APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
+LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-1.0}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --num_gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
+        --resume_ckpt)
+            RESUME_CKPT="$2"
+            shift 2
+            ;;
+        --base_model)
+            BASE_MODEL="$2"
+            shift 2
+            ;;
+        --click_head_from)
+            CLICK_HEAD_FROM="$2"
+            shift 2
+            ;;
+        --output_dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --free_reasoning_sft)
+            FREE_REASONING_SFT="$2"
+            shift 2
+            ;;
+        --append_assistant_eos)
+            APPEND_ASSISTANT_EOS="$2"
+            shift 2
+            ;;
+        --lm_loss_weight)
+            LM_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
 
 # Auto-detect workspace
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -78,8 +151,6 @@ if [ -n "$RESUME_CKPT" ]; then
 fi
 
 CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
-FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
-APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
 
 echo "============================================================"
 echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
@@ -117,7 +188,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_target_modules "q_proj,v_proj" \
     --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
-    --lm_loss_weight 1.0 \
+    --lm_loss_weight "$LM_LOSS_WEIGHT" \
     --look_loss_weight 1.0 \
     --click_loss_weight 1.0 \
     --num_train_epochs 1 \
