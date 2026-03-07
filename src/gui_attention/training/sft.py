@@ -40,7 +40,7 @@ from gui_attention.modeling.attention import (
     token_to_spatial,
 )
 from gui_attention.inputs.builder import MultiRoundInputBuilder
-from gui_attention.inputs.crop import crop_image, point_in_bbox
+from gui_attention.inputs.crop import crop_image, crop_image_bbox, point_in_bbox
 from gui_attention.inputs.labels import compute_binary_labels, compute_overlap_mask
 from gui_attention.constants import (
     DEFAULT_LOOK_PAD_TOKEN,
@@ -51,6 +51,7 @@ from gui_attention.constants import (
     IGNORE_INDEX,
     LOW_RES_MAX_PIXELS,
 )
+from gui_attention.runtime.proposals import box_center, select_top_proposal_bbox
 from gui_attention.modeling.model import Qwen25VLWithDualHead, build_model
 
 
@@ -418,6 +419,8 @@ class SaccadeTrainer:
         max_rounds = self.max_rounds
         pred_x, pred_y = gt_cx, gt_cy  # overwritten by round 0
         ga_scale = max(self.args.gradient_accumulation_steps, 1)
+        look_crop_pixels = self.sa.low_res_max_pixels
+        round_crop_bboxes = []
 
         def _backward_round(round_loss):
             """Backward the accumulated loss for this round, then release graph.
@@ -427,6 +430,41 @@ class SaccadeTrainer:
                 scaled = round_loss / (max_rounds * ga_scale)
                 scaled.backward()
                 total_loss_value += round_loss.item()
+
+        def _attn_np(attn: torch.Tensor):
+            return attn.detach().cpu().float().numpy()
+
+        def _fallback_bbox_from_point(center_x, center_y):
+            _, fallback_bbox = crop_image(
+                img,
+                center_x,
+                center_y,
+                crop_size=self.sa.crop_size,
+                crop_upscale=self.sa.crop_upscale,
+            )
+            return fallback_bbox
+
+        def _proposal_bbox_from_attn(
+            img_attn_2d: torch.Tensor,
+            *,
+            parent_bbox=(0.0, 0.0, 1.0, 1.0),
+            fallback_center=None,
+        ):
+            try:
+                proposal_bbox, _, _ = select_top_proposal_bbox(
+                    _attn_np(img_attn_2d),
+                    parent_bbox=parent_bbox,
+                )
+            except Exception:
+                if fallback_center is None:
+                    raise
+                proposal_bbox = _fallback_bbox_from_point(fallback_center[0], fallback_center[1])
+            _, proposal_bbox = crop_image_bbox(
+                img,
+                proposal_bbox,
+                target_pixels=look_crop_pixels,
+            )
+            return proposal_bbox
 
         for ri in range(max_rounds):
             if ri == 0:
@@ -509,22 +547,29 @@ class SaccadeTrainer:
                     # Decode prediction from LookHead attention
                     _, local_idx = identify_attended_image(attn.squeeze(0), vis_ranges)
                     low_attn = attn.squeeze(0)[vis_ranges[0][0]:vis_ranges[0][0]+vis_ranges[0][1]]
-                    pred_x, pred_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
+                    low_attn_2d = low_attn.view(nh0, nw0)
+                    peak_x, peak_y = token_to_spatial(local_idx, nw0, nh0, attn_weights=low_attn)
+                    proposal_bbox = _proposal_bbox_from_attn(
+                        low_attn_2d,
+                        parent_bbox=(0.0, 0.0, 1.0, 1.0),
+                        fallback_center=(peak_x, peak_y),
+                    )
+                    pred_x, pred_y = box_center(proposal_bbox)
                     round_preds.append((pred_x, pred_y))
+                    round_crop_bboxes.append(proposal_bbox)
 
                     # Virtual crop_hit for round 0
-                    _, virtual_bbox = crop_image(img, pred_x, pred_y,
-                                                    crop_size=self.sa.crop_size,
-                                                    crop_upscale=self.sa.crop_upscale)
-                    if point_in_bbox(gt_cx, gt_cy, virtual_bbox):
+                    if point_in_bbox(gt_cx, gt_cy, proposal_bbox):
                         crop_hit_round = 1  # round 0's crop = crop round 1
 
             else:
                 # ===== Round ri: Crop =====
-                crop_cx, crop_cy = pred_x, pred_y
-                cropped, crop_bbox = crop_image(img, crop_cx, crop_cy,
-                                                  crop_size=self.sa.crop_size,
-                                                  crop_upscale=self.sa.crop_upscale)
+                current_request_bbox = round_crop_bboxes[ri - 1]
+                cropped, crop_bbox = crop_image_bbox(
+                    img,
+                    current_request_bbox,
+                    target_pixels=look_crop_pixels,
+                )
                 gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
                 if gt_in_crop and crop_hit_round is None:
                     crop_hit_round = ri  # first round that covered GT
@@ -540,10 +585,12 @@ class SaccadeTrainer:
                     append_assistant_eos=self.sa.append_assistant_eos,
                 )
                 for prev_ri in range(1, ri):
-                    prev_px, prev_py = round_preds[prev_ri - 1]
-                    prev_crop, prev_bbox = crop_image(img, prev_px, prev_py,
-                                                       crop_size=self.sa.crop_size,
-                                                       crop_upscale=self.sa.crop_upscale)
+                    prev_crop_bbox = round_crop_bboxes[prev_ri - 1]
+                    prev_crop, prev_bbox = crop_image_bbox(
+                        img,
+                        prev_crop_bbox,
+                        target_pixels=look_crop_pixels,
+                    )
                     # Previous crops were always "look" (not the final click)
                     prev_gt_in = point_in_bbox(gt_cx, gt_cy, prev_bbox)
                     try:
@@ -786,9 +833,18 @@ class SaccadeTrainer:
                         lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
                         info = self.builder.image_infos[img_idx]
                         bx1, by1, bx2, by2 = info.global_bbox
-                        pred_x = bx1 + lx * (bx2 - bx1)
-                        pred_y = by1 + ly * (by2 - by1)
+                        fallback_center = (
+                            bx1 + lx * (bx2 - bx1),
+                            by1 + ly * (by2 - by1),
+                        )
+                        proposal_bbox = _proposal_bbox_from_attn(
+                            img_attn.view(nh_a, nw_a),
+                            parent_bbox=info.global_bbox,
+                            fallback_center=fallback_center,
+                        )
+                        pred_x, pred_y = box_center(proposal_bbox)
                         round_preds.append((pred_x, pred_y))
+                        round_crop_bboxes.append(proposal_bbox)
                     else:
                         break
 
@@ -871,8 +927,9 @@ class SaccadeTrainer:
             print(f"=== Saccade Foveation Training (Dual Head: LookHead + ClickHead, {mode}) ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  low_res={self.sa.low_res_max_pixels}  high_res={self.sa.high_res_max_pixels}")
-            print(f"  crop_size={self.sa.crop_size}x{self.sa.crop_size} x{self.sa.crop_upscale} -> "
-                  f"{self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  "
+            print(f"  look_crop_strategy=top1_basin_proposal -> resize_to={self.sa.low_res_max_pixels} pixels")
+            print(f"  fallback_square_crop={self.sa.crop_size}x{self.sa.crop_size} x {self.sa.crop_upscale} "
+                  f"-> {self.sa.crop_size*self.sa.crop_upscale}x{self.sa.crop_size*self.sa.crop_upscale}  "
                   f"max_saccade_rounds={self.sa.max_saccade_rounds}")
             print(f"  click_phase_step={self.sa.click_phase_step} (ClickHead starts at step {self.sa.click_phase_step})")
             print(f"  lm_loss_weight={self.sa.lm_loss_weight}  look_loss_weight={self.sa.look_loss_weight}  "

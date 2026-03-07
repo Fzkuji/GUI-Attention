@@ -18,9 +18,10 @@ from gui_attention.modeling.attention import (
     token_to_spatial,
 )
 from gui_attention.inputs.builder import MultiRoundInputBuilder
-from gui_attention.inputs.crop import crop_image
+from gui_attention.inputs.crop import crop_image, crop_image_bbox
 from gui_attention.inputs.labels import compute_overlap_mask
 from gui_attention.runtime.foveation import SaccadeLoop
+from gui_attention.runtime.proposals import box_center, select_top_proposal_bbox
 from gui_attention.runtime.reasoning import (
     ActionSpanStoppingCriteria,
     decode_reasoning_content,
@@ -157,7 +158,44 @@ def run_saccade_inference(
     def _to_device(inputs):
         return {k: v.to(device) for k, v in inputs.items()}
 
-    def _build_context(history_used_responses, history_points, *, current_crop=None, current_bbox=None,
+    look_crop_pixels = builder.low_res_max_pixels
+
+    def _attn_np(attn: torch.Tensor):
+        return attn.detach().cpu().float().numpy()
+
+    def _fallback_bbox_from_point(center_x, center_y):
+        _, fallback_bbox = crop_image(
+            image,
+            center_x,
+            center_y,
+            crop_size=crop_size,
+            crop_upscale=crop_upscale,
+        )
+        return fallback_bbox
+
+    def _proposal_bbox_from_attn(
+        img_attn_2d: torch.Tensor,
+        *,
+        parent_bbox=(0.0, 0.0, 1.0, 1.0),
+        fallback_center=None,
+    ):
+        try:
+            proposal_bbox, _, _ = select_top_proposal_bbox(
+                _attn_np(img_attn_2d),
+                parent_bbox=parent_bbox,
+            )
+        except Exception:
+            if fallback_center is None:
+                raise
+            proposal_bbox = _fallback_bbox_from_point(fallback_center[0], fallback_center[1])
+        _, proposal_bbox = crop_image_bbox(
+            image,
+            proposal_bbox,
+            target_pixels=look_crop_pixels,
+        )
+        return proposal_bbox
+
+    def _build_context(history_used_responses, history_crop_bboxes, *, current_crop=None, current_bbox=None,
                        current_response=None, for_generation=False):
         builder.reset()
         if history_used_responses:
@@ -179,13 +217,11 @@ def run_saccade_inference(
             )
 
         for hist_idx in range(1, len(history_used_responses)):
-            prev_px, prev_py = history_points[hist_idx - 1]
-            prev_crop, prev_bbox = crop_image(
+            prev_crop_bbox = history_crop_bboxes[hist_idx - 1]
+            prev_crop, prev_bbox = crop_image_bbox(
                 image,
-                prev_px,
-                prev_py,
-                crop_size=crop_size,
-                crop_upscale=crop_upscale,
+                prev_crop_bbox,
+                target_pixels=look_crop_pixels,
             )
             inputs, cur_text, cur_images = builder.extend_with_crop(
                 cur_text,
@@ -288,7 +324,15 @@ def run_saccade_inference(
     n_low = vis_ranges[0][1]
     low_attn = attn_1d[:n_low]
     best_idx = low_attn.argmax().item()
-    focus_x, focus_y = token_to_spatial(best_idx, nw0, nh0, attn_weights=low_attn)
+    low_attn_2d = low_attn.view(nh0, nw0)
+    peak_x, peak_y = token_to_spatial(best_idx, nw0, nh0, attn_weights=low_attn)
+    proposal_bbox = _proposal_bbox_from_attn(
+        low_attn_2d,
+        parent_bbox=(0.0, 0.0, 1.0, 1.0),
+        fallback_center=(peak_x, peak_y),
+    )
+    focus_x, focus_y = box_center(proposal_bbox)
+    round_crop_bboxes = [proposal_bbox]
 
     saccade.decide_round0(state, focus_x, focus_y)
     nw_final, nh_final = nw0, nh0
@@ -305,13 +349,13 @@ def run_saccade_inference(
             "used_reasoning_text": parsed0.used_content,
             "format_ok": parsed0.format_ok,
             "crop_bbox": None,
-            "decision_crop_bbox": None,
+            "decision_crop_bbox": proposal_bbox,
             "pred_x": focus_x,
             "pred_y": focus_y,
             "attended_image": "low",
             "grid_dims_low": (nh0, nw0),
             "grid_dims_crop": None,
-            "low_attn_2d": _maybe_numpy(low_attn.view(nh0, nw0)),
+            "low_attn_2d": _maybe_numpy(low_attn_2d),
             "crop_attn_2d": None,
             "point_kind": "look",
         })
@@ -325,15 +369,18 @@ def run_saccade_inference(
     click_trace_idx = None
     decision_crop_bbox = None
     for ri in range(1, max_rounds):
-        cropped, crop_bbox = crop_image(image, focus_x, focus_y,
-                                        crop_size=crop_size,
-                                        crop_upscale=crop_upscale)
+        current_request_bbox = round_crop_bboxes[ri - 1]
+        cropped, crop_bbox = crop_image_bbox(
+            image,
+            current_request_bbox,
+            target_pixels=look_crop_pixels,
+        )
         decision_crop_bbox = crop_bbox
         history_responses = list(round_used_responses)
         try:
             ri_prompt, _, _ = _build_context(
                 history_responses,
-                round_preds,
+                round_crop_bboxes[:ri - 1],
                 current_crop=cropped,
                 current_bbox=crop_bbox,
                 for_generation=True,
@@ -349,7 +396,7 @@ def run_saccade_inference(
         try:
             ri_inputs_full, _, _ = _build_context(
                 history_responses,
-                round_preds,
+                round_crop_bboxes[:ri - 1],
                 current_crop=cropped,
                 current_bbox=crop_bbox,
                 current_response=parsed.used_content,
@@ -432,15 +479,22 @@ def run_saccade_inference(
             nh_a, nw_a = grid_dims[img_idx]
             off_a, n_a = vis_ranges[img_idx]
             img_attn = attn_1d[off_a:off_a + n_a]
-            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-
             bx1, by1, bx2, by2 = info.global_bbox
-            global_x = bx1 + lx * (bx2 - bx1)
-            global_y = by1 + ly * (by2 - by1)
-
-            focus_x, focus_y = global_x, global_y
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+            fallback_center = (
+                bx1 + lx * (bx2 - bx1),
+                by1 + ly * (by2 - by1),
+            )
+            next_bbox = _proposal_bbox_from_attn(
+                img_attn.view(nh_a, nw_a),
+                parent_bbox=info.global_bbox,
+                fallback_center=fallback_center,
+            )
+            focus_x, focus_y = box_center(next_bbox)
+            decision_crop_bbox = next_bbox
+            round_crop_bboxes.append(next_bbox)
             round_preds.append((focus_x, focus_y))
-            last_look_point = (global_x, global_y)
+            last_look_point = (focus_x, focus_y)
             last_look_dims = (nw_a, nh_a)
             if return_trace:
                 crop_off, crop_n = vis_ranges[latest_img_idx]
@@ -452,9 +506,9 @@ def run_saccade_inference(
                     "used_reasoning_text": parsed.used_content,
                     "format_ok": parsed.format_ok,
                     "crop_bbox": crop_bbox,
-                    "decision_crop_bbox": crop_bbox,
-                    "pred_x": global_x,
-                    "pred_y": global_y,
+                    "decision_crop_bbox": next_bbox,
+                    "pred_x": focus_x,
+                    "pred_y": focus_y,
                     "attended_image": info.resolution,
                     "grid_dims_low": (nh0, nw0),
                     "grid_dims_crop": (grid_dims[latest_img_idx][0], grid_dims[latest_img_idx][1]),

@@ -6,6 +6,35 @@ from PIL import Image
 from qwen_vl_utils import smart_resize
 
 
+def normalize_bbox(image_or_size, bbox_norm):
+    """Clip a normalized bbox to image bounds and snap it to valid pixel extents."""
+    if isinstance(image_or_size, Image.Image):
+        W, H = image_or_size.size
+    else:
+        W, H = image_or_size
+    bx1, by1, bx2, by2 = [float(v) for v in bbox_norm]
+    bx1 = min(max(bx1, 0.0), 1.0)
+    by1 = min(max(by1, 0.0), 1.0)
+    bx2 = min(max(bx2, 0.0), 1.0)
+    by2 = min(max(by2, 0.0), 1.0)
+    if bx2 < bx1:
+        bx1, bx2 = bx2, bx1
+    if by2 < by1:
+        by1, by2 = by2, by1
+
+    x1 = int(math.floor(bx1 * W))
+    y1 = int(math.floor(by1 * H))
+    x2 = int(math.ceil(bx2 * W))
+    y2 = int(math.ceil(by2 * H))
+
+    x1 = min(max(x1, 0), max(W - 1, 0))
+    y1 = min(max(y1, 0), max(H - 1, 0))
+    x2 = min(max(x2, x1 + 1), W)
+    y2 = min(max(y2, y1 + 1), H)
+
+    return (x1 / W, y1 / H, x2 / W, y2 / H)
+
+
 def crop_image(image: Image.Image, cx_norm, cy_norm, crop_ratio=0.0,
                upsample_pixels: int = 0, crop_target_pixels: int = 0,
                crop_size: int = 0, crop_upscale: int = 1):
@@ -89,6 +118,47 @@ def crop_image(image: Image.Image, cx_norm, cy_norm, crop_ratio=0.0,
                 cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
 
     return cropped, (x1 / W, y1 / H, x2 / W, y2 / H)
+
+
+def crop_image_bbox(
+    image: Image.Image,
+    bbox_norm,
+    *,
+    target_pixels: int = 0,
+    upsample_pixels: int = 0,
+):
+    """Crop a normalized rectangle and resize it to a fixed pixel budget if requested."""
+    W, H = image.size
+    x1n, y1n, x2n, y2n = normalize_bbox((W, H), bbox_norm)
+    x1 = int(round(x1n * W))
+    y1 = int(round(y1n * H))
+    x2 = int(round(x2n * W))
+    y2 = int(round(y2n * H))
+    x2 = max(x2, x1 + 1)
+    y2 = max(y2, y1 + 1)
+
+    cropped = image.crop((x1, y1, x2, y2))
+
+    if target_pixels > 0:
+        cur_w, cur_h = cropped.size
+        new_h, new_w = smart_resize(
+            cur_h, cur_w, factor=28,
+            min_pixels=target_pixels, max_pixels=target_pixels,
+        )
+        if (new_w, new_h) != (cur_w, cur_h):
+            cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
+    elif upsample_pixels > 0:
+        cur_w, cur_h = cropped.size
+        cur_pixels = cur_w * cur_h
+        if cur_pixels < upsample_pixels:
+            new_h, new_w = smart_resize(
+                cur_h, cur_w, factor=28,
+                min_pixels=upsample_pixels, max_pixels=upsample_pixels,
+            )
+            if (new_w, new_h) != (cur_w, cur_h):
+                cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
+
+    return cropped, (x1n, y1n, x2n, y2n)
 
 
 def get_patch_bbox(px_norm, py_norm, n_width, n_height):

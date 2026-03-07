@@ -172,3 +172,46 @@ def rect_box(center_x: float, center_y: float, width: float, height: float) -> t
         elif y2 >= 1.0:
             y1 = max(0.0, 1.0 - height)
     return x1, y1, x2, y2
+
+
+def box_center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    """Return the normalized center of a normalized box."""
+    x1, y1, x2, y2 = box
+    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+
+
+def map_local_box_to_global(
+    local_box: tuple[float, float, float, float],
+    parent_bbox: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Map a box in local [0,1] coords into the parent's normalized bbox."""
+    px1, py1, px2, py2 = parent_bbox
+    pw = max(px2 - px1, 1e-8)
+    ph = max(py2 - py1, 1e-8)
+    lx1, ly1, lx2, ly2 = local_box
+    return (
+        px1 + lx1 * pw,
+        py1 + ly1 * ph,
+        px1 + lx2 * pw,
+        py1 + ly2 * ph,
+    )
+
+
+def select_top_proposal_bbox(
+    attn: np.ndarray,
+    *,
+    parent_bbox: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    top_k: int = 1,
+) -> tuple[tuple[float, float, float, float], list[BasinProposal], np.ndarray]:
+    """Return the highest-ranked proposal box mapped into global coordinates."""
+    proposals, labels = compute_basin_proposals(attn, top_k=max(top_k, 1))
+    if not proposals:
+        raise ValueError("no basin proposals available")
+    proposal = proposals[0]
+    local_box = rect_box(
+        proposal.rect.center_x,
+        proposal.rect.center_y,
+        proposal.rect.width,
+        proposal.rect.height,
+    )
+    return map_local_box_to_global(local_box, parent_bbox), proposals, labels
