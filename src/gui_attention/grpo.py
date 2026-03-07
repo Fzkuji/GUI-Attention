@@ -22,6 +22,7 @@ import os
 import random
 import traceback
 import math
+import shutil
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -203,6 +204,8 @@ class GRPOTrainer:
 
         self.metrics = defaultdict(list)
         self.global_step = 0
+        self.best_checkpoint_score = float("-inf")
+        self.best_checkpoint_step = 0
 
     def _get_pointer_pad_ids(self):
         pp_id = self.model.config.pointer_pad_token_id
@@ -717,6 +720,16 @@ class GRPOTrainer:
 
         return pg_loss
 
+    def _rolling_metric(self, key: str, window: Optional[int] = None) -> Optional[float]:
+        values = self.metrics.get(key, [])
+        if not values:
+            return None
+        if window is not None and window > 0:
+            values = values[-window:]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
     def _replay_trajectory_loss(self, sample, traj: Trajectory):
         """Replay a trajectory and compute differentiable policy gradient loss.
 
@@ -1093,26 +1106,60 @@ class GRPOTrainer:
                                 self.metrics[key] = self.metrics[key][-500:]
 
                 if self.global_step % self.args.save_steps == 0 and self.global_step > 0:
-                    self._save(f"checkpoint-{self.global_step}")
+                    save_window = max(self.args.save_steps, 1)
+                    score = self._rolling_metric("grpo_avg_reward", window=save_window)
+                    if score is not None and score > self.best_checkpoint_score:
+                        self.best_checkpoint_score = score
+                        self.best_checkpoint_step = self.global_step
+                        self._save(
+                            "checkpoint-best",
+                            overwrite=True,
+                            extra_state={
+                                "best_metric_name": "grpo_avg_reward",
+                                "best_metric_value": score,
+                                "best_metric_window": save_window,
+                                "best_metric_step": self.global_step,
+                                "best_hit_rate": self._rolling_metric("grpo_hit_rate", window=save_window),
+                            },
+                        )
+                    elif self.rank == 0:
+                        best_str = (
+                            f"{self.best_checkpoint_score:.3f}"
+                            if self.best_checkpoint_score > float("-inf")
+                            else "N/A"
+                        )
+                        score_str = f"{score:.3f}" if score is not None else "N/A"
+                        print(
+                            f"  Skip save at step {self.global_step}: "
+                            f"reward={score_str} <= best={best_str}"
+                        )
 
         self._save("final")
         if self.rank == 0:
             print(f"Done. Saved to {self.args.output_dir}")
 
-    def _save(self, name):
+    def _save(self, name, overwrite: bool = False, extra_state: Optional[dict] = None):
         if self.world_size > 1:
             dist.barrier()
         p = os.path.join(self.args.output_dir, name)
         if self.rank != 0:
             return
+        if overwrite and os.path.isdir(p):
+            shutil.rmtree(p)
         os.makedirs(p, exist_ok=True)
         self.model.save_pretrained(p)
         self.tokenizer.save_pretrained(p)
-        torch.save({
+        state = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "global_step": self.global_step,
-        }, os.path.join(p, "training_state.pt"))
+        }
+        if self.best_checkpoint_score > float("-inf"):
+            state["best_checkpoint_score"] = self.best_checkpoint_score
+            state["best_checkpoint_step"] = self.best_checkpoint_step
+        if extra_state:
+            state.update(extra_state)
+        torch.save(state, os.path.join(p, "training_state.pt"))
         print(f"  Saved: {p}")
 
 
