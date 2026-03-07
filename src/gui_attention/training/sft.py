@@ -420,6 +420,7 @@ class SaccadeTrainer:
 
                 if look_loss is not None:
                     round_loss = round_loss + self.sa.look_loss_weight * look_loss
+                    self.metrics["look_loss"].append(look_loss.item())
                     n_valid += 1
 
                 # Backward round 0 loss — releases computation graph
@@ -579,6 +580,7 @@ class SaccadeTrainer:
                         vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                     if look_loss is not None:
                         round_loss = round_loss + self.sa.look_loss_weight * look_loss
+                        self.metrics["look_loss"].append(look_loss.item())
                         n_valid += 1
 
                     # ClickHead (after click_phase_step): precise position on ALL crop tokens
@@ -672,6 +674,7 @@ class SaccadeTrainer:
                             vis_embeds, anchor, labels=look_full_labels, mask=full_mask)
                         if look_loss is not None:
                             round_loss = round_loss + self.sa.look_loss_weight * look_loss
+                            self.metrics["look_loss"].append(look_loss.item())
                             n_valid += 1
                     else:
                         with torch.no_grad():
@@ -736,6 +739,8 @@ class SaccadeTrainer:
             hit = (sample["bbox_gt"][0] <= final_px <= sample["bbox_gt"][2]
                    and sample["bbox_gt"][1] <= final_py <= sample["bbox_gt"][3])
             self.metrics["hit_rate"].append(1 if hit else 0)
+        if nv > 0:
+            self.metrics["total_loss"].append(loss)
         return loss if nv > 0 else 0.0, nv
 
     def train_step(self, batch):
@@ -749,7 +754,7 @@ class SaccadeTrainer:
                     acc_n += 1
             except Exception:
                 traceback.print_exc()
-        return acc_loss, acc_n
+        return acc_loss / max(acc_n, 1), acc_n
 
     # -- main train loop ------------------------------------------------------
 
@@ -827,10 +832,16 @@ class SaccadeTrainer:
                         all_lrs = self.scheduler.get_last_lr()
                         lr_val = all_lrs[0]
                         bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val
+                        loss_str = (
+                            f" loss={ar('total_loss'):.4f}"
+                            if self.metrics["total_loss"]
+                            else f" loss={loss_val:.4f}"
+                        )
                         lm_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
+                        look_str = f" look={ar('look_loss'):.3f}" if self.metrics["look_loss"] else ""
                         click_str = f" click={ar('click_loss'):.3f}" if self.metrics["click_loss"] else ""
                         phase = "Look+Click" if self.in_click_phase else "Look"
-                        print(f"  [Step {self.global_step}] [{phase}] loss={loss_val:.4f}{lm_str}{click_str} "
+                        print(f"  [Step {self.global_step}] [{phase}]{loss_str}{lm_str}{look_str}{click_str} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
                               f"crop_rounds={ar('crop_rounds'):.1f} vis_tok={ar('vis_tokens'):.0f} "
