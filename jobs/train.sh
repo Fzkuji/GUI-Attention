@@ -30,6 +30,8 @@ Options:
   --free_reasoning_sft true|false
   --append_assistant_eos true|false
   --lm_loss_weight FLOAT
+  --look_loss_weight FLOAT
+  --click_loss_weight FLOAT
   --help
 
 Environment variables are still supported, but CLI flags take precedence.
@@ -43,7 +45,9 @@ CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
 APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
-LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-1.0}"
+LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-0.5}"
+LOOK_LOSS_WEIGHT="${LOOK_LOSS_WEIGHT:-1.0}"
+CLICK_LOSS_WEIGHT="${CLICK_LOSS_WEIGHT:-2.0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,6 +81,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lm_loss_weight)
             LM_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --look_loss_weight)
+            LOOK_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --click_loss_weight)
+            CLICK_LOSS_WEIGHT="$2"
             shift 2
             ;;
         --help|-h)
@@ -189,8 +201,8 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --action_head_lr 1e-4 \
     --lora_lr 5e-5 \
     --lm_loss_weight "$LM_LOSS_WEIGHT" \
-    --look_loss_weight 1.0 \
-    --click_loss_weight 1.0 \
+    --look_loss_weight "$LOOK_LOSS_WEIGHT" \
+    --click_loss_weight "$CLICK_LOSS_WEIGHT" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
