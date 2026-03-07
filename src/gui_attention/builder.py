@@ -8,6 +8,7 @@ Each round's image is pre-processed at its own resolution so the processor
 never re-sizes an image intended for a different precision level.
 """
 
+import random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +30,7 @@ from gui_attention.constants import (
 from gui_attention.reasoning import (
     REASONING_ASSISTANT_PREFIX,
     get_reasoning_guide,
+    sample_sft_reasoning_content,
     wrap_assistant_content,
 )
 
@@ -65,6 +67,15 @@ class MultiRoundInputBuilder:
         self._processor_cache: Dict[int, AutoProcessor] = {}
         self._resized_images: List[Image.Image] = []
         self.image_infos: List[ImageInfo] = []
+        self.last_assistant_content: Optional[str] = None
+        self.rng = random.Random()
+        self._assistant_eos_token = tokenizer.eos_token if getattr(tokenizer, "eos_token", None) not in (None, "<|im_end|>") else None
+
+    def _wrap_supervised_assistant(self, content: str, append_eos: bool) -> str:
+        return wrap_assistant_content(
+            content,
+            eos_token=self._assistant_eos_token if append_eos else None,
+        )
 
     def _get_processor(self, max_pixels: int):
         if max_pixels not in self._processor_cache:
@@ -79,6 +90,7 @@ class MultiRoundInputBuilder:
         """Clear state for a new sample."""
         self._resized_images = []
         self.image_infos = []
+        self.last_assistant_content = None
 
     # ----- round 0: low-res full image ------------------------------------
 
@@ -91,6 +103,8 @@ class MultiRoundInputBuilder:
         free_reasoning: bool = False,
         for_generation: bool = False,
         assistant_response: Optional[str] = None,
+        sample_sft_reasoning: bool = False,
+        append_assistant_eos: bool = False,
     ):
         """Build round-0 inputs (full image at low resolution).
 
@@ -118,12 +132,22 @@ class MultiRoundInputBuilder:
             conv, tokenize=False, add_generation_prompt=False, chat_template=CHAT_TEMPLATE,
         )
         if assistant_response is not None:
-            text += wrap_assistant_content(assistant_response)
+            self.last_assistant_content = assistant_response
+            text += self._wrap_supervised_assistant(assistant_response, append_assistant_eos)
+        elif sample_sft_reasoning:
+            self.last_assistant_content = sample_sft_reasoning_content("look", is_round0=True, rng=self.rng)
+            text += self._wrap_supervised_assistant(
+                self.last_assistant_content,
+                append_assistant_eos,
+            )
         elif for_generation and free_reasoning:
+            self.last_assistant_content = None
             text += REASONING_ASSISTANT_PREFIX
         elif for_generation:
+            self.last_assistant_content = None
             text += "<|im_start|>assistant\n"
         else:
+            self.last_assistant_content = None
             text += ROUND0_SUFFIX if use_dual_tokens else PLACEHOLDER_SUFFIX
         images, _ = process_vision_info(conv)
 
@@ -151,6 +175,8 @@ class MultiRoundInputBuilder:
         *,
         free_reasoning: bool = False,
         assistant_response: Optional[str] = None,
+        sample_sft_reasoning: bool = False,
+        append_assistant_eos: bool = False,
     ):
         """Append a high-res crop.
 
@@ -167,15 +193,29 @@ class MultiRoundInputBuilder:
         round_num = len(self.image_infos)
 
         if assistant_response is not None:
-            suffix = wrap_assistant_content(assistant_response)
+            self.last_assistant_content = assistant_response
+            suffix = self._wrap_supervised_assistant(assistant_response, append_assistant_eos)
+        elif sample_sft_reasoning:
+            self.last_assistant_content = sample_sft_reasoning_content(
+                "click" if gt_in_crop and use_dual_tokens else "look",
+                rng=self.rng,
+            )
+            suffix = self._wrap_supervised_assistant(
+                self.last_assistant_content,
+                append_assistant_eos,
+            )
         elif for_generation and free_reasoning:
+            self.last_assistant_content = None
             suffix = REASONING_ASSISTANT_PREFIX
         elif for_generation:
             # No suffix — let model generate and decide look vs click
+            self.last_assistant_content = None
             suffix = "<|im_start|>assistant\n"
         elif use_dual_tokens:
+            self.last_assistant_content = None
             suffix = CLICK_SUFFIX if gt_in_crop else LOOK_SUFFIX
         else:
+            self.last_assistant_content = None
             suffix = PLACEHOLDER_SUFFIX
 
         zoom_hint = ""

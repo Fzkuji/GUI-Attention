@@ -1,7 +1,9 @@
 """Shared helpers for free-form reasoning with structured action spans."""
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence
+
+import random
 
 import torch
 from transformers import StoppingCriteria
@@ -33,6 +35,43 @@ CROP_REASONING_GUIDE = (
     f"{LOOK_ACTION_SPAN} or {CLICK_ACTION_SPAN}\n"
     "Use the look action when you need another close-up. Use the click action only when the target is clear enough to click now."
 )
+
+ROUND0_REASONING_TEMPLATES = [
+    "I should inspect a high-resolution region before deciding.",
+    "I need a closer view of the relevant area first.",
+    "Let me zoom into a promising region to verify the target.",
+    "I will examine one detailed crop before I decide where to click.",
+    "The overview is too coarse, so I should inspect a local region next.",
+    "I need a closer crop to confirm the target accurately.",
+    "I should look at a more detailed region before committing to a click.",
+    "The target needs a close-up check, so I will inspect another region.",
+]
+
+LOOK_REASONING_TEMPLATES = [
+    "This crop is still not clear enough, so I should inspect another region.",
+    "I need one more close-up before I can click confidently.",
+    "The target is not certain in this view, so I should keep looking.",
+    "I should move to another nearby region to gather stronger evidence.",
+    "This view is inconclusive, so another detailed crop would help.",
+    "I do not have enough evidence to click yet, so I should inspect elsewhere.",
+    "The target is still ambiguous here, so I need another close-up.",
+    "I should continue exploring because this crop does not confirm the target.",
+    "I need a clearer region before I can safely click the target.",
+    "This region is not sufficient yet, so I should inspect another crop.",
+]
+
+CLICK_REASONING_TEMPLATES = [
+    "This crop is clear enough, and I can click the target now.",
+    "I have enough evidence in this region to click the target.",
+    "The target is visible in this crop, so I can commit to the click.",
+    "This view confirms the target well enough to click now.",
+    "I can identify the target confidently in this crop and should click it.",
+    "The target location is clear here, so I am ready to click.",
+    "This crop provides enough detail to click the correct target now.",
+    "I have confirmed the target in this region and can click it.",
+    "The target is sufficiently clear in this crop, so I should click now.",
+    "This region resolves the ambiguity, and I can click the target now.",
+]
 
 
 @dataclass
@@ -67,9 +106,39 @@ def normalize_assistant_content(content: str) -> str:
     return text
 
 
-def wrap_assistant_content(content: str) -> str:
+def wrap_assistant_content(content: str, *, eos_token: Optional[str] = None) -> str:
     text = normalize_assistant_content(content)
-    return f"<|im_start|>assistant\n{text}<|im_end|>\n"
+    wrapped = f"<|im_start|>assistant\n{text}<|im_end|>\n"
+    if eos_token and eos_token != "<|im_end|>":
+        wrapped += eos_token
+        if not wrapped.endswith("\n"):
+            wrapped += "\n"
+    return wrapped
+
+
+def sample_sft_reasoning_content(
+    action: str,
+    *,
+    is_round0: bool = False,
+    rng: Optional[random.Random] = None,
+) -> str:
+    """Sample a short supervised reasoning response ending with one action span.
+
+    This bootstraps the LM from old fixed-format SFT into the new
+    "brief reasoning + structured action" output distribution.
+    """
+    chooser = rng if rng is not None else random
+    if is_round0 or action == "round0":
+        thought = chooser.choice(ROUND0_REASONING_TEMPLATES)
+        action = "look"
+    elif action == "click":
+        thought = chooser.choice(CLICK_REASONING_TEMPLATES)
+    else:
+        thought = chooser.choice(LOOK_REASONING_TEMPLATES)
+        action = "look"
+
+    action_span = LOOK_ACTION_SPAN if action == "look" else CLICK_ACTION_SPAN
+    return f"{thought}{action_span}"
 
 
 def canonical_assistant_content(thought: str, action: str) -> str:

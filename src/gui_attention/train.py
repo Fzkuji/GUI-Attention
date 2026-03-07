@@ -100,6 +100,8 @@ class ScriptArgs:
     max_saccade_rounds: int = field(default=6, metadata={"help": "Max rounds per sample (round 0 + up to N-1 crop saccades)."})
     click_phase_step: int = field(default=3000, metadata={"help": "Step to start training ClickHead. Before this, only LookHead trains."})
     use_dual_tokens: bool = field(default=False, metadata={"help": "Use <look_pad>/<click_pad> dual tokens instead of <pointer_pad>."})
+    free_reasoning_sft: bool = field(default=True, metadata={"help": "Bootstrap SFT with brief reasoning + action span outputs instead of the old fixed assistant string."})
+    append_assistant_eos: bool = field(default=True, metadata={"help": "Append tokenizer EOS after supervised assistant turns to teach the model where to stop."})
     # Loss weights
     lm_loss_weight: float = field(default=0.1, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
@@ -338,6 +340,7 @@ class SaccadeTrainer:
         total_loss_value = 0.0  # scalar for logging only
         n_valid = 0
         round_preds = []
+        round_responses = []
         click_pred = None  # ClickHead prediction (global coords)
 
         # Track all crop info for ClickHead at the end
@@ -364,7 +367,12 @@ class SaccadeTrainer:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
                     use_dual_tokens=self.sa.use_dual_tokens,
+                    free_reasoning=self.sa.free_reasoning_sft,
+                    sample_sft_reasoning=self.sa.free_reasoning_sft,
+                    append_assistant_eos=self.sa.append_assistant_eos,
                 )
+                if self.sa.free_reasoning_sft:
+                    round_responses.append(self.builder.last_assistant_content)
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 # Enable grad on pixel_values for gradient checkpointing
                 if inp.get("pixel_values") is not None:
@@ -446,6 +454,10 @@ class SaccadeTrainer:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
                     sample, sample["instruction"],
                     use_dual_tokens=self.sa.use_dual_tokens,
+                    free_reasoning=self.sa.free_reasoning_sft,
+                    assistant_response=(round_responses[0] if self.sa.free_reasoning_sft and round_responses else None),
+                    sample_sft_reasoning=(self.sa.free_reasoning_sft and not round_responses),
+                    append_assistant_eos=self.sa.append_assistant_eos,
                 )
                 for prev_ri in range(1, ri):
                     prev_px, prev_py = round_preds[prev_ri - 1]
@@ -458,6 +470,16 @@ class SaccadeTrainer:
                         r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                             cur_text, cur_images, prev_crop, prev_bbox,
                             gt_in_crop=prev_gt_in, use_dual_tokens=self.sa.use_dual_tokens,
+                            free_reasoning=self.sa.free_reasoning_sft,
+                            assistant_response=(
+                                round_responses[prev_ri]
+                                if self.sa.free_reasoning_sft and prev_ri < len(round_responses)
+                                else None
+                            ),
+                            sample_sft_reasoning=(
+                                self.sa.free_reasoning_sft and prev_ri >= len(round_responses)
+                            ),
+                            append_assistant_eos=self.sa.append_assistant_eos,
                         )
                     except Exception:
                         break
@@ -465,7 +487,15 @@ class SaccadeTrainer:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
                         gt_in_crop=gt_in_crop, use_dual_tokens=self.sa.use_dual_tokens,
+                        free_reasoning=self.sa.free_reasoning_sft,
+                        sample_sft_reasoning=self.sa.free_reasoning_sft,
+                        append_assistant_eos=self.sa.append_assistant_eos,
                     )
+                    if self.sa.free_reasoning_sft:
+                        if ri < len(round_responses):
+                            round_responses[ri] = self.builder.last_assistant_content
+                        else:
+                            round_responses.append(self.builder.last_assistant_content)
                 except Exception:
                     break
 

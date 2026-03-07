@@ -78,6 +78,8 @@ if [ -n "$RESUME_CKPT" ]; then
 fi
 
 CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
+FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
+APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
 
 echo "============================================================"
 echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
@@ -87,6 +89,8 @@ echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
 echo "  ClickHead from: $CLICK_HEAD_FROM"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v15_dual}"
+echo "  Free-reasoning SFT: $FREE_REASONING_SFT"
+echo "  Append assistant EOS: $APPEND_ASSISTANT_EOS"
 echo "============================================================"
 
 torchrun --nproc_per_node=$NUM_GPUS \
@@ -105,6 +109,8 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --max_saccade_rounds 6 \
     --click_phase_step 0 \
     --use_dual_tokens true \
+    --free_reasoning_sft "$FREE_REASONING_SFT" \
+    --append_assistant_eos "$APPEND_ASSISTANT_EOS" \
     --use_lora true \
     --lora_r 32 \
     --lora_alpha 64 \
