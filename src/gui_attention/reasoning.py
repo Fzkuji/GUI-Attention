@@ -45,6 +45,10 @@ ROUND0_REASONING_TEMPLATES = [
     "I need a closer crop to confirm the target accurately.",
     "I should look at a more detailed region before committing to a click.",
     "The target needs a close-up check, so I will inspect another region.",
+    "I only have a coarse overview right now, so the next step should be a closer inspection of one region.",
+    "Before clicking anything, I want to inspect a zoomed-in area that is most likely to contain the target.",
+    "This first screen view is useful for orientation, but I still need a sharper local crop before making a decision.",
+    "I should narrow the search to a detailed region first, then decide whether another look or a click is appropriate.",
 ]
 
 LOOK_REASONING_TEMPLATES = [
@@ -58,6 +62,12 @@ LOOK_REASONING_TEMPLATES = [
     "I should continue exploring because this crop does not confirm the target.",
     "I need a clearer region before I can safely click the target.",
     "This region is not sufficient yet, so I should inspect another crop.",
+    "I can rule out this crop for now, so I should move to a different nearby region.",
+    "This evidence is weak, and another close-up would be more reliable than clicking now.",
+    "I am not confident enough to click from this view, so I should inspect one more detailed region.",
+    "The current crop suggests the target may be elsewhere, so another inspection step makes more sense.",
+    "This patch does not resolve the ambiguity, so I should continue the search with another zoomed region.",
+    "I still cannot localize the target precisely here, so I should look again before committing.",
 ]
 
 CLICK_REASONING_TEMPLATES = [
@@ -71,6 +81,12 @@ CLICK_REASONING_TEMPLATES = [
     "I have confirmed the target in this region and can click it.",
     "The target is sufficiently clear in this crop, so I should click now.",
     "This region resolves the ambiguity, and I can click the target now.",
+    "The target location is unambiguous in this crop, so there is no need to inspect another region before clicking.",
+    "I can now distinguish the correct UI element clearly enough to click it in this view.",
+    "This crop gives me a precise enough localization of the target, so I should click now rather than keep exploring.",
+    "The evidence here is strong and specific, so I can stop searching and click the target directly.",
+    "I no longer need another crop because this region already identifies the target clearly enough for a click.",
+    "This view is decisive, and the best next action is to click the target now.",
 ]
 
 
