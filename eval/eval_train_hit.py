@@ -17,8 +17,6 @@ import argparse
 import json
 import os
 import random
-import sys
-
 import torch
 from PIL import Image, ImageFile
 from tqdm import tqdm
@@ -26,12 +24,10 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Import pointer head from our code (same architecture as GUI-Actor)
 from gui_attention.constants import (
-    ADDITIONAL_SPECIAL_TOKENS,
+    DEFAULT_POINTER_END_TOKEN,
     DEFAULT_POINTER_PAD_TOKEN,
     DEFAULT_POINTER_START_TOKEN,
-    DEFAULT_POINTER_END_TOKEN,
     GROUNDING_SYSTEM_MESSAGE,
 )
 from gui_attention.dual_head import _AttentionHead
@@ -129,7 +125,7 @@ def load_gui_actor_model(model_path, device="cuda:0"):
     processor = AutoProcessor.from_pretrained(model_path)
     tokenizer = processor.tokenizer
 
-    # Build pointer head (same architecture as GUI-Actor's VisionHead_MultiPatch)
+    # Build pointer head with the same architecture expected by the saved weights.
     d_model = backbone.config.hidden_size
     pointer_head = _AttentionHead(d_model=d_model, projection_dim=d_model)
 
@@ -145,7 +141,7 @@ def load_gui_actor_model(model_path, device="cuda:0"):
         for k, v in state_dict.items():
             if k.startswith("multi_patch_pointer_head."):
                 new_k = k.replace("multi_patch_pointer_head.", "")
-                # Map GUI-Actor names to our VisionHead_MultiPatch names
+                # Map GUI-Actor names to our _AttentionHead names.
                 new_k = new_k.replace("projection_enc", "mlp_v")
                 new_k = new_k.replace("projection_dec", "mlp_t")
                 pointer_state[new_k] = v
@@ -229,13 +225,9 @@ def eval_single_round(backbone, pointer_head, processor, tokenizer, pp_id,
             continue
         vis_start = vis_indices[0].item()
         vis_end = vis_indices[-1].item() + 1
-        visual_hs = hidden_states[0, vis_start:vis_end, :]  # [N_vis, D]
         n_vis = vis_end - vis_start
 
         # Get visual encoder embeddings for pointer head
-        # GUI-Actor uses ViT output (inputs_embeds), not hidden_states
-        # But for pointer head attention, it uses hidden_states for anchor
-        # and ViT embeddings for visual features
         pixel_values = inputs.get("pixel_values")
         image_grid_thw = inputs.get("image_grid_thw")
 
@@ -243,17 +235,17 @@ def eval_single_round(backbone, pointer_head, processor, tokenizer, pp_id,
         _inner = backbone
         if hasattr(_inner, 'model'):
             _inner = _inner.model
-        vis_out = _inner.visual(pixel_values, grid_thw=image_grid_thw)
+        vis_out = _inner.visual(pixel_values.to(_inner.visual.dtype), grid_thw=image_grid_thw)
         vis_embeds = vis_out  # [N_vis, D]
 
         # Pointer head forward
-        attn_weights, loss, logits = pointer_head(
-            vis_embeds.unsqueeze(0),   # [1, N_vis, D]
-            anchor_hs.unsqueeze(0),     # [1, 1, D]
-        )[:3]
+        attn_weights, _, _ = pointer_head(
+            vis_embeds,   # [N_vis, D]
+            anchor_hs,    # [1, D]
+        )
 
         # Get predicted position (argmax)
-        pred_idx = attn_weights[0].argmax().item()
+        pred_idx = attn_weights.squeeze(0).argmax().item()
 
         # Compute grid dimensions from image_grid_thw
         t, h, w = image_grid_thw[0].tolist()

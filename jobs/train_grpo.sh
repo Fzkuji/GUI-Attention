@@ -66,6 +66,7 @@ echo "============================================================"
 echo "  GRPO Saccade Training"
 echo "  SFT checkpoint: $SFT_CKPT"
 echo "  GPUs: $NUM_GPUS"
+echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_grpo}"
 echo "============================================================"
 
@@ -81,9 +82,11 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --low_res_max_pixels 1001600 \
     --crop_size 308 \
     --crop_upscale 3 \
-    --max_saccade_rounds 4 \
+    --max_saccade_rounds 6 \
+    --use_dual_tokens true \
     --group_size 8 \
     --reward_hit 1.0 \
+    --reward_proximity_weight 0.25 \
     --reward_round_penalty 0.05 \
     --kl_coeff 0.01 \
     --temperature 1.0 \
@@ -94,13 +97,13 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_r 32 \
     --lora_alpha 64 \
     --lora_target_modules "q_proj,v_proj" \
-    --action_head_lr 1e-5 \
-    --lora_lr 5e-6 \
+    --action_head_lr 2e-5 \
+    --lora_lr 1e-5 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --weight_decay 0.0 \
-    --warmup_ratio 0.05 \
+    --warmup_ratio 0.0 \
     --logging_steps 10 \
     --save_strategy steps \
     --save_steps 500 \

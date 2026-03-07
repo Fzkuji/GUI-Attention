@@ -18,11 +18,10 @@ Usage:
         --output_dir /path/to/output
 """
 
-import json
-import math
 import os
 import random
 import traceback
+import math
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -38,13 +37,16 @@ from tqdm import tqdm
 from gui_attention.attention import (
     extract_anchor_hidden_states,
     extract_visual_hidden_states,
-    identify_attended_image,
-    token_to_spatial,
 )
 from gui_attention.builder import MultiRoundInputBuilder
-from gui_attention.constants import HIGH_RES_MAX_PIXELS, LOW_RES_MAX_PIXELS, IGNORE_INDEX
+from gui_attention.constants import (
+    CLICK_SUFFIX,
+    HIGH_RES_MAX_PIXELS,
+    LOW_RES_MAX_PIXELS,
+    LOOK_SUFFIX,
+)
 from gui_attention.crop import crop_image, point_in_bbox
-from gui_attention.labels import compute_binary_labels, compute_overlap_mask
+from gui_attention.labels import compute_overlap_mask
 from gui_attention.model import Qwen25VLWithDualHead, build_model
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -54,7 +56,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 @dataclass
 class GRPOArgs:
-    model_name_or_path: str = field(default="Qwen/Qwen2.5-VL-3B-Instruct")
+    model_name_or_path: str = field(default="microsoft/GUI-Actor-3B-Qwen2.5-VL")
     data_path: str = field(default=None)
     image_folder: str = field(default=None)
     max_samples: Optional[int] = field(default=None)
@@ -64,9 +66,11 @@ class GRPOArgs:
     crop_size: int = field(default=308)
     crop_upscale: int = field(default=3)
     max_saccade_rounds: int = field(default=6)
+    use_dual_tokens: bool = field(default=True)
     # GRPO
     group_size: int = field(default=4, metadata={"help": "Number of trajectories per sample (G)"})
     reward_hit: float = field(default=1.0, metadata={"help": "Reward for clicking in GT bbox"})
+    reward_proximity_weight: float = field(default=0.25, metadata={"help": "Dense reward weight for clicking closer to the GT center."})
     reward_round_penalty: float = field(default=0.05, metadata={"help": "Penalty per round used"})
     reward_overlap_penalty: float = field(default=0.1, metadata={"help": "Penalty weight for crop overlap (IoU with previous crops)"})
     kl_coeff: float = field(default=0.01, metadata={"help": "KL penalty coefficient against reference"})
@@ -125,13 +129,19 @@ def _get_visual_module(model):
 class Trajectory:
     """A single saccade trajectory for one sample."""
     round_preds: list          # [(x, y), ...] per round
+    look_token_indices: list   # sampled LookHead token idx per look action
     crop_bboxes: list          # [bbox, ...] per crop round
+    decision_actions: list     # ["look"|"click", ...] per crop round
+    decision_log_probs: list   # [log_prob] per crop round
     look_log_probs: list       # [log_prob] per round (LookHead action)
+    click_token_index: Optional[int]  # sampled ClickHead token idx on concatenated crop tokens
     click_log_prob: float      # ClickHead action log_prob
     click_pred: tuple          # (x, y) final click position
     n_rounds: int              # total rounds used
     hit: bool                  # whether click was in GT bbox
-    reward: float              # computed reward
+    proximity_score: float     # distance-based click quality score in [0, 1]
+    raw_reward: float          # pre-normalization reward
+    reward: float              # normalized reward / advantage
 
 
 # -- GRPO Trainer -------------------------------------------------------------
@@ -180,6 +190,69 @@ class GRPOTrainer:
 
         self.metrics = defaultdict(list)
         self.global_step = 0
+        self.look_suffix_ids = tokenizer(
+            LOOK_SUFFIX, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0]
+        self.click_suffix_ids = tokenizer(
+            CLICK_SUFFIX, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0]
+
+    def _get_pointer_pad_ids(self):
+        pp_id = self.model.config.pointer_pad_token_id
+        if self.ga.use_dual_tokens and hasattr(self.model.config, "look_pad_token_id") and hasattr(self.model.config, "click_pad_token_id"):
+            pp_id = [
+                self.model.config.look_pad_token_id,
+                self.model.config.click_pad_token_id,
+                self.model.config.pointer_pad_token_id,
+            ]
+        return pp_id
+
+    @staticmethod
+    def _locate_visual_token(token_idx: int, visual_ranges):
+        for img_idx, (offset, n_tokens) in enumerate(visual_ranges):
+            if offset <= token_idx < offset + n_tokens:
+                return img_idx, token_idx - offset
+        return None, None
+
+    def _score_suffix(self, inp, suffix_ids: torch.Tensor) -> torch.Tensor:
+        """Average log-prob of a fixed suffix under the current prompt.
+
+        We normalize by suffix length so the binary look/click decision is not
+        biased toward whichever fixed template happens to be shorter.
+        """
+        device = inp["input_ids"].device
+        suffix_ids = suffix_ids.to(device)
+        if suffix_ids.numel() == 0:
+            return torch.tensor(0.0, device=device)
+
+        full_input_ids = torch.cat([inp["input_ids"], suffix_ids.unsqueeze(0)], dim=1)
+        attention_mask = inp.get("attention_mask")
+        if attention_mask is not None:
+            suffix_mask = torch.ones(
+                (attention_mask.shape[0], suffix_ids.numel()),
+                dtype=attention_mask.dtype,
+                device=device,
+            )
+            attention_mask = torch.cat([attention_mask, suffix_mask], dim=1)
+
+        outputs = self.model(
+            input_ids=full_input_ids,
+            attention_mask=attention_mask,
+            pixel_values=inp.get("pixel_values"),
+            image_grid_thw=inp.get("image_grid_thw"),
+        )
+        prompt_len = inp["input_ids"].shape[1]
+        logits = outputs.logits[:, prompt_len - 1:-1, :]
+        token_log_probs = F.log_softmax(logits, dim=-1).gather(
+            -1, suffix_ids.view(1, -1, 1)
+        ).squeeze(-1)
+        return token_log_probs.mean()
+
+    def _decision_log_probs(self, inp) -> torch.Tensor:
+        look_score = self._score_suffix(inp, self.look_suffix_ids)
+        click_score = self._score_suffix(inp, self.click_suffix_ids)
+        scores = torch.stack([look_score, click_score], dim=0) / max(self.ga.temperature, 1e-6)
+        return F.log_softmax(scores, dim=0)
 
     # -- generate one trajectory (sampling) -----------------------------------
 
@@ -191,21 +264,16 @@ class GRPOTrainer:
         """
         device = _get_model_device(self.model)
         bbox_gt = sample["bbox_gt"]
-        gt_cx = (bbox_gt[0] + bbox_gt[2]) / 2
-        gt_cy = (bbox_gt[1] + bbox_gt[3]) / 2
-
         img_tok = self.model.config.image_token_id
-        pp_id = self.model.config.pointer_pad_token_id
-        # Support dual tokens
-        if hasattr(self.model.config, "look_pad_token_id") and hasattr(self.model.config, "click_pad_token_id"):
-            look_id = self.model.config.look_pad_token_id
-            click_id = self.model.config.click_pad_token_id
-            pp_id = list(set([look_id, click_id, pp_id]))
+        pp_id = self._get_pointer_pad_ids()
         merge = _get_visual_module(self.model).spatial_merge_size
 
         self.builder.reset()
         round_preds = []
+        look_token_indices = []
         crop_bboxes = []
+        decision_actions = []
+        decision_log_probs = []
         look_log_probs = []
         all_crop_info = []
 
@@ -215,7 +283,7 @@ class GRPOTrainer:
         for ri in range(max_rounds):
             if ri == 0:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 if inp.get("pixel_values") is not None:
                     inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
@@ -249,6 +317,7 @@ class GRPOTrainer:
                 probs = F.softmax(logits_1d, dim=-1)
                 sampled_idx = torch.multinomial(probs, 1).item()
                 log_prob = F.log_softmax(logits_1d, dim=-1)[sampled_idx].item()
+                look_token_indices.append(sampled_idx)
                 look_log_probs.append(log_prob)
 
                 # Convert sampled token to spatial coordinates
@@ -256,42 +325,73 @@ class GRPOTrainer:
                 pred_y = ((sampled_idx // nw0) + 0.5) / nh0
                 round_preds.append((pred_x, pred_y))
 
-                # Virtual crop check
-                _, virtual_bbox = crop_image(img, pred_x, pred_y,
-                                             crop_size=self.ga.crop_size,
-                                             crop_upscale=self.ga.crop_upscale)
-
             else:
                 crop_cx, crop_cy = round_preds[-1]
                 cropped, crop_bbox = crop_image(img, crop_cx, crop_cy,
                                                 crop_size=self.ga.crop_size,
                                                 crop_upscale=self.ga.crop_upscale)
                 crop_bboxes.append(crop_bbox)
-                gt_in_crop = point_in_bbox(gt_cx, gt_cy, crop_bbox)
 
-                # Rebuild context
+                # Rebuild previous context, then ask the LM to choose look vs click.
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
-                for prev_ri in range(1, ri):
-                    prev_px, prev_py = round_preds[prev_ri]  # round_preds[1] = first crop pred
-                    if prev_ri - 1 < len(crop_bboxes):
-                        prev_crop, prev_bbox = crop_image(img, round_preds[prev_ri - 1][0],
-                                                          round_preds[prev_ri - 1][1],
-                                                          crop_size=self.ga.crop_size,
-                                                          crop_upscale=self.ga.crop_upscale)
-                        try:
-                            r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
-                                cur_text, cur_images, prev_crop, prev_bbox,
-                                use_dual_tokens=True)
-                        except Exception:
-                            break
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
+                for prev_idx in range(ri - 1):
+                    prev_crop, prev_bbox = crop_image(
+                        img, round_preds[prev_idx][0], round_preds[prev_idx][1],
+                        crop_size=self.ga.crop_size, crop_upscale=self.ga.crop_upscale,
+                    )
+                    try:
+                        r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                            cur_text, cur_images, prev_crop, prev_bbox,
+                            gt_in_crop=False, use_dual_tokens=self.ga.use_dual_tokens,
+                        )
+                    except Exception:
+                        return None
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
-                        use_dual_tokens=True)
+                        gt_in_crop=None, use_dual_tokens=self.ga.use_dual_tokens,
+                        for_generation=True,
+                    )
                 except Exception:
-                    break
+                    return None
+
+                inp = {k: v.to(device) for k, v in r_inputs.items()}
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
+
+                decision_log_probs_tensor = self._decision_log_probs(inp)
+                decision_idx = torch.multinomial(
+                    decision_log_probs_tensor.exp(), 1
+                ).item()
+                decision = "look" if decision_idx == 0 else "click"
+                decision_actions.append(decision)
+                decision_log_probs.append(decision_log_probs_tensor[decision_idx].item())
+
+                self.builder.reset()
+                r_inputs, cur_text, cur_images = self.builder.build_round0(
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
+                for prev_idx in range(ri - 1):
+                    prev_crop, prev_bbox = crop_image(
+                        img, round_preds[prev_idx][0], round_preds[prev_idx][1],
+                        crop_size=self.ga.crop_size, crop_upscale=self.ga.crop_upscale,
+                    )
+                    try:
+                        r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                            cur_text, cur_images, prev_crop, prev_bbox,
+                            gt_in_crop=False, use_dual_tokens=self.ga.use_dual_tokens,
+                        )
+                    except Exception:
+                        return None
+                try:
+                    r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                        cur_text, cur_images, cropped, crop_bbox,
+                        gt_in_crop=(decision == "click"),
+                        use_dual_tokens=self.ga.use_dual_tokens,
+                    )
+                except Exception:
+                    return None
 
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 if inp.get("pixel_values") is not None:
@@ -313,14 +413,13 @@ class GRPOTrainer:
                     last_hs, inp["input_ids"], pp_id, n=ri)
 
                 if vis_embeds is None or anchor is None or len(vis_ranges) < ri + 1:
-                    break
+                    return None
 
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 n_total = vis_embeds.shape[0]
                 n_low = vis_ranges[0][1]
                 latest_img_idx = len(vis_ranges) - 1
 
-                # Mask old crops
                 this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
@@ -328,40 +427,28 @@ class GRPOTrainer:
                     off_prev, ntok_prev = vis_ranges[prev_i]
                     full_mask[off_prev:off_prev + ntok_prev] = True
 
-                # Save crop info
                 offset_hi, n_hi = vis_ranges[latest_img_idx]
                 nh_high, nw_high = grid_dims[latest_img_idx]
                 all_crop_info.append({
                     "offset": offset_hi, "n_tokens": n_hi,
                     "grid_h": nh_high, "grid_w": nw_high,
-                    "crop_bbox": crop_bbox, "gt_in_crop": gt_in_crop,
+                    "crop_bbox": crop_bbox,
                 })
 
-                if gt_in_crop:
-                    # LookHead: sample on full tokens
-                    _, _, logits = self.model.dual_head.look(
-                        vis_embeds, anchor, mask=full_mask)
-                    logits_1d = logits.squeeze(0) / temperature
-                    probs = F.softmax(logits_1d, dim=-1)
-                    sampled_idx = torch.multinomial(probs, 1).item()
-                    log_prob = F.log_softmax(logits_1d, dim=-1)[sampled_idx].item()
-                    look_log_probs.append(log_prob)
-
-                    # ClickHead: sample on all crop tokens
-                    crop_vis_list = [vis_embeds[ci["offset"]:ci["offset"] + ci["n_tokens"]]
-                                     for ci in all_crop_info]
+                if decision == "click":
+                    crop_vis_list = [
+                        vis_embeds[ci["offset"]:ci["offset"] + ci["n_tokens"]]
+                        for ci in all_crop_info
+                    ]
                     combined_crop_vis = torch.cat(crop_vis_list, dim=0)
-
-                    _, _, click_logits = self.model.dual_head.click(
-                        combined_crop_vis, anchor)
+                    _, _, click_logits = self.model.dual_head.click(combined_crop_vis, anchor)
                     click_logits_1d = click_logits.squeeze(0) / temperature
                     click_probs = F.softmax(click_logits_1d, dim=-1)
                     click_sampled = torch.multinomial(click_probs, 1).item()
                     click_log_prob = F.log_softmax(click_logits_1d, dim=-1)[click_sampled].item()
 
-                    # Map sampled click token back to global coords
                     running = 0
-                    click_pred = (0.5, 0.5)  # fallback
+                    click_pred = (0.5, 0.5)
                     for ci in all_crop_info:
                         if running + ci["n_tokens"] > click_sampled:
                             local_tok = click_sampled - running
@@ -372,50 +459,45 @@ class GRPOTrainer:
                             break
                         running += ci["n_tokens"]
 
-                    # Check hit
                     hit = (bbox_gt[0] <= click_pred[0] <= bbox_gt[2]
                            and bbox_gt[1] <= click_pred[1] <= bbox_gt[3])
 
                     return Trajectory(
                         round_preds=round_preds,
+                        look_token_indices=look_token_indices,
                         crop_bboxes=crop_bboxes,
+                        decision_actions=decision_actions,
+                        decision_log_probs=decision_log_probs,
                         look_log_probs=look_log_probs,
+                        click_token_index=click_sampled,
                         click_log_prob=click_log_prob,
                         click_pred=click_pred,
                         n_rounds=ri + 1,
                         hit=hit,
-                        reward=0.0,  # computed later
+                        proximity_score=0.0,
+                        raw_reward=0.0,
+                        reward=0.0,
                     )
 
-                else:
-                    # Saccade: sample from LookHead
-                    _, _, logits = self.model.dual_head.look(
-                        vis_embeds, anchor, mask=full_mask)
-                    logits_1d = logits.squeeze(0) / temperature
-                    probs = F.softmax(logits_1d, dim=-1)
-                    sampled_idx = torch.multinomial(probs, 1).item()
-                    log_prob = F.log_softmax(logits_1d, dim=-1)[sampled_idx].item()
-                    look_log_probs.append(log_prob)
+                _, _, logits = self.model.dual_head.look(
+                    vis_embeds, anchor, mask=full_mask)
+                logits_1d = logits.squeeze(0) / temperature
+                probs = F.softmax(logits_1d, dim=-1)
+                sampled_idx = torch.multinomial(probs, 1).item()
+                log_prob = F.log_softmax(logits_1d, dim=-1)[sampled_idx].item()
+                look_token_indices.append(sampled_idx)
+                look_log_probs.append(log_prob)
 
-                    # Map sampled token to global coords
-                    img_idx, _ = identify_attended_image(probs, vis_ranges)
-                    if img_idx < len(grid_dims):
-                        nh_a, nw_a = grid_dims[img_idx]
-                        off_a, n_a = vis_ranges[img_idx]
-                        # Find local index within this image
-                        local_sampled = sampled_idx - off_a
-                        if 0 <= local_sampled < n_a:
-                            lx = ((local_sampled % nw_a) + 0.5) / nw_a
-                            ly = ((local_sampled // nw_a) + 0.5) / nh_a
-                            info = self.builder.image_infos[img_idx]
-                            bx1, by1, bx2, by2 = info.global_bbox
-                            pred_x = bx1 + lx * (bx2 - bx1)
-                            pred_y = by1 + ly * (by2 - by1)
-                            round_preds.append((pred_x, pred_y))
-                        else:
-                            break
-                    else:
-                        break
+                img_idx, local_sampled = self._locate_visual_token(sampled_idx, vis_ranges)
+                if img_idx is None or img_idx >= len(grid_dims) or img_idx >= len(self.builder.image_infos):
+                    return None
+
+                nh_a, nw_a = grid_dims[img_idx]
+                info = self.builder.image_infos[img_idx]
+                bx1, by1, bx2, by2 = info.global_bbox
+                pred_x = bx1 + (((local_sampled % nw_a) + 0.5) / nw_a) * (bx2 - bx1)
+                pred_y = by1 + (((local_sampled // nw_a) + 0.5) / nh_a) * (by2 - by1)
+                round_preds.append((pred_x, pred_y))
 
         # Reached max rounds without finding GT
         # Use last LookHead prediction as click (no ClickHead)
@@ -429,12 +511,18 @@ class GRPOTrainer:
 
         return Trajectory(
             round_preds=round_preds,
+            look_token_indices=look_token_indices,
             crop_bboxes=crop_bboxes,
+            decision_actions=decision_actions,
+            decision_log_probs=decision_log_probs,
             look_log_probs=look_log_probs,
+            click_token_index=None,
             click_log_prob=0.0,  # no ClickHead used
             click_pred=click_pred,
             n_rounds=len(round_preds),
             hit=hit,
+            proximity_score=0.0,
+            raw_reward=0.0,
             reward=0.0,
         )
 
@@ -453,6 +541,21 @@ class GRPOTrainer:
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
 
+    @staticmethod
+    def _compute_proximity_score(click_pred, bbox_gt):
+        """Continuous click quality based on distance to GT bbox center.
+
+        We only have GT bbox annotations, so center distance is the most stable
+        dense proxy for "how good was the click" beyond binary hit/miss.
+        """
+        bx1, by1, bx2, by2 = bbox_gt
+        gt_cx = (bx1 + bx2) / 2
+        gt_cy = (by1 + by2) / 2
+        bbox_diag = math.hypot(bx2 - bx1, by2 - by1)
+        norm = max(bbox_diag, 0.05)
+        dist = math.hypot(click_pred[0] - gt_cx, click_pred[1] - gt_cy)
+        return math.exp(-0.5 * (dist / norm) ** 2)
+
     def _compute_overlap_penalty(self, crop_bboxes):
         """Sum of max IoU with any previous crop, for each crop."""
         total = 0.0
@@ -463,31 +566,35 @@ class GRPOTrainer:
             total += max_iou
         return total
 
-    def _compute_rewards(self, trajectories: list):
+    def _compute_rewards(self, sample, trajectories: list):
         """Compute rewards for a group of trajectories (same sample).
 
         reward = hit * reward_hit - round_penalty * n_rounds
+                 + proximity_weight * proximity_score
                  - overlap_penalty * sum_of_max_ious
         Then group-normalize (GRPO).
         """
         for traj in trajectories:
             r = 0.0
+            proximity = self._compute_proximity_score(traj.click_pred, sample["bbox_gt"])
+            traj.proximity_score = proximity
             if traj.hit:
                 r += self.ga.reward_hit
+            r += self.ga.reward_proximity_weight * proximity
             r -= self.ga.reward_round_penalty * traj.n_rounds
             # Overlap penalty: penalize revisiting same areas
             if traj.crop_bboxes and self.ga.reward_overlap_penalty > 0:
                 r -= self.ga.reward_overlap_penalty * self._compute_overlap_penalty(traj.crop_bboxes)
-            traj.reward = r
+            traj.raw_reward = r
 
         # Group normalization
-        rewards = [t.reward for t in trajectories]
+        rewards = [t.raw_reward for t in trajectories]
         mean_r = sum(rewards) / len(rewards)
         std_r = (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5
         std_r = max(std_r, 1e-8)
 
         for traj in trajectories:
-            traj.reward = (traj.reward - mean_r) / std_r  # advantage
+            traj.reward = (traj.raw_reward - mean_r) / std_r  # advantage
 
     # -- GRPO loss ------------------------------------------------------------
 
@@ -521,17 +628,8 @@ class GRPOTrainer:
         Returns: -advantage * sum(log_probs)
         """
         device = _get_model_device(self.model)
-        bbox_gt = sample["bbox_gt"]
-        gt_cx = (bbox_gt[0] + bbox_gt[2]) / 2
-        gt_cy = (bbox_gt[1] + bbox_gt[3]) / 2
-
         img_tok = self.model.config.image_token_id
-        pp_id = self.model.config.pointer_pad_token_id
-        # Support dual tokens
-        if hasattr(self.model.config, "look_pad_token_id") and hasattr(self.model.config, "click_pad_token_id"):
-            look_id = self.model.config.look_pad_token_id
-            click_id = self.model.config.click_pad_token_id
-            pp_id = list(set([look_id, click_id, pp_id]))
+        pp_id = self._get_pointer_pad_ids()
         merge = _get_visual_module(self.model).spatial_merge_size
 
         try:
@@ -543,11 +641,12 @@ class GRPOTrainer:
         self.model.train()
         temperature = self.ga.temperature
         total_log_prob = torch.tensor(0.0, device=device)
+        all_crop_info = []
 
         for ri in range(traj.n_rounds):
             if ri == 0:
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
                 inp = {k: v.to(device) for k, v in r_inputs.items()}
                 if inp.get("pixel_values") is not None:
                     inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
@@ -572,47 +671,82 @@ class GRPOTrainer:
                 grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
                 nh0, nw0 = grid_dims[0]
 
-                # LookHead: get log_prob of the action taken
+                # Round 0 is always a look action.
                 _, _, logits = self.model.dual_head.look(vis_embeds, anchor)
                 logits_1d = logits.squeeze(0) / temperature
 
-                # Reconstruct which token was sampled from round_preds
-                pred_x, pred_y = traj.round_preds[0]
-                tok_col = int(pred_x * nw0)
-                tok_row = int(pred_y * nh0)
-                tok_col = min(max(tok_col, 0), nw0 - 1)
-                tok_row = min(max(tok_row, 0), nh0 - 1)
-                sampled_idx = tok_row * nw0 + tok_col
-
+                sampled_idx = traj.look_token_indices[0]
+                if sampled_idx >= logits_1d.shape[0]:
+                    return None
                 log_prob = F.log_softmax(logits_1d, dim=-1)[sampled_idx]
                 total_log_prob = total_log_prob + log_prob
 
             else:
-                # Use the stored round_preds to reconstruct crops
                 prev_x, prev_y = traj.round_preds[ri - 1]
                 cropped, crop_bbox = crop_image(img, prev_x, prev_y,
                                                 crop_size=self.ga.crop_size,
                                                 crop_upscale=self.ga.crop_upscale)
 
-                # Rebuild context
+                # Rebuild the pre-decision prompt for this crop round.
                 self.builder.reset()
                 r_inputs, cur_text, cur_images = self.builder.build_round0(
-                    sample["image_path"], sample["instruction"], use_dual_tokens=True)
-                for prev_ri in range(1, ri):
-                    pp_x, pp_y = traj.round_preds[prev_ri - 1]
-                    prev_crop, prev_bbox = crop_image(img, pp_x, pp_y,
-                                                      crop_size=self.ga.crop_size,
-                                                      crop_upscale=self.ga.crop_upscale)
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
+                for prev_idx in range(ri - 1):
+                    pp_x, pp_y = traj.round_preds[prev_idx]
+                    prev_crop, prev_bbox = crop_image(
+                        img, pp_x, pp_y,
+                        crop_size=self.ga.crop_size,
+                        crop_upscale=self.ga.crop_upscale,
+                    )
                     try:
                         r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                             cur_text, cur_images, prev_crop, prev_bbox,
-                            use_dual_tokens=True)
+                            gt_in_crop=False, use_dual_tokens=self.ga.use_dual_tokens,
+                        )
                     except Exception:
                         return None
                 try:
                     r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                         cur_text, cur_images, cropped, crop_bbox,
-                        use_dual_tokens=True)
+                        gt_in_crop=None, use_dual_tokens=self.ga.use_dual_tokens,
+                        for_generation=True,
+                    )
+                except Exception:
+                    return None
+
+                inp = {k: v.to(device) for k, v in r_inputs.items()}
+                if inp.get("pixel_values") is not None:
+                    inp["pixel_values"] = inp["pixel_values"].requires_grad_(True)
+
+                decision_log_probs = self._decision_log_probs(inp)
+                decision = traj.decision_actions[ri - 1]
+                decision_idx = 0 if decision == "look" else 1
+                total_log_prob = total_log_prob + decision_log_probs[decision_idx]
+
+                # Rebuild the chosen branch with the selected suffix for anchor extraction.
+                self.builder.reset()
+                r_inputs, cur_text, cur_images = self.builder.build_round0(
+                    sample, sample["instruction"], use_dual_tokens=self.ga.use_dual_tokens)
+                for prev_idx in range(ri - 1):
+                    pp_x, pp_y = traj.round_preds[prev_idx]
+                    prev_crop, prev_bbox = crop_image(
+                        img, pp_x, pp_y,
+                        crop_size=self.ga.crop_size,
+                        crop_upscale=self.ga.crop_upscale,
+                    )
+                    try:
+                        r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                            cur_text, cur_images, prev_crop, prev_bbox,
+                            gt_in_crop=False, use_dual_tokens=self.ga.use_dual_tokens,
+                        )
+                    except Exception:
+                        return None
+                try:
+                    r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
+                        cur_text, cur_images, cropped, crop_bbox,
+                        gt_in_crop=(decision == "click"),
+                        use_dual_tokens=self.ga.use_dual_tokens,
+                    )
                 except Exception:
                     return None
 
@@ -650,84 +784,49 @@ class GRPOTrainer:
                     off_prev, ntok_prev = vis_ranges[prev_i]
                     full_mask[off_prev:off_prev + ntok_prev] = True
 
-                # LookHead log_prob
+                offset_hi, n_hi = vis_ranges[latest_img_idx]
+                nh_high, nw_high = grid_dims[latest_img_idx]
+                all_crop_info.append({
+                    "offset": offset_hi, "n_tokens": n_hi,
+                    "grid_h": nh_high, "grid_w": nw_high,
+                    "crop_bbox": crop_bbox,
+                })
+
+                if decision == "click":
+                    if traj.click_token_index is None:
+                        return None
+                    crop_vis_list = [
+                        vis_embeds[ci["offset"]:ci["offset"] + ci["n_tokens"]]
+                        for ci in all_crop_info
+                    ]
+                    combined_crop_vis = torch.cat(crop_vis_list, dim=0)
+                    _, _, click_logits = self.model.dual_head.click(combined_crop_vis, anchor)
+                    click_logits_1d = click_logits.squeeze(0) / temperature
+                    if traj.click_token_index >= click_logits_1d.shape[0]:
+                        return None
+                    total_log_prob = total_log_prob + F.log_softmax(
+                        click_logits_1d, dim=-1
+                    )[traj.click_token_index]
+                    break
+
                 _, _, logits = self.model.dual_head.look(
                     vis_embeds, anchor, mask=full_mask)
                 logits_1d = logits.squeeze(0) / temperature
+                if ri >= len(traj.look_token_indices):
+                    return None
+                sampled_idx = traj.look_token_indices[ri]
+                if sampled_idx >= logits_1d.shape[0]:
+                    return None
+                total_log_prob = total_log_prob + F.log_softmax(
+                    logits_1d, dim=-1
+                )[sampled_idx]
 
-                # Reconstruct sampled token from round_preds
-                if ri < len(traj.round_preds):
-                    pred_x, pred_y = traj.round_preds[ri]
-                    # Find which image and local token
-                    # For simplicity, find the token with coords closest to pred
-                    # (since we stored the global coords during generation)
-                    best_idx = logits_1d.argmax().item()  # fallback
-                    for img_i, (off_i, n_i) in enumerate(vis_ranges):
-                        if img_i < len(grid_dims) and img_i < len(self.builder.image_infos):
-                            nh_i, nw_i = grid_dims[img_i]
-                            info = self.builder.image_infos[img_i]
-                            bx1, by1, bx2, by2 = info.global_bbox
-                            if bx1 <= pred_x <= bx2 and by1 <= pred_y <= by2:
-                                local_x = (pred_x - bx1) / max(bx2 - bx1, 1e-8)
-                                local_y = (pred_y - by1) / max(by2 - by1, 1e-8)
-                                col = min(max(int(local_x * nw_i), 0), nw_i - 1)
-                                row = min(max(int(local_y * nh_i), 0), nh_i - 1)
-                                best_idx = off_i + row * nw_i + col
-                                break
-
-                    if best_idx < logits_1d.shape[0]:
-                        log_prob = F.log_softmax(logits_1d, dim=-1)[best_idx]
-                        total_log_prob = total_log_prob + log_prob
-
-        # ClickHead differentiable replay (if trajectory ended with a click)
-        if traj.click_log_prob != 0.0 and traj.n_rounds > 1:
-            # The last round's forward is already done above.
-            # Re-run ClickHead on accumulated crop tokens.
-            try:
-                crop_vis_list = []
-                crop_meta = []
-                for ci_idx in range(1, len(vis_ranges)):
-                    if ci_idx >= len(grid_dims) or ci_idx >= len(self.builder.image_infos):
-                        continue
-                    ci_off, ci_n = vis_ranges[ci_idx]
-                    ci_info = self.builder.image_infos[ci_idx]
-                    ci_nh, ci_nw = grid_dims[ci_idx]
-                    crop_vis_list.append(vis_embeds[ci_off:ci_off + ci_n])
-                    crop_meta.append((ci_n, ci_nw, ci_nh, ci_info.global_bbox))
-
-                if crop_vis_list:
-                    combined = torch.cat(crop_vis_list, dim=0)
-                    _, _, click_logits = self.model.dual_head.click(combined, anchor)
-                    click_logits_1d = click_logits.squeeze(0) / temperature
-
-                    # Reconstruct which token was clicked
-                    cx, cy = traj.click_pred
-                    click_idx = 0
-                    running = 0
-                    for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
-                        bx1, by1, bx2, by2 = ci_bbox
-                        if bx1 <= cx <= bx2 and by1 <= cy <= by2:
-                            local_x = (cx - bx1) / max(bx2 - bx1, 1e-8)
-                            local_y = (cy - by1) / max(by2 - by1, 1e-8)
-                            col = min(max(int(local_x * ci_nw), 0), ci_nw - 1)
-                            row = min(max(int(local_y * ci_nh), 0), ci_nh - 1)
-                            click_idx = running + row * ci_nw + col
-                            break
-                        running += ci_n
-
-                    if click_idx < click_logits_1d.shape[0]:
-                        click_lp = F.log_softmax(click_logits_1d, dim=-1)[click_idx]
-                        total_log_prob = total_log_prob + click_lp
-            except Exception:
-                pass  # If ClickHead replay fails, still use LookHead log_probs
-
-        # KL penalty against reference model
         kl_penalty = torch.tensor(0.0, device=device)
         if self.ga.kl_coeff > 0 and self.ref_model is not None:
-            # Simple parameter-space KL approximation:
-            # sum of squared diff between current and ref params
-            for p, p_ref in zip(self.model.dual_head.parameters(),
-                                self.ref_model.dual_head.parameters()):
+            for p, p_ref in zip(
+                self.model.dual_head.parameters(),
+                self.ref_model.dual_head.parameters(),
+            ):
                 kl_penalty = kl_penalty + ((p - p_ref.detach()) ** 2).sum()
             kl_penalty = self.ga.kl_coeff * kl_penalty
 
@@ -760,15 +859,32 @@ class GRPOTrainer:
             return 0.0
 
         # Compute rewards and advantages
-        self._compute_rewards(trajectories)
+        self._compute_rewards(sample, trajectories)
 
         # Log metrics
         hits = sum(1 for t in trajectories if t.hit)
         avg_rounds = sum(t.n_rounds for t in trajectories) / len(trajectories)
+        raw_rewards = [t.raw_reward for t in trajectories]
+        avg_proximity = sum(t.proximity_score for t in trajectories) / len(trajectories)
+        mean_reward = sum(raw_rewards) / len(raw_rewards)
+        reward_std = (
+            sum((r - mean_reward) ** 2 for r in raw_rewards) / len(raw_rewards)
+        ) ** 0.5
+        click_rounds = [t.n_rounds for t in trajectories if t.click_token_index is not None]
+        no_click_rate = sum(1 for t in trajectories if t.click_token_index is None) / len(trajectories)
         self.metrics["grpo_hit_rate"].append(hits / len(trajectories))
         self.metrics["grpo_avg_rounds"].append(avg_rounds)
         self.metrics["grpo_avg_reward"].append(
+            sum(t.raw_reward for t in trajectories) / len(trajectories))
+        self.metrics["grpo_avg_advantage"].append(
             sum(t.reward for t in trajectories) / len(trajectories))
+        self.metrics["grpo_avg_proximity"].append(avg_proximity)
+        self.metrics["grpo_reward_std"].append(reward_std)
+        self.metrics["grpo_no_click_rate"].append(no_click_rate)
+        if click_rounds:
+            self.metrics["grpo_avg_click_round"].append(
+                sum(click_rounds) / len(click_rounds)
+            )
 
         # Compute GRPO loss (differentiable replay)
         self.model.train()
@@ -799,10 +915,10 @@ class GRPOTrainer:
             print(f"=== GRPO Saccade Training ===")
             print(f"  samples={len(self.train_data)}  epochs={epochs}  bs={bs}  ga={ga}")
             print(f"  group_size={self.ga.group_size}  temperature={self.ga.temperature}")
-            print(f"  reward_hit={self.ga.reward_hit}  round_penalty={self.ga.reward_round_penalty}")
+            print(f"  reward_hit={self.ga.reward_hit}  proximity_weight={self.ga.reward_proximity_weight}  round_penalty={self.ga.reward_round_penalty}")
             print(f"  kl_coeff={self.ga.kl_coeff}  clip_eps={self.ga.clip_eps}")
             print(f"  head_lr={self.ga.action_head_lr}  backbone_lr={self.ga.lora_lr}")
-            print(f"  max_saccade_rounds={self.ga.max_saccade_rounds}")
+            print(f"  max_saccade_rounds={self.ga.max_saccade_rounds}  use_dual_tokens={self.ga.use_dual_tokens}")
 
         self.optimizer.zero_grad()
         micro = 0
@@ -824,6 +940,29 @@ class GRPOTrainer:
                     except Exception:
                         traceback.print_exc()
 
+                if self.rank == 0:
+                    def ar(k, n=20):
+                        vals = self.metrics[k][-n:]
+                        return sum(vals) / max(len(vals), 1)
+
+                    postfix = {
+                        "loss": f"{batch_loss / max(len(batch), 1):.3f}",
+                    }
+                    if self.metrics["grpo_hit_rate"]:
+                        postfix["hit"] = f"{ar('grpo_hit_rate'):.1%}"
+                        postfix["rounds"] = f"{ar('grpo_avg_rounds'):.2f}"
+                        postfix["click_r"] = f"{ar('grpo_avg_click_round'):.2f}" if self.metrics["grpo_avg_click_round"] else "-"
+                        postfix["no_click"] = f"{ar('grpo_no_click_rate'):.1%}"
+                        postfix["prox"] = f"{ar('grpo_avg_proximity'):.3f}"
+                        postfix["reward"] = f"{ar('grpo_avg_reward'):.3f}"
+                        postfix["r_std"] = f"{ar('grpo_reward_std'):.3f}"
+                        postfix["adv"] = f"{ar('grpo_avg_advantage'):.3f}"
+                    if micro % ga == 0 and self.global_step > 0:
+                        lrs = self.scheduler.get_last_lr()
+                        postfix["step"] = str(self.global_step)
+                        postfix["lr"] = f"{lrs[0]:.2e}"
+                    pbar.set_postfix(postfix, refresh=False)
+
                 micro += 1
                 if micro % ga == 0:
                     if self.world_size > 1:
@@ -840,14 +979,21 @@ class GRPOTrainer:
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     if micro % ga == 0 and self.metrics["grpo_hit_rate"]:
-                        def ar(k, n=20):
-                            vals = self.metrics[k][-n:]
-                            return sum(vals) / max(len(vals), 1)
                         lrs = self.scheduler.get_last_lr()
+                        click_round_str = (
+                            f"{ar('grpo_avg_click_round'):.1f}"
+                            if self.metrics["grpo_avg_click_round"]
+                            else "-"
+                        )
                         print(f"  [Step {self.global_step}] "
                               f"hit={ar('grpo_hit_rate'):.1%} "
                               f"rounds={ar('grpo_avg_rounds'):.1f} "
+                              f"click_r={click_round_str} "
+                              f"no_click={ar('grpo_no_click_rate'):.1%} "
+                              f"prox={ar('grpo_avg_proximity'):.3f} "
                               f"reward={ar('grpo_avg_reward'):.3f} "
+                              f"r_std={ar('grpo_reward_std'):.3f} "
+                              f"adv={ar('grpo_avg_advantage'):.3f} "
                               f"lr={lrs[0]:.2e}")
                         for key in list(self.metrics.keys()):
                             if len(self.metrics[key]) > 500:
