@@ -2,8 +2,8 @@
 # ============================================================================
 # v15 Training: Dual Head (LookHead + ClickHead)
 #
-# ClickHead initialized from GUI-Actor pointer head (43% ScreenSpot-Pro).
-# Both heads train from step 0 (no warmup — ClickHead already has ability).
+# Both LookHead and ClickHead are initialized from GUI-Actor pointer head.
+# Both heads train from step 0 (no warmup).
 #
 # Config: LoRA + 1M low-res + 308px crop + mask old crops
 #
@@ -191,11 +191,11 @@ CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
 
 echo "============================================================"
 echo "  GUI-Attention v15 Training (Dual Head: LookHead + ClickHead)"
-echo "  ClickHead initialized from GUI-Actor pointer head"
+echo "  LookHead and ClickHead initialized from GUI-Actor pointer head"
 echo "  Both heads from step 0 (no warmup phases)"
 echo "  GPUs: $NUM_GPUS"
 echo "  Base model: ${BASE_MODEL:-$MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL}"
-echo "  ClickHead from: $CLICK_HEAD_FROM"
+echo "  Head init from: $CLICK_HEAD_FROM"
 echo "  Output: ${OUTPUT_DIR:-$RESULT_DIR/ours_v15_dual}"
 echo "  Free-reasoning SFT: $FREE_REASONING_SFT"
 echo "  Append assistant EOS: $APPEND_ASSISTANT_EOS"

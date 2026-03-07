@@ -179,9 +179,9 @@ class ScriptArgs:
     max_samples_per_dataset: Optional[str] = field(default=None, metadata={
         "help": "Comma-separated per-dataset max samples, e.g. '0,0,0,60000,0'. 0=no limit."
     })
-    # ClickHead initialization from GUI-Actor
+    # Dual-head initialization from GUI-Actor pointer head
     click_head_from: Optional[str] = field(default=None, metadata={
-        "help": "Path to GUI-Actor checkpoint (safetensors dir) to init ClickHead from pointer_head weights"
+        "help": "Path to GUI-Actor checkpoint (safetensors dir) to initialize both LookHead and ClickHead from pointer_head weights"
     })
     # Resume
     resume_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})

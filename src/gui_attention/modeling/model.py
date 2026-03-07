@@ -19,17 +19,21 @@ from gui_attention.constants import ADDITIONAL_SPECIAL_TOKENS
 from gui_attention.modeling.dual_head import DualActionHead
 
 
-def _load_click_head_from_pointer(dual_head, checkpoint_path):
-    """Load GUI-Actor pointer_head weights into ClickHead.
+def _load_dual_heads_from_pointer(dual_head, checkpoint_path):
+    """Load GUI-Actor pointer_head weights into both LookHead and ClickHead.
 
     GUI-Actor (microsoft/GUI-Actor-3B-Qwen2.5-VL) stores the pointer head as
     'multi_patch_pointer_head.*' with different naming than our _AttentionHead.
 
     Key mapping (GUI-Actor VisionHead_MultiPatch → our _AttentionHead):
-        multi_patch_pointer_head.self_attention.* → click_head.self_attention.*
-        multi_patch_pointer_head.layer_norm.*     → click_head.layer_norm.*
-        multi_patch_pointer_head.projection_enc.* → click_head.mlp_v.*
-        multi_patch_pointer_head.projection_dec.* → click_head.mlp_t.*
+        multi_patch_pointer_head.self_attention.* → {look,click}_head.self_attention.*
+        multi_patch_pointer_head.layer_norm.*     → {look,click}_head.layer_norm.*
+        multi_patch_pointer_head.projection_enc.* → {look,click}_head.mlp_v.*
+        multi_patch_pointer_head.projection_dec.* → {look,click}_head.mlp_t.*
+
+    We intentionally duplicate the same pretrained GUI-Actor pointer head into
+    both branches at initialization time. The two heads then specialize under
+    different losses: LookHead for exploration, ClickHead for precise clicking.
     """
     from safetensors.torch import load_file
     import glob
@@ -52,16 +56,25 @@ def _load_click_head_from_pointer(dual_head, checkpoint_path):
                     suffix = suffix.replace("projection_enc.", "mlp_v.", 1)
                 elif suffix.startswith("projection_dec."):
                     suffix = suffix.replace("projection_dec.", "mlp_t.", 1)
-                new_key = f"click_head.{suffix}"
-                pointer_state[new_key] = v
+                pointer_state[suffix] = v
 
     if pointer_state:
-        missing, unexpected = dual_head.load_state_dict(pointer_state, strict=False)
-        # Only look_head keys should be missing (expected)
-        actual_missing = [k for k in missing if not k.startswith("look_head.")]
-        print(f"  ClickHead loaded from GUI-Actor pointer_head: {len(pointer_state)} params")
+        dual_state = {}
+        for prefix in ("look_head", "click_head"):
+            for suffix, value in pointer_state.items():
+                dual_state[f"{prefix}.{suffix}"] = value
+
+        missing, unexpected = dual_head.load_state_dict(dual_state, strict=False)
+        print(
+            "  LookHead and ClickHead both initialized from GUI-Actor "
+            f"pointer_head: {len(pointer_state)} source params × 2"
+        )
+        actual_missing = [
+            k for k in missing
+            if not (k.startswith("look_head.") or k.startswith("click_head."))
+        ]
         if actual_missing:
-            print(f"  WARNING: unexpected missing click_head keys: {actual_missing}")
+            print(f"  WARNING: unexpected missing dual-head keys: {actual_missing}")
         if unexpected:
             print(f"  WARNING: unexpected keys: {unexpected}")
     else:
@@ -83,8 +96,8 @@ def build_model(
 
     Args:
         click_head_from: path to a GUI-Actor style checkpoint (safetensors)
-            to load pointer head weights into ClickHead. The pointer head
-            keys are mapped: pointer_head.* → click_head.*
+            to load pointer head weights into both LookHead and ClickHead.
+            Kept under the old name for CLI compatibility.
 
     Returns:
         model: Qwen25VLWithDualHead (the wrapper).
@@ -159,9 +172,9 @@ def build_model(
     d_model = getattr(backbone.config, "hidden_size", None) or backbone.config.text_config.hidden_size
     dual_head = DualActionHead(d_model=d_model, projection_dim=d_model)
 
-    # Load ClickHead from GUI-Actor pointer head if specified
+    # Initialize both heads from GUI-Actor pointer head if specified.
     if click_head_from:
-        _load_click_head_from_pointer(dual_head, click_head_from)
+        _load_dual_heads_from_pointer(dual_head, click_head_from)
 
     dual_head = dual_head.to(torch_dtype)
 
