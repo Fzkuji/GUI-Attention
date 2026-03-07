@@ -147,10 +147,10 @@ class Trajectory:
 # -- GRPO Trainer -------------------------------------------------------------
 
 class GRPOTrainer:
-    def __init__(self, model: Qwen25VLWithDualHead, ref_model: Qwen25VLWithDualHead,
+    def __init__(self, model: Qwen25VLWithDualHead, ref_dual_head,
                  tokenizer, train_data, args: GRPOTrainArgs, grpo_args: GRPOArgs):
         self.model = model
-        self.ref_model = ref_model  # frozen reference for KL
+        self.ref_dual_head = ref_dual_head  # frozen CPU copy for KL on dual head only
         self.tokenizer = tokenizer
         self.train_data = train_data
         self.args = args
@@ -822,12 +822,13 @@ class GRPOTrainer:
                 )[sampled_idx]
 
         kl_penalty = torch.tensor(0.0, device=device)
-        if self.ga.kl_coeff > 0 and self.ref_model is not None:
+        if self.ga.kl_coeff > 0 and self.ref_dual_head is not None:
             for p, p_ref in zip(
                 self.model.dual_head.parameters(),
-                self.ref_model.dual_head.parameters(),
+                self.ref_dual_head.parameters(),
             ):
-                kl_penalty = kl_penalty + ((p - p_ref.detach()) ** 2).sum()
+                ref_param = p_ref.detach().to(device=device, dtype=p.dtype)
+                kl_penalty = kl_penalty + ((p - ref_param) ** 2).sum()
             kl_penalty = self.ga.kl_coeff * kl_penalty
 
         # GRPO loss: -advantage * total_log_prob + KL penalty
@@ -888,21 +889,19 @@ class GRPOTrainer:
 
         # Compute GRPO loss (differentiable replay)
         self.model.train()
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_loss_value = 0.0
 
         for traj in trajectories:
             if abs(traj.reward) < 1e-8:
                 continue
             traj_loss = self._replay_trajectory_loss(sample, traj)
             if traj_loss is not None:
-                total_loss = total_loss + traj_loss
+                loss_for_backward = traj_loss / max(len(trajectories), 1)
+                if loss_for_backward.requires_grad:
+                    (loss_for_backward / max(self.args.gradient_accumulation_steps, 1)).backward()
+                total_loss_value += traj_loss.item()
 
-        total_loss = total_loss / max(len(trajectories), 1)
-
-        if total_loss.requires_grad:
-            (total_loss / max(self.args.gradient_accumulation_steps, 1)).backward()
-
-        return total_loss.item()
+        return total_loss_value / max(len(trajectories), 1)
 
     # -- main train loop ------------------------------------------------------
 
@@ -1085,16 +1084,15 @@ def main():
 
     model.to(f"cuda:{local_rank}")
 
-    # Reference model (frozen copy for KL penalty)
-    ref_model = deepcopy(model)
-    ref_model.eval()
-    for p in ref_model.parameters():
+    # Reference dual head only (KL is applied only on dual_head params).
+    ref_dual_head = deepcopy(model.dual_head).cpu().eval()
+    for p in ref_dual_head.parameters():
         p.requires_grad = False
 
     train_data = load_dataset(ga.data_path, ga.image_folder, ga.max_samples, ga.max_samples_per_dataset)
     os.makedirs(ta.output_dir, exist_ok=True)
 
-    trainer = GRPOTrainer(model, ref_model, tokenizer, train_data, ta, ga)
+    trainer = GRPOTrainer(model, ref_dual_head, tokenizer, train_data, ta, ga)
     trainer.train()
 
     if dist.is_initialized():

@@ -84,7 +84,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 3 \
     --max_saccade_rounds 6 \
     --use_dual_tokens true \
-    --group_size 8 \
+    --group_size 4 \
     --reward_hit 1.0 \
     --reward_proximity_weight 0.25 \
     --reward_round_penalty 0.05 \
