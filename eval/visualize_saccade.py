@@ -1,4 +1,4 @@
-"""Visualize multi-round saccade inference on a single image.
+"""Visualize current multi-round GUI inference on a single image.
 
 Produces a figure showing:
   - Each round's attention heatmap overlaid on the image
@@ -9,7 +9,7 @@ Usage:
   # With a trained checkpoint
   python eval/visualize_saccade.py \
       --checkpoint /path/to/checkpoint \
-      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+      --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
       --image /path/to/screenshot.png \
       --instruction "Click the search button" \
       --output viz_output.png
@@ -17,7 +17,7 @@ Usage:
   # With GT bbox (normalised x1,y1,x2,y2)
   python eval/visualize_saccade.py \
       --checkpoint /path/to/checkpoint \
-      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
+      --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
       --image /path/to/screenshot.png \
       --instruction "Click the search button" \
       --gt_bbox 0.45,0.32,0.55,0.38 \
@@ -26,8 +26,8 @@ Usage:
   # From ScreenSpot-Pro dataset (auto-loads image + instruction + GT)
   python eval/visualize_saccade.py \
       --checkpoint /path/to/checkpoint \
-      --base_model /path/to/Qwen2.5-VL-3B-Instruct \
-      --screenspot_dir /path/to/ScreenSpot-Pro \
+      --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
+      --data_dir /path/to/ScreenSpot-Pro \
       --sample_index 42 \
       --output viz_output.png
 """
@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import sys
+from typing import TYPE_CHECKING
 
 import matplotlib
 matplotlib.use("Agg")
@@ -49,17 +50,8 @@ from PIL import Image
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from gui_attention.attention import (
-    extract_anchor_hidden_states,
-    extract_visual_hidden_states,
-    identify_attended_image,
-    token_to_spatial,
-)
-from gui_attention.builder import MultiRoundInputBuilder
-from gui_attention.crop import crop_image
-from gui_attention.foveation import SaccadeLoop
-from gui_attention.labels import compute_overlap_mask
-from gui_attention.model import Qwen25VLWithDualHead
+if TYPE_CHECKING:
+    from gui_attention.builder import MultiRoundInputBuilder
 
 
 # ---------------------------------------------------------------------------
@@ -72,195 +64,35 @@ def run_saccade_with_recording(
     instruction: str,
     model,
     tokenizer,
-    builder: MultiRoundInputBuilder,
-    max_rounds: int = 4,
+    builder: "MultiRoundInputBuilder",
+    max_rounds: int = 6,
     crop_ratio: float = 0.0,
-    crop_size: int = 252,
+    crop_size: int = 308,
     crop_upscale: int = 3,
     crop_target_pixels: int = 0,
     device: str = "cuda:0",
-) -> list:
-    """Run saccade inference and record per-round details for visualization.
+    reasoning_max_new_tokens: int = 48,
+) -> dict:
+    """Run the current inference pipeline and return its trace for plotting."""
+    from gui_attention.inference import run_saccade_inference
 
-    Returns:
-        list of dicts, one per round:
-        {
-            "round": int,
-            "attn_2d": np.ndarray (nh, nw),     # attention heatmap
-            "pred_x": float, "pred_y": float,    # predicted click (global normalised)
-            "crop_bbox": (x1,y1,x2,y2) or None,  # crop region (global normalised)
-            "attended_image": str,                # "low" or "high"
-            "grid_dims": (nh, nw),
-            "image_info": {...},
-        }
-    """
-    saccade = SaccadeLoop(max_rounds=max_rounds, crop_ratio=crop_ratio)
-    state = saccade.new_state()
-    builder.reset()
-
-    img_tok = model.config.image_token_id
-    pp_id = model.config.pointer_pad_token_id
-    # Support dual tokens
-    if hasattr(model.config, 'look_pad_token_id') and hasattr(model.config, 'click_pad_token_id'):
-        look_id = model.config.look_pad_token_id
-        click_id = model.config.click_pad_token_id
-        pp_id = list(set([look_id, click_id, pp_id]))
-    _backbone = model.backbone
-    if hasattr(_backbone, "base_model") and hasattr(_backbone.base_model, "model"):
-        _inner = _backbone.base_model.model
-    else:
-        _inner = _backbone
-    if hasattr(_inner, "visual"):
-        _visual = _inner.visual
-    elif hasattr(_inner, "model") and hasattr(_inner.model, "visual"):
-        _visual = _inner.model.visual
-    else:
-        raise AttributeError(f"Cannot find visual module in {type(_inner)}")
-    merge = _visual.spatial_merge_size
-
-    rounds_info = []
-
-    # ---- Round 0: low-res ----
-    r0_inputs, cur_text, cur_images = builder.build_round0(image_path, instruction)
-    inp = {k: v.to(device) for k, v in r0_inputs.items()}
-
-    with torch.no_grad():
-        outputs = model(
-            input_ids=inp["input_ids"],
-            attention_mask=inp.get("attention_mask"),
-            pixel_values=inp.get("pixel_values"),
-            image_grid_thw=inp.get("image_grid_thw"),
-        )
-
-    last_hs = outputs.hidden_states[-1]
-    vis_embeds = model.extract_visual_embeds(
-        inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
-    _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
-    anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=0)
-
-    if vis_embeds is None or anchor is None:
-        return rounds_info
-
-    grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
-    nh0, nw0 = grid_dims[0]
-
-    attn0, _, _ = model.dual_head.look(vis_embeds, anchor)
-    attn_1d = attn0.squeeze(0)
-
-    # Low-res attention for round 0
-    n_low = vis_ranges[0][1]
-    low_attn = attn_1d[:n_low].detach().cpu().float().numpy().reshape(nh0, nw0)
-    lx, ly = token_to_spatial(attn_1d[:n_low].argmax().item(), nw0, nh0,
-                              attn_weights=attn_1d[:n_low])
-
-    rounds_info.append({
-        "round": 0,
-        "attn_2d": low_attn,
-        "pred_x": lx,
-        "pred_y": ly,
-        "crop_bbox": None,
-        "attended_image": "low",
-        "grid_dims": (nh0, nw0),
-    })
-
-    focus_x, focus_y = lx, ly
-    decision = saccade.decide_round0(state, focus_x, focus_y)
-
-    # ---- Subsequent rounds ----
-    for ri in range(1, max_rounds):
-        if not saccade.should_continue(state, ri):
-            break
-
-        cropped, crop_bbox = crop_image(image, focus_x, focus_y,
-                                        crop_ratio=crop_ratio,
-                                        crop_size=crop_size,
-                                        crop_upscale=crop_upscale,
-                                        crop_target_pixels=crop_target_pixels)
-        try:
-            ri_inputs, cur_text, cur_images = builder.extend_with_crop(
-                cur_text, cur_images, cropped, crop_bbox)
-        except Exception:
-            break
-
-        inp = {k: v.to(device) for k, v in ri_inputs.items()}
-
-        with torch.no_grad():
-            outputs = model(
-                input_ids=inp["input_ids"],
-                attention_mask=inp.get("attention_mask"),
-                pixel_values=inp.get("pixel_values"),
-                image_grid_thw=inp.get("image_grid_thw"),
-            )
-
-        last_hs = outputs.hidden_states[-1]
-        vis_embeds = model.extract_visual_embeds(
-            inp["input_ids"], inp.get("pixel_values"), inp.get("image_grid_thw"))
-        _, vis_ranges = extract_visual_hidden_states(last_hs, inp["input_ids"], img_tok)
-        anchor = extract_anchor_hidden_states(last_hs, inp["input_ids"], pp_id, n=ri)
-
-        if vis_embeds is None or anchor is None or len(vis_ranges) < 2:
-            break
-
-        grid_dims = builder.get_image_grid_dims(inp["image_grid_thw"], merge)
-        nh_low, nw_low = grid_dims[0]
-        latest_img_idx = len(vis_ranges) - 1
-
-        # Mask: current crop overlap on low-res. Old crops NOT masked (matches training).
-        this_crop_mask = compute_overlap_mask(nh_low, nw_low, crop_bbox).to(device)
-        n_low = vis_ranges[0][1]
-        n_total = sum(r[1] for r in vis_ranges)
-        full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-        full_mask[:n_low] = this_crop_mask
-
-        attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-        attn_1d = attn_ri.squeeze(0)
-
-        img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
-        info = builder.image_infos[img_idx]
-
-        if img_idx < len(grid_dims):
-            nh_a, nw_a = grid_dims[img_idx]
-        else:
-            break
-
-        off_a, n_a = vis_ranges[img_idx]
-        img_attn = attn_1d[off_a:off_a + n_a]
-        lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
-        bx1, by1, bx2, by2 = info.global_bbox
-        global_x = bx1 + lx * (bx2 - bx1)
-        global_y = by1 + ly * (by2 - by1)
-
-        attended_source = "high" if info.resolution == "high" else "low"
-
-        # Build attention heatmap for this round
-        # Low-res attention (unmasked patches)
-        low_attn_raw = attn_1d[:vis_ranges[0][1]].detach().cpu().float().numpy()
-        low_attn_2d = low_attn_raw.reshape(grid_dims[0])
-
-        # Crop attention
-        crop_off, crop_n = vis_ranges[latest_img_idx]
-        crop_attn_raw = attn_1d[crop_off:crop_off + crop_n].detach().cpu().float().numpy()
-        crop_nh, crop_nw = grid_dims[latest_img_idx]
-        crop_attn_2d = crop_attn_raw.reshape(crop_nh, crop_nw)
-
-        rounds_info.append({
-            "round": ri,
-            "attn_2d_low": low_attn_2d,
-            "attn_2d_crop": crop_attn_2d,
-            "pred_x": global_x,
-            "pred_y": global_y,
-            "crop_bbox": crop_bbox,
-            "attended_image": attended_source,
-            "grid_dims_low": grid_dims[0],
-            "grid_dims_crop": (crop_nh, crop_nw),
-        })
-
-        decision = saccade.decide_saccade(state, attended_source, global_x, global_y)
-        if decision["action"] == "stop":
-            break
-        focus_x, focus_y = global_x, global_y
-
-    return rounds_info
+    del crop_ratio, crop_target_pixels  # legacy args kept for CLI compatibility
+    return run_saccade_inference(
+        image=image,
+        image_path=image_path,
+        instruction=instruction,
+        model=model,
+        tokenizer=tokenizer,
+        builder=builder,
+        max_rounds=max_rounds,
+        crop_size=crop_size,
+        crop_upscale=crop_upscale,
+        device=device,
+        use_click_head=True,
+        use_dual_tokens=True,
+        reasoning_max_new_tokens=reasoning_max_new_tokens,
+        return_trace=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,14 +109,22 @@ def _draw_grid(ax, n_width, n_height, img_w, img_h, color="white", alpha=0.3, li
         ax.axhline(y=j * patch_h, color=color, alpha=alpha, linewidth=linewidth)
 
 
-def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
+def _shorten_reasoning(text: str, limit: int = 90) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def plot_saccade_rounds(image: Image.Image, result: dict, gt_bbox=None,
                         instruction: str = "", output_path: str = "viz_saccade.png"):
     """Plot multi-round saccade results.
 
     Layout: one row per round.
-      - Round 0: full image + low-res heatmap + predicted point + patch grid
-      - Round N: full image with crop box + crop image with heatmap + patch grid
+      - Left: full image with optional low-res heatmap, crop box, and predicted point
+      - Right: selected crop with crop heatmap when available
     """
+    rounds_info = result.get("trace", [])
     n_rounds = len(rounds_info)
     if n_rounds == 0:
         print("No rounds to visualize.")
@@ -304,102 +144,105 @@ def plot_saccade_rounds(image: Image.Image, rounds_info: list, gt_bbox=None,
     for i, rinfo in enumerate(rounds_info):
         ri = rinfo["round"]
 
-        if ri == 0:
-            # Round 0: full image with low-res heatmap
-            ax_full = axes[i, 0]
-            ax_full.imshow(img_np)
-            attn = rinfo["attn_2d"]
-            nh, nw = rinfo["grid_dims"]
-            # Upsample heatmap to image size
-            heatmap = _upsample_heatmap(attn, img_w, img_h)
-            ax_full.imshow(heatmap, alpha=0.5, cmap="jet", extent=[0, img_w, img_h, 0])
-            # Draw patch grid
-            _draw_grid(ax_full, nw, nh, img_w, img_h, color="white", alpha=0.4, linewidth=0.5)
-            # Predicted point
+        ax_full = axes[i, 0]
+        ax_crop = axes[i, 1]
+
+        ax_full.imshow(img_np)
+        low_attn = rinfo.get("low_attn_2d")
+        if low_attn is not None:
+            heatmap_low = _upsample_heatmap(low_attn, img_w, img_h)
+            ax_full.imshow(heatmap_low, alpha=0.4, cmap="jet", extent=[0, img_w, img_h, 0])
+        if rinfo.get("grid_dims_low") is not None:
+            nh_low, nw_low = rinfo["grid_dims_low"]
+            _draw_grid(ax_full, nw_low, nh_low, img_w, img_h, color="white", alpha=0.3, linewidth=0.5)
+
+        crop_bbox = rinfo.get("crop_bbox")
+        decision_crop_bbox = rinfo.get("decision_crop_bbox")
+        if decision_crop_bbox is not None:
+            cx1, cy1, cx2, cy2 = decision_crop_bbox
+            rect = patches.Rectangle(
+                (cx1 * img_w, cy1 * img_h),
+                (cx2 - cx1) * img_w, (cy2 - cy1) * img_h,
+                linewidth=2.0, edgecolor="cyan", facecolor="none", linestyle="--"
+            )
+            ax_full.add_patch(rect)
+        if crop_bbox is not None and crop_bbox != decision_crop_bbox:
+            cx1, cy1, cx2, cy2 = crop_bbox
+            rect = patches.Rectangle(
+                (cx1 * img_w, cy1 * img_h),
+                (cx2 - cx1) * img_w, (cy2 - cy1) * img_h,
+                linewidth=2.0, edgecolor="orange", facecolor="none", linestyle="-."
+            )
+            ax_full.add_patch(rect)
+
+        if rinfo.get("pred_x") is not None and rinfo.get("pred_y") is not None:
             px, py = rinfo["pred_x"] * img_w, rinfo["pred_y"] * img_h
-            ax_full.plot(px, py, "c*", markersize=18, markeredgecolor="black", markeredgewidth=1.5)
-            # GT
-            if gt_bbox is not None:
-                _draw_gt(ax_full, gt_bbox, img_w, img_h)
-            ax_full.set_title(f"Round {ri}: Low-res overview ({nw}×{nh} patches)", fontsize=11)
-            ax_full.axis("off")
+            marker = "o" if rinfo.get("point_kind") == "click" else "*"
+            ax_full.plot(px, py, marker, color="cyan", markersize=16,
+                         markeredgecolor="black", markeredgewidth=1.5)
+        if gt_bbox is not None:
+            _draw_gt(ax_full, gt_bbox, img_w, img_h)
 
-            # Empty right column for round 0
-            axes[i, 1].axis("off")
-            axes[i, 1].set_title("(no crop)", fontsize=10, color="gray")
+        title = (
+            f"Round {ri}: action={rinfo.get('action')} "
+            f"(attended={rinfo.get('attended_image', '?')}, fmt={'ok' if rinfo.get('format_ok') else 'bad'})"
+        )
+        ax_full.set_title(title, fontsize=10)
+        ax_full.axis("off")
 
-        else:
-            # Round N: left = full image with crop box, right = crop with heatmap
-            ax_full = axes[i, 0]
-            ax_crop = axes[i, 1]
-
-            # Left: full image + low-res heatmap + crop box
-            ax_full.imshow(img_np)
-            if "attn_2d_low" in rinfo:
-                heatmap_low = _upsample_heatmap(rinfo["attn_2d_low"], img_w, img_h)
-                ax_full.imshow(heatmap_low, alpha=0.4, cmap="jet", extent=[0, img_w, img_h, 0])
-                # Draw low-res grid on full image
-                nh_low, nw_low = rinfo["grid_dims_low"]
-                _draw_grid(ax_full, nw_low, nh_low, img_w, img_h, color="white", alpha=0.3, linewidth=0.5)
-
-            crop_bbox = rinfo["crop_bbox"]
-            if crop_bbox is not None:
-                cx1, cy1, cx2, cy2 = crop_bbox
-                rect = patches.Rectangle(
-                    (cx1 * img_w, cy1 * img_h),
-                    (cx2 - cx1) * img_w, (cy2 - cy1) * img_h,
-                    linewidth=2.5, edgecolor="cyan", facecolor="none", linestyle="--"
-                )
-                ax_full.add_patch(rect)
-
-            # Predicted point on full image
-            px, py = rinfo["pred_x"] * img_w, rinfo["pred_y"] * img_h
-            ax_full.plot(px, py, "c*", markersize=18, markeredgecolor="black", markeredgewidth=1.5)
-            if gt_bbox is not None:
-                _draw_gt(ax_full, gt_bbox, img_w, img_h)
-            attended = rinfo.get("attended_image", "?")
-            ax_full.set_title(f"Round {ri}: Full image (attended={attended})", fontsize=11)
-            ax_full.axis("off")
-
-            # Right: crop image with crop heatmap + grid
-            if crop_bbox is not None and "attn_2d_crop" in rinfo:
-                cx1, cy1, cx2, cy2 = crop_bbox
-                crop_pil = image.crop((
-                    int(cx1 * img_w), int(cy1 * img_h),
-                    int(cx2 * img_w), int(cy2 * img_h),
-                ))
-                crop_np = np.array(crop_pil)
-                cw, ch = crop_pil.size
-                ax_crop.imshow(crop_np)
-                crop_heatmap = _upsample_heatmap(rinfo["attn_2d_crop"], cw, ch)
+        if crop_bbox is not None:
+            cx1, cy1, cx2, cy2 = crop_bbox
+            crop_pil = image.crop((
+                int(cx1 * img_w), int(cy1 * img_h),
+                int(cx2 * img_w), int(cy2 * img_h),
+            ))
+            crop_np = np.array(crop_pil)
+            cw, ch = crop_pil.size
+            ax_crop.imshow(crop_np)
+            if rinfo.get("crop_attn_2d") is not None:
+                crop_heatmap = _upsample_heatmap(rinfo["crop_attn_2d"], cw, ch)
                 ax_crop.imshow(crop_heatmap, alpha=0.5, cmap="jet", extent=[0, cw, ch, 0])
-                # Draw crop patch grid
+            if rinfo.get("grid_dims_crop") is not None:
                 crop_nh, crop_nw = rinfo["grid_dims_crop"]
                 _draw_grid(ax_crop, crop_nw, crop_nh, cw, ch, color="white", alpha=0.5, linewidth=0.5)
 
-                # Predicted point in crop coords
-                if cx1 <= rinfo["pred_x"] <= cx2 and cy1 <= rinfo["pred_y"] <= cy2:
-                    local_px = (rinfo["pred_x"] - cx1) / (cx2 - cx1) * cw
-                    local_py = (rinfo["pred_y"] - cy1) / (cy2 - cy1) * ch
-                    ax_crop.plot(local_px, local_py, "c*", markersize=18,
-                                 markeredgecolor="black", markeredgewidth=1.5)
+            if (
+                rinfo.get("pred_x") is not None and rinfo.get("pred_y") is not None
+                and cx1 <= rinfo["pred_x"] <= cx2 and cy1 <= rinfo["pred_y"] <= cy2
+            ):
+                local_px = (rinfo["pred_x"] - cx1) / (cx2 - cx1) * cw
+                local_py = (rinfo["pred_y"] - cy1) / (cy2 - cy1) * ch
+                marker = "o" if rinfo.get("point_kind") == "click" else "*"
+                ax_crop.plot(local_px, local_py, marker, color="cyan", markersize=16,
+                             markeredgecolor="black", markeredgewidth=1.5)
 
-                # GT in crop coords
-                if gt_bbox is not None:
-                    gx1, gy1, gx2, gy2 = gt_bbox
-                    gt_cx = (gx1 + gx2) / 2
-                    gt_cy = (gy1 + gy2) / 2
-                    if cx1 <= gt_cx <= cx2 and cy1 <= gt_cy <= cy2:
-                        local_gx = (gt_cx - cx1) / (cx2 - cx1) * cw
-                        local_gy = (gt_cy - cy1) / (cy2 - cy1) * ch
-                        ax_crop.plot(local_gx, local_gy, "r+", markersize=18,
-                                     markeredgewidth=3)
+            if gt_bbox is not None:
+                gx1, gy1, gx2, gy2 = gt_bbox
+                gt_cx = (gx1 + gx2) / 2
+                gt_cy = (gy1 + gy2) / 2
+                if cx1 <= gt_cx <= cx2 and cy1 <= gt_cy <= cy2:
+                    local_gx = (gt_cx - cx1) / (cx2 - cx1) * cw
+                    local_gy = (gt_cy - cy1) / (cy2 - cy1) * ch
+                    ax_crop.plot(local_gx, local_gy, "r+", markersize=18, markeredgewidth=3)
 
-                ax_crop.set_title(f"Round {ri}: Crop region ({crop_nw}×{crop_nh} patches)", fontsize=11)
-            else:
-                ax_crop.text(0.5, 0.5, "No crop data", ha="center", va="center",
-                             transform=ax_crop.transAxes, fontsize=12, color="gray")
-            ax_crop.axis("off")
+            crop_title = f"Crop ({rinfo.get('action')})"
+            if rinfo.get("selected_crop_round") is not None:
+                crop_title += f" from round {rinfo['selected_crop_round']}"
+            ax_crop.set_title(crop_title, fontsize=10)
+        else:
+            ax_crop.text(0.5, 0.5, "No crop view", ha="center", va="center",
+                         transform=ax_crop.transAxes, fontsize=12, color="gray")
+        reasoning = _shorten_reasoning(rinfo.get("reasoning_text", ""))
+        if reasoning:
+            ax_crop.text(
+                0.02, -0.08,
+                reasoning,
+                transform=ax_crop.transAxes,
+                fontsize=9,
+                va="top",
+                ha="left",
+            )
+        ax_crop.axis("off")
 
     # Legend
     from matplotlib.lines import Line2D
@@ -496,7 +339,7 @@ def load_screenspot_sample(screenspot_dir: str, index: int):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize saccade inference")
+    parser = argparse.ArgumentParser(description="Visualize current multi-round GUI inference")
     parser.add_argument("--checkpoint", required=True, help="Path to trained checkpoint")
     parser.add_argument("--base_model", required=True, help="Path to base Qwen2.5-VL model")
     parser.add_argument("--image", help="Path to input image")
@@ -509,14 +352,18 @@ def main():
     parser.add_argument("--sample_index", type=int, default=0, help="Sample index")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to visualize (batch mode)")
     parser.add_argument("--output", default="viz_saccade.png", help="Output image path")
-    parser.add_argument("--max_rounds", type=int, default=4, help="Max saccade rounds")
+    parser.add_argument("--max_rounds", type=int, default=6, help="Max saccade rounds")
     parser.add_argument("--crop_ratio", type=float, default=0.0, help="Crop ratio (legacy, 0=use crop_size)")
-    parser.add_argument("--crop_size", type=int, default=252, help="Fixed crop side length in pixels")
+    parser.add_argument("--crop_size", type=int, default=308, help="Fixed crop side length in pixels")
     parser.add_argument("--crop_upscale", type=int, default=3, help="Integer upscale factor")
     parser.add_argument("--crop_target_pixels", type=int, default=0, help="(Legacy) Crop target pixels")
-    parser.add_argument("--low_res_max_pixels", type=int, default=400000, help="Low-res max pixels")
+    parser.add_argument("--low_res_max_pixels", type=int, default=1001600, help="Low-res max pixels")
+    parser.add_argument("--reasoning_max_new_tokens", type=int, default=48, help="Max new tokens for reasoning generation")
     parser.add_argument("--device", default="cuda:0", help="Device")
     args = parser.parse_args()
+
+    from gui_attention.builder import MultiRoundInputBuilder
+    from gui_attention.model import Qwen25VLWithDualHead
 
     # Load model
     print(f"Loading model from {args.checkpoint} (base: {args.base_model})")
@@ -592,7 +439,7 @@ def main():
             gt_bbox = tuple(float(x) for x in args.gt_bbox.split(","))
         samples.append((image, image_path, instruction, gt_bbox, args.output, 0))
     else:
-        parser.error("Provide --image or --screenspot_dir")
+        parser.error("Provide --image or --data_dir")
         return
 
     # Process each sample
@@ -601,7 +448,7 @@ def main():
         if gt_bbox:
             print(f"  GT bbox (norm): ({gt_bbox[0]:.3f}, {gt_bbox[1]:.3f}, {gt_bbox[2]:.3f}, {gt_bbox[3]:.3f})")
 
-        rounds_info = run_saccade_with_recording(
+        result = run_saccade_with_recording(
             image=image,
             image_path=image_path,
             instruction=instruction,
@@ -614,21 +461,42 @@ def main():
             crop_upscale=args.crop_upscale,
             crop_target_pixels=args.crop_target_pixels,
             device=args.device,
+            reasoning_max_new_tokens=args.reasoning_max_new_tokens,
         )
 
-        print(f"  {len(rounds_info)} rounds:")
-        for rinfo in rounds_info:
+        trace = result.get("trace", [])
+        print(f"  {len(trace)} traced panels:")
+        for rinfo in trace:
             ri = rinfo["round"]
+            px, py = rinfo.get("pred_x"), rinfo.get("pred_y")
             hit = ""
-            if gt_bbox:
-                px, py = rinfo["pred_x"], rinfo["pred_y"]
+            if gt_bbox and px is not None and py is not None:
                 in_box = gt_bbox[0] <= px <= gt_bbox[2] and gt_bbox[1] <= py <= gt_bbox[3]
                 hit = " ✓ HIT" if in_box else " ✗ MISS"
-            print(f"    Round {ri}: pred=({rinfo['pred_x']:.4f}, {rinfo['pred_y']:.4f}), "
-                  f"attended={rinfo.get('attended_image', 'low')}{hit}")
+            pred_text = f"pred=({px:.4f}, {py:.4f})" if px is not None and py is not None else "pred=(n/a)"
+            print(
+                f"    Round {ri}: action={rinfo.get('action')} {pred_text}, "
+                f"attended={rinfo.get('attended_image', 'low')}, "
+                f"fmt={'ok' if rinfo.get('format_ok') else 'bad'}{hit}"
+            )
+            reasoning = _shorten_reasoning(rinfo.get("reasoning_text", ""), limit=100)
+            if reasoning:
+                print(f"      reasoning: {reasoning}")
 
-        plot_saccade_rounds(image, rounds_info, gt_bbox=gt_bbox,
-                            instruction=instruction, output_path=output_path)
+        final_point = result["topk_points"][0]
+        final_hit = ""
+        if gt_bbox:
+            in_box = gt_bbox[0] <= final_point[0] <= gt_bbox[2] and gt_bbox[1] <= final_point[1] <= gt_bbox[3]
+            final_hit = " ✓ HIT" if in_box else " ✗ MISS"
+        print(f"  Final: ({final_point[0]:.4f}, {final_point[1]:.4f}){final_hit}")
+
+        plot_saccade_rounds(
+            image,
+            result,
+            gt_bbox=gt_bbox,
+            instruction=instruction,
+            output_path=output_path,
+        )
 
 
 if __name__ == "__main__":

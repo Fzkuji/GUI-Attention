@@ -108,6 +108,7 @@ def run_saccade_inference(
     use_click_head: bool = True,
     use_dual_tokens: bool = True,
     reasoning_max_new_tokens: int = 48,
+    return_trace: bool = False,
 ) -> dict:
     """Multi-round saccade inference with LookHead + ClickHead.
 
@@ -237,6 +238,10 @@ def run_saccade_inference(
     round_raw_responses = []
     round_used_responses = []
     round_format_oks = []
+    trace = []
+
+    def _maybe_numpy(attn):
+        return attn.detach().cpu().float().numpy() if return_trace and attn is not None else None
 
     # Round 0: generate reasoning, then always look on low-res.
     r0_prompt, _, _ = _build_context([], [], for_generation=True)
@@ -292,6 +297,24 @@ def run_saccade_inference(
     last_look_point = final_point
     last_look_dims = (nw0, nh0)
     round_preds = [final_point]
+    if return_trace:
+        trace.append({
+            "round": 0,
+            "action": parsed0.action,
+            "reasoning_text": parsed0.raw_content,
+            "used_reasoning_text": parsed0.used_content,
+            "format_ok": parsed0.format_ok,
+            "crop_bbox": None,
+            "decision_crop_bbox": None,
+            "pred_x": focus_x,
+            "pred_y": focus_y,
+            "attended_image": "low",
+            "grid_dims_low": (nh0, nw0),
+            "grid_dims_crop": None,
+            "low_attn_2d": _maybe_numpy(low_attn.view(nh0, nw0)),
+            "crop_attn_2d": None,
+            "point_kind": "look",
+        })
 
     # Keep the latest full context for final ClickHead on accumulated crops.
     last_vis_embeds = None
@@ -299,10 +322,13 @@ def run_saccade_inference(
     last_grid_dims = None
     last_anchor = None
 
+    click_trace_idx = None
+    decision_crop_bbox = None
     for ri in range(1, max_rounds):
         cropped, crop_bbox = crop_image(image, focus_x, focus_y,
                                         crop_size=crop_size,
                                         crop_upscale=crop_upscale)
+        decision_crop_bbox = crop_bbox
         history_responses = list(round_used_responses)
         try:
             ri_prompt, _, _ = _build_context(
@@ -374,6 +400,25 @@ def run_saccade_inference(
         if parsed.action == "click":
             last_look_point = (focus_x, focus_y)
             last_look_dims = (nw0, nh0)
+            if return_trace:
+                click_trace_idx = len(trace)
+                trace.append({
+                    "round": ri,
+                    "action": parsed.action,
+                    "reasoning_text": parsed.raw_content,
+                    "used_reasoning_text": parsed.used_content,
+                    "format_ok": parsed.format_ok,
+                    "crop_bbox": crop_bbox,
+                    "decision_crop_bbox": crop_bbox,
+                    "pred_x": None,
+                    "pred_y": None,
+                    "attended_image": "click",
+                    "grid_dims_low": (nh0, nw0),
+                    "grid_dims_crop": None,
+                    "low_attn_2d": None,
+                    "crop_attn_2d": None,
+                    "point_kind": "click",
+                })
             break
         else:
             attn_ri, _, _ = model.dual_head.look(vis_embeds, anchor, mask=full_mask)
@@ -397,8 +442,32 @@ def run_saccade_inference(
             round_preds.append((focus_x, focus_y))
             last_look_point = (global_x, global_y)
             last_look_dims = (nw_a, nh_a)
+            if return_trace:
+                crop_off, crop_n = vis_ranges[latest_img_idx]
+                crop_attn = attn_1d[crop_off:crop_off + crop_n]
+                trace.append({
+                    "round": ri,
+                    "action": parsed.action,
+                    "reasoning_text": parsed.raw_content,
+                    "used_reasoning_text": parsed.used_content,
+                    "format_ok": parsed.format_ok,
+                    "crop_bbox": crop_bbox,
+                    "decision_crop_bbox": crop_bbox,
+                    "pred_x": global_x,
+                    "pred_y": global_y,
+                    "attended_image": info.resolution,
+                    "grid_dims_low": (nh0, nw0),
+                    "grid_dims_crop": (grid_dims[latest_img_idx][0], grid_dims[latest_img_idx][1]),
+                    "low_attn_2d": _maybe_numpy(attn_1d[:n_low].view(nh0, nw0)),
+                    "crop_attn_2d": _maybe_numpy(crop_attn.view(grid_dims[latest_img_idx][0], grid_dims[latest_img_idx][1])),
+                    "point_kind": "look",
+                })
 
     # Final prediction: ClickHead on all accumulated crop tokens.
+    selected_crop_bbox = None
+    selected_crop_grid = None
+    selected_crop_attn = None
+    selected_crop_round = None
     if (
         use_click_head
         and last_vis_embeds is not None
@@ -427,7 +496,7 @@ def run_saccade_inference(
             global_argmax = click_1d.argmax().item()
 
             running = 0
-            for ci_n, ci_nw, ci_nh, ci_bbox in crop_meta:
+            for crop_meta_idx, (ci_n, ci_nw, ci_nh, ci_bbox) in enumerate(crop_meta, start=1):
                 if running + ci_n > global_argmax:
                     local_tok = global_argmax - running
                     lx = ((local_tok % ci_nw) + 0.5) / ci_nw
@@ -439,6 +508,10 @@ def run_saccade_inference(
                     )
                     # Return clicked crop grid dims, not low-res dims.
                     nw_final, nh_final = ci_nw, ci_nh
+                    selected_crop_bbox = ci_bbox
+                    selected_crop_grid = (ci_nh, ci_nw)
+                    selected_crop_attn = click_1d[running:running + ci_n].view(ci_nh, ci_nw)
+                    selected_crop_round = crop_meta_idx
                     break
                 running += ci_n
         else:
@@ -449,7 +522,35 @@ def run_saccade_inference(
         final_point = last_look_point
         nw_final, nh_final = last_look_dims
 
-    return {
+    if return_trace:
+        if click_trace_idx is not None and click_trace_idx < len(trace):
+            trace[click_trace_idx]["pred_x"] = final_point[0]
+            trace[click_trace_idx]["pred_y"] = final_point[1]
+            trace[click_trace_idx]["crop_bbox"] = selected_crop_bbox or trace[click_trace_idx]["crop_bbox"]
+            trace[click_trace_idx]["grid_dims_crop"] = selected_crop_grid
+            trace[click_trace_idx]["crop_attn_2d"] = _maybe_numpy(selected_crop_attn)
+            trace[click_trace_idx]["selected_crop_round"] = selected_crop_round
+        elif selected_crop_bbox is not None:
+            trace.append({
+                "round": len(trace),
+                "action": "final_click",
+                "reasoning_text": "",
+                "used_reasoning_text": "",
+                "format_ok": True,
+                "crop_bbox": selected_crop_bbox,
+                "decision_crop_bbox": decision_crop_bbox,
+                "pred_x": final_point[0],
+                "pred_y": final_point[1],
+                "attended_image": "click",
+                "grid_dims_low": (nh0, nw0),
+                "grid_dims_crop": selected_crop_grid,
+                "low_attn_2d": None,
+                "crop_attn_2d": _maybe_numpy(selected_crop_attn),
+                "point_kind": "click",
+                "selected_crop_round": selected_crop_round,
+            })
+
+    result = {
         "topk_points": [final_point],
         "n_width": nw_final,
         "n_height": nh_final,
@@ -463,3 +564,6 @@ def run_saccade_inference(
             if round_format_oks else 0.0
         ),
     }
+    if return_trace:
+        result["trace"] = trace
+    return result
