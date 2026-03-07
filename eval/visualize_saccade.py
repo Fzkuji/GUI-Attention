@@ -53,6 +53,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 if TYPE_CHECKING:
     from gui_attention.inputs.builder import MultiRoundInputBuilder
 
+from gui_attention.runtime.proposals import compute_basin_proposals, rect_box
+
 
 # ---------------------------------------------------------------------------
 # Saccade inference with per-round recording
@@ -116,8 +118,47 @@ def _shorten_reasoning(text: str, limit: int = 90) -> str:
     return text[: limit - 3] + "..."
 
 
+def _draw_basin_proposals(
+    ax,
+    proposals,
+    *,
+    width_px: int,
+    height_px: int,
+    label_prefix: str = "#",
+):
+    """Overlay ranked basin proposals on an existing image axis."""
+    colors = ["lime", "cyan", "orange", "magenta", "yellow"]
+    for idx, proposal in enumerate(proposals, start=1):
+        x1, y1, x2, y2 = rect_box(
+            proposal.rect.center_x,
+            proposal.rect.center_y,
+            proposal.rect.width,
+            proposal.rect.height,
+        )
+        color = colors[(idx - 1) % len(colors)]
+        rect = patches.Rectangle(
+            (x1 * width_px, y1 * height_px),
+            (x2 - x1) * width_px,
+            (y2 - y1) * height_px,
+            linewidth=2.0,
+            edgecolor=color,
+            facecolor="none",
+        )
+        ax.add_patch(rect)
+        ax.text(
+            x1 * width_px + 4,
+            y1 * height_px + 16,
+            f"{label_prefix}{idx}",
+            fontsize=10,
+            fontweight="bold",
+            color=color,
+            bbox={"facecolor": "black", "alpha": 0.55, "pad": 2},
+        )
+
+
 def plot_saccade_rounds(image: Image.Image, result: dict, gt_bbox=None,
-                        instruction: str = "", output_path: str = "viz_saccade.png"):
+                        instruction: str = "", output_path: str = "viz_saccade.png",
+                        show_basin_proposals: bool = True, proposal_topk: int = 3):
     """Plot multi-round saccade results.
 
     Layout: one row per round.
@@ -152,6 +193,15 @@ def plot_saccade_rounds(image: Image.Image, result: dict, gt_bbox=None,
         if low_attn is not None:
             heatmap_low = _upsample_heatmap(low_attn, img_w, img_h)
             ax_full.imshow(heatmap_low, alpha=0.4, cmap="jet", extent=[0, img_w, img_h, 0])
+            if show_basin_proposals:
+                low_props, _ = compute_basin_proposals(low_attn, top_k=proposal_topk)
+                _draw_basin_proposals(
+                    ax_full,
+                    low_props,
+                    width_px=img_w,
+                    height_px=img_h,
+                    label_prefix="#",
+                )
         if rinfo.get("grid_dims_low") is not None:
             nh_low, nw_low = rinfo["grid_dims_low"]
             _draw_grid(ax_full, nw_low, nh_low, img_w, img_h, color="white", alpha=0.3, linewidth=0.5)
@@ -202,6 +252,15 @@ def plot_saccade_rounds(image: Image.Image, result: dict, gt_bbox=None,
             if rinfo.get("crop_attn_2d") is not None:
                 crop_heatmap = _upsample_heatmap(rinfo["crop_attn_2d"], cw, ch)
                 ax_crop.imshow(crop_heatmap, alpha=0.5, cmap="jet", extent=[0, cw, ch, 0])
+                if show_basin_proposals:
+                    crop_props, _ = compute_basin_proposals(rinfo["crop_attn_2d"], top_k=proposal_topk)
+                    _draw_basin_proposals(
+                        ax_crop,
+                        crop_props,
+                        width_px=cw,
+                        height_px=ch,
+                        label_prefix="p",
+                    )
             if rinfo.get("grid_dims_crop") is not None:
                 crop_nh, crop_nw = rinfo["grid_dims_crop"]
                 _draw_grid(ax_crop, crop_nw, crop_nh, cw, ch, color="white", alpha=0.5, linewidth=0.5)
@@ -359,6 +418,9 @@ def main():
     parser.add_argument("--crop_target_pixels", type=int, default=0, help="(Legacy) Crop target pixels")
     parser.add_argument("--low_res_max_pixels", type=int, default=1001600, help="Low-res max pixels")
     parser.add_argument("--reasoning_max_new_tokens", type=int, default=48, help="Max new tokens for reasoning generation")
+    parser.add_argument("--proposal_topk", type=int, default=3, help="Number of basin proposals to overlay per panel")
+    parser.add_argument("--show_basin_proposals", action=argparse.BooleanOptionalAction, default=True,
+                        help="Overlay ranked attention-region proposals on low-res and crop views")
     parser.add_argument("--device", default="cuda:0", help="Device")
     args = parser.parse_args()
 
@@ -496,6 +558,8 @@ def main():
             gt_bbox=gt_bbox,
             instruction=instruction,
             output_path=output_path,
+            show_basin_proposals=args.show_basin_proposals,
+            proposal_topk=args.proposal_topk,
         )
 
 
