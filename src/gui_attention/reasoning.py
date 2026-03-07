@@ -23,19 +23,21 @@ CLICK_ACTION_SPAN = (
     f"{DEFAULT_POINTER_START_TOKEN}{DEFAULT_CLICK_PAD_TOKEN}{DEFAULT_POINTER_END_TOKEN}"
 )
 
-REASONING_ASSISTANT_PREFIX = "<|im_start|>assistant\nThought: "
+REASONING_ASSISTANT_PREFIX = "<|im_start|>assistant\n"
 
 ROUND0_REASONING_GUIDE = (
-    "\nRespond as the assistant using exactly two lines:\n"
-    f"{THOUGHT_PREFIX}<brief reasoning about which region to inspect next>\n"
-    f"{ACTION_PREFIX}{LOOK_ACTION_SPAN}\n"
+    "\nRespond as the assistant with a brief explanation, then end the response with exactly one action span:\n"
+    f"{LOOK_ACTION_SPAN}\n"
+    "You may optionally place the action span on a new line as "
+    f"'{ACTION_PREFIX}{LOOK_ACTION_SPAN}'. "
     "This is the initial low-resolution overview, so you must inspect a high-resolution region next."
 )
 
 CROP_REASONING_GUIDE = (
-    "\nRespond as the assistant using exactly two lines:\n"
-    f"{THOUGHT_PREFIX}<brief reasoning>\n"
-    f"{ACTION_PREFIX}{LOOK_ACTION_SPAN} or {CLICK_ACTION_SPAN}\n"
+    "\nRespond as the assistant with a brief explanation, then end the response with exactly one action span:\n"
+    f"{LOOK_ACTION_SPAN} or {CLICK_ACTION_SPAN}\n"
+    "You may optionally place the action span on a new line as "
+    f"'{ACTION_PREFIX}{LOOK_ACTION_SPAN}' or '{ACTION_PREFIX}{CLICK_ACTION_SPAN}'. "
     "Use the look action when you need another close-up. Use the click action only when the target is clear enough to click now."
 )
 
@@ -61,8 +63,6 @@ def decode_reasoning_content(tokenizer, generated_token_ids: Sequence[int]) -> s
         clean_up_tokenization_spaces=False,
     )
     decoded = decoded.replace("<|im_end|>", "").strip()
-    if not decoded.startswith(THOUGHT_PREFIX):
-        decoded = f"{THOUGHT_PREFIX}{decoded}"
     return decoded.strip()
 
 
@@ -88,48 +88,59 @@ def canonical_assistant_content(thought: str, action: str) -> str:
             else "I have enough evidence to click the target now."
         )
     action_span = LOOK_ACTION_SPAN if action == "look" else CLICK_ACTION_SPAN
-    return f"{THOUGHT_PREFIX}{thought}\n{ACTION_PREFIX}{action_span}"
+    return f"{thought}{action_span}"
+
+
+def _find_action_span(text: str):
+    spans = []
+    for action, span in (("look", LOOK_ACTION_SPAN), ("click", CLICK_ACTION_SPAN)):
+        start = 0
+        while True:
+            idx = text.find(span, start)
+            if idx < 0:
+                break
+            spans.append((idx, action, span))
+            start = idx + len(span)
+    spans.sort(key=lambda x: x[0])
+    return spans
 
 
 def parse_reasoning_action(content: str, *, allow_click: bool) -> ParsedReasoningAction:
     text = normalize_assistant_content(content)
+    spans = _find_action_span(text)
+    total_hits = len(spans)
+    parse_failed = total_hits != 1
+    action = "look"
+    action_span = LOOK_ACTION_SPAN
+    action_pos = -1
+    if total_hits == 1:
+        action_pos, action, action_span = spans[0]
 
-    look_hits = text.count(LOOK_ACTION_SPAN)
-    click_hits = text.count(CLICK_ACTION_SPAN)
-    total_hits = look_hits + click_hits
-
-    action_line_idx = text.rfind(f"\n{ACTION_PREFIX}")
-    if action_line_idx < 0:
-        action_line_idx = text.find(ACTION_PREFIX)
-    thought_block = text[:action_line_idx] if action_line_idx >= 0 else text
+    thought_block = text[:action_pos] if action_pos >= 0 else text
+    thought_block = thought_block.rstrip()
+    if thought_block.endswith(ACTION_PREFIX):
+        thought_block = thought_block[: -len(ACTION_PREFIX)].rstrip()
     if THOUGHT_PREFIX in thought_block:
         thought = thought_block.split(THOUGHT_PREFIX, 1)[1].strip()
     else:
         thought = thought_block.strip()
 
     format_ok = (
-        text.startswith(THOUGHT_PREFIX)
-        and action_line_idx >= 0
+        total_hits == 1
+        and text.rstrip().endswith(action_span)
         and bool(thought)
-        and total_hits == 1
     )
-
-    parse_failed = total_hits != 1
-    action = "look"
-    if look_hits == 1 and click_hits == 0:
-        action = "look"
-    elif click_hits == 1 and look_hits == 0:
-        action = "click"
 
     if action == "click" and not allow_click:
         parse_failed = True
         format_ok = False
         action = "look"
+        action_span = LOOK_ACTION_SPAN
 
     if total_hits != 1:
         action = "look"
 
-    used_content = canonical_assistant_content(thought, action)
+    used_content = text if total_hits == 1 and not parse_failed else canonical_assistant_content(thought, action)
     return ParsedReasoningAction(
         raw_content=text,
         used_content=used_content,
