@@ -13,9 +13,6 @@ from gui_attention.constants import (
     DEFAULT_POINTER_START_TOKEN,
 )
 
-THOUGHT_PREFIX = "Thought: "
-ACTION_PREFIX = "Action: "
-
 LOOK_ACTION_SPAN = (
     f"{DEFAULT_POINTER_START_TOKEN}{DEFAULT_LOOK_PAD_TOKEN}{DEFAULT_POINTER_END_TOKEN}"
 )
@@ -28,16 +25,12 @@ REASONING_ASSISTANT_PREFIX = "<|im_start|>assistant\n"
 ROUND0_REASONING_GUIDE = (
     "\nRespond as the assistant with a brief explanation, then end the response with exactly one action span:\n"
     f"{LOOK_ACTION_SPAN}\n"
-    "You may optionally place the action span on a new line as "
-    f"'{ACTION_PREFIX}{LOOK_ACTION_SPAN}'. "
     "This is the initial low-resolution overview, so you must inspect a high-resolution region next."
 )
 
 CROP_REASONING_GUIDE = (
     "\nRespond as the assistant with a brief explanation, then end the response with exactly one action span:\n"
     f"{LOOK_ACTION_SPAN} or {CLICK_ACTION_SPAN}\n"
-    "You may optionally place the action span on a new line as "
-    f"'{ACTION_PREFIX}{LOOK_ACTION_SPAN}' or '{ACTION_PREFIX}{CLICK_ACTION_SPAN}'. "
     "Use the look action when you need another close-up. Use the click action only when the target is clear enough to click now."
 )
 
@@ -118,12 +111,7 @@ def parse_reasoning_action(content: str, *, allow_click: bool) -> ParsedReasonin
 
     thought_block = text[:action_pos] if action_pos >= 0 else text
     thought_block = thought_block.rstrip()
-    if thought_block.endswith(ACTION_PREFIX):
-        thought_block = thought_block[: -len(ACTION_PREFIX)].rstrip()
-    if THOUGHT_PREFIX in thought_block:
-        thought = thought_block.split(THOUGHT_PREFIX, 1)[1].strip()
-    else:
-        thought = thought_block.strip()
+    thought = thought_block.strip()
 
     format_ok = (
         total_hits == 1
