@@ -148,6 +148,7 @@ declare -a ALL_DATASETS=(
     "guiact_bbox.json:GUIAct/GUIAct/web_imgs:0"
     "androidcontrol_bbox.json:AndroidControl/AndroidControl/tfrecord/images:0"
     "wave_ui_bbox.json:Wave-UI/Wave-UI/images_fixed:0"
+    "groundcua_bbox.json:GroundCUA/data:120000"
     "uground_bbox.json:Uground/Uground/images:60000"
     "gta/gta_data/gta_data_wo_web.json:gta/gta_data/image:60000"
 )
