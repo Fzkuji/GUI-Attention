@@ -89,10 +89,18 @@ def _normalize_bbox(bbox: list[float], width: int, height: int) -> list[float] |
     return [x1 / width, y1 / height, x2 / width, y2 / height]
 
 
-def _iter_annotation_files(root: Path) -> Iterable[Path]:
-    data_dir = root / "data"
-    if not data_dir.exists():
-        raise FileNotFoundError(f"GroundCUA data dir not found: {data_dir}")
+def _resolve_data_dir(root: Path) -> Path:
+    if (root / "data").exists():
+        return root / "data"
+    if any(root.glob("*/")) and any(root.rglob("*.json")):
+        return root
+    raise FileNotFoundError(
+        f"GroundCUA data dir not found under {root}. Expected either "
+        f"'{root / 'data'}' or annotation folders directly inside '{root}'."
+    )
+
+
+def _iter_annotation_files(data_dir: Path) -> Iterable[Path]:
     yield from sorted(data_dir.rglob("*.json"))
 
 
@@ -129,6 +137,7 @@ def main() -> None:
     args = parser.parse_args()
 
     root = Path(args.groundcua_dir).expanduser().resolve()
+    data_dir = _resolve_data_dir(root)
     output_path = Path(args.output_json).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -139,7 +148,7 @@ def main() -> None:
     missing_images = 0
     skipped_boxes = 0
 
-    for ann_path in _iter_annotation_files(root):
+    for ann_path in _iter_annotation_files(data_dir):
         files_seen += 1
         with ann_path.open("r", encoding="utf-8") as f:
             entries = json.load(f)
@@ -149,7 +158,7 @@ def main() -> None:
         rel_image = entries[0].get("image_path")
         if not rel_image:
             continue
-        image_path = root / "data" / rel_image
+        image_path = data_dir / rel_image
         if not image_path.exists():
             missing_images += 1
             continue
