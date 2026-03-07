@@ -13,6 +13,7 @@
 set -e
 
 NUM_GPUS="${NUM_GPUS:-8}"
+GROUP_SIZE="${GROUP_SIZE:-8}"
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CODE_DIR=$(dirname "$SCRIPT_DIR")
@@ -28,6 +29,7 @@ cd "$CODE_DIR"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=src:$PYTHONPATH
 export HF_HUB_OFFLINE=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # SFT checkpoint to start from (edit this path directly)
 SFT_CKPT="$RESULT_DIR/ours_v15_dual/checkpoint-500"
@@ -84,7 +86,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --crop_upscale 3 \
     --max_saccade_rounds 6 \
     --use_dual_tokens true \
-    --group_size 4 \
+    --group_size "$GROUP_SIZE" \
     --reward_hit 1.0 \
     --reward_proximity_weight 0.25 \
     --reward_round_penalty 0.05 \
