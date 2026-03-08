@@ -407,7 +407,34 @@ def load_training_samples(train_json: str, image_root: str):
     """Load repo training JSON into visualize_saccade's common sample format."""
     from gui_attention.training.sft import load_single_dataset
 
-    train_samples = load_single_dataset(train_json, image_root)
+    if not os.path.exists(train_json):
+        raise FileNotFoundError(
+            f"Training JSON not found: {train_json}. "
+            "If this is GroundCUA, generate it first with scripts/convert_groundcua.py."
+        )
+
+    candidate_roots = [image_root]
+    if os.path.basename(train_json) == "groundcua_bbox.json":
+        data_subdir = os.path.join(image_root, "data")
+        if os.path.isdir(data_subdir):
+            candidate_roots.insert(0, data_subdir)
+
+    train_samples = []
+    chosen_root = None
+    for root in candidate_roots:
+        train_samples = load_single_dataset(train_json, root)
+        if train_samples:
+            chosen_root = root
+            break
+
+    if chosen_root is None:
+        raise FileNotFoundError(
+            f"No training samples could be resolved from {train_json} with image root "
+            f"{image_root}. Tried: {candidate_roots}"
+        )
+
+    print(f"  Loaded {len(train_samples)} training samples from {train_json}")
+    print(f"  Using image root: {chosen_root}")
     samples = []
     for s in train_samples:
         samples.append(
