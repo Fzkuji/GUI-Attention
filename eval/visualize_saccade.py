@@ -30,6 +30,16 @@ Usage:
       --data_dir /path/to/ScreenSpot-Pro \
       --sample_index 42 \
       --output viz_output.png
+
+  # From training JSON + image root
+  python eval/visualize_saccade.py \
+      --checkpoint /path/to/checkpoint \
+      --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
+      --dataset train \
+      --train_json /path/to/guiact_bbox.json \
+      --image_root /path/to/images \
+      --sample_index 42 \
+      --output viz_train.png
 """
 
 import argparse
@@ -393,6 +403,24 @@ def load_screenspot_sample(screenspot_dir: str, index: int):
     return img, img_path, instruction, gt_bbox, sample
 
 
+def load_training_samples(train_json: str, image_root: str):
+    """Load repo training JSON into visualize_saccade's common sample format."""
+    from gui_attention.training.sft import load_single_dataset
+
+    train_samples = load_single_dataset(train_json, image_root)
+    samples = []
+    for s in train_samples:
+        samples.append(
+            {
+                "image": None,
+                "image_path": s["image_path"],
+                "instruction": s["instruction"],
+                "bbox_norm": tuple(s["bbox_gt"]),
+            }
+        )
+    return samples
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -404,10 +432,12 @@ def main():
     parser.add_argument("--image", help="Path to input image")
     parser.add_argument("--instruction", help="Text instruction")
     parser.add_argument("--gt_bbox", help="GT bbox as x1,y1,x2,y2 (normalised)")
-    parser.add_argument("--dataset", default="pro", choices=["v1", "v2", "pro"],
-                        help="Dataset: v1 (ScreenSpot), v2 (ScreenSpot-v2), pro (ScreenSpot-Pro)")
+    parser.add_argument("--dataset", default="pro", choices=["v1", "v2", "pro", "train"],
+                        help="Dataset: v1 (ScreenSpot), v2 (ScreenSpot-v2), pro (ScreenSpot-Pro), train (repo training JSON)")
     parser.add_argument("--data_dir", help="Path to dataset directory (required for pro/v2)")
     parser.add_argument("--screenspot_dir", help="(Deprecated) Alias for --data_dir with --dataset pro")
+    parser.add_argument("--train_json", help="Path to training JSON (used with --dataset train)")
+    parser.add_argument("--image_root", help="Image root for training JSON (used with --dataset train)")
     parser.add_argument("--sample_index", type=int, default=0, help="Sample index")
     parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to visualize (batch mode)")
     parser.add_argument("--output", default="viz_saccade.png", help="Output image path")
@@ -453,7 +483,20 @@ def main():
 
     # Collect samples to visualize
     samples = []
-    if args.data_dir or args.dataset in ("v1", "v2"):
+    if args.dataset == "train":
+        if not args.train_json or not args.image_root:
+            parser.error("--dataset train requires --train_json and --image_root")
+        all_samples = load_training_samples(args.train_json, args.image_root)
+
+        for idx in range(args.sample_index, min(args.sample_index + args.num_samples, len(all_samples))):
+            s = all_samples[idx]
+            img_path = s["image_path"]
+            img = Image.open(img_path).convert("RGB")
+            gt_bbox = tuple(s["bbox_norm"]) if "bbox_norm" in s else None
+            out_path = args.output.replace(".png", f"_{idx}.png") if args.num_samples > 1 else args.output
+            samples.append((img, img_path, s["instruction"], gt_bbox, out_path, idx))
+
+    elif args.data_dir or args.dataset in ("v1", "v2"):
         # Load full dataset then pick samples by index
         from eval_screenspot import load_screenspot_v1, load_screenspot_v2, load_screenspot_pro
         if args.dataset == "v1":
