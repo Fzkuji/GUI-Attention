@@ -17,8 +17,12 @@ form consumed by `load_single_dataset()` in `training/sft.py`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable
 
@@ -111,6 +115,7 @@ def _resolve_image_path(
     ann_path: Path,
     rel_image: str,
     basename_cache: dict[str, Path | None],
+    cache_lock: threading.Lock | None = None,
 ) -> Path | None:
     rel_path = Path(str(rel_image))
     candidates: list[Path] = []
@@ -133,11 +138,101 @@ def _resolve_image_path(
 
     basename = rel_path.name
     if basename:
-        if basename not in basename_cache:
-            matches = list(root.rglob(basename))
-            basename_cache[basename] = matches[0].resolve() if matches else None
-        return basename_cache[basename]
+        if cache_lock is None:
+            if basename not in basename_cache:
+                matches = list(root.rglob(basename))
+                basename_cache[basename] = matches[0].resolve() if matches else None
+            return basename_cache[basename]
+        with cache_lock:
+            if basename in basename_cache:
+                return basename_cache[basename]
+        matches = list(root.rglob(basename))
+        resolved = matches[0].resolve() if matches else None
+        with cache_lock:
+            basename_cache.setdefault(basename, resolved)
+            return basename_cache[basename]
     return None
+
+
+def _seed_for_path(base_seed: int, path: Path) -> int:
+    digest = hashlib.sha256(f"{base_seed}:{path}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "little")
+
+
+def _process_annotation_file(
+    ann_path: Path,
+    *,
+    root: Path,
+    data_dir: Path,
+    max_per_image: int,
+    base_seed: int,
+    basename_cache: dict[str, Path | None],
+    cache_lock: threading.Lock,
+) -> dict:
+    with ann_path.open("r", encoding="utf-8") as f:
+        entries = json.load(f)
+    if not entries:
+        return {"samples": [], "converted": False, "missing": 0, "unreadable": 0, "invalid": 0}
+
+    rel_image = entries[0].get("image_path")
+    if not rel_image:
+        return {"samples": [], "converted": False, "missing": 0, "unreadable": 0, "invalid": 0}
+
+    image_path = _resolve_image_path(
+        root=root,
+        data_dir=data_dir,
+        ann_path=ann_path,
+        rel_image=rel_image,
+        basename_cache=basename_cache,
+        cache_lock=cache_lock,
+    )
+    if image_path is None or not image_path.exists():
+        return {"samples": [], "converted": False, "missing": 1, "unreadable": 0, "invalid": 0}
+
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+    except (UnidentifiedImageError, OSError):
+        return {"samples": [], "converted": False, "missing": 0, "unreadable": 1, "invalid": 0}
+
+    rng = random.Random(_seed_for_path(base_seed, ann_path))
+    image_samples = []
+    skipped_boxes = 0
+    for entry in entries:
+        bbox = _normalize_bbox(entry.get("bbox", []), width, height)
+        if bbox is None:
+            skipped_boxes += 1
+            continue
+        instruction = _make_instruction(entry, rng)
+        image_samples.append(
+            {
+                "image": str(image_path),
+                "conversations": [
+                    {"from": "human", "value": f"<image>\n{instruction}"},
+                    {"from": "assistant", "value": "", "bbox_gt": bbox},
+                ],
+            }
+        )
+
+    if not image_samples:
+        return {
+            "samples": [],
+            "converted": False,
+            "missing": 0,
+            "unreadable": 0,
+            "invalid": skipped_boxes,
+        }
+
+    if max_per_image > 0 and len(image_samples) > max_per_image:
+        image_samples = rng.sample(image_samples, max_per_image)
+
+    return {
+        "samples": image_samples,
+        "converted": True,
+        "missing": 0,
+        "unreadable": 0,
+        "invalid": skipped_boxes,
+    }
 
 
 def main() -> None:
@@ -170,6 +265,12 @@ def main() -> None:
         default=42,
         help="Random seed for per-image sampling and prompt templates",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(16, (os.cpu_count() or 4))),
+        help="Number of worker threads for annotation/image processing",
+    )
     args = parser.parse_args()
 
     root = Path(args.groundcua_dir).expanduser().resolve()
@@ -179,65 +280,33 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     samples = []
-    files_seen = 0
+    ann_files = list(_iter_annotation_files(data_dir))
+    files_seen = len(ann_files)
     images_seen = 0
     missing_images = 0
     unreadable_images = 0
     skipped_boxes = 0
     basename_cache: dict[str, Path | None] = {}
+    cache_lock = threading.Lock()
 
-    for ann_path in _iter_annotation_files(data_dir):
-        files_seen += 1
-        with ann_path.open("r", encoding="utf-8") as f:
-            entries = json.load(f)
-        if not entries:
-            continue
-
-        rel_image = entries[0].get("image_path")
-        if not rel_image:
-            continue
-        image_path = _resolve_image_path(
-            root=root,
-            data_dir=data_dir,
-            ann_path=ann_path,
-            rel_image=rel_image,
-            basename_cache=basename_cache,
-        )
-        if image_path is None or not image_path.exists():
-            missing_images += 1
-            continue
-
-        try:
-            with Image.open(image_path) as img:
-                width, height = img.size
-        except (UnidentifiedImageError, OSError):
-            unreadable_images += 1
-            continue
-
-        image_samples = []
-        for entry in entries:
-            bbox = _normalize_bbox(entry.get("bbox", []), width, height)
-            if bbox is None:
-                skipped_boxes += 1
-                continue
-            instruction = _make_instruction(entry, rng)
-            image_samples.append(
-                {
-                    "image": str(image_path),
-                    "conversations": [
-                        {"from": "human", "value": f"<image>\n{instruction}"},
-                        {"from": "assistant", "value": "", "bbox_gt": bbox},
-                    ],
-                }
-            )
-
-        if not image_samples:
-            continue
-
-        images_seen += 1
-        if args.max_per_image > 0 and len(image_samples) > args.max_per_image:
-            image_samples = rng.sample(image_samples, args.max_per_image)
-        samples.extend(image_samples)
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        for result in executor.map(
+            lambda ann_path: _process_annotation_file(
+                ann_path,
+                root=root,
+                data_dir=data_dir,
+                max_per_image=args.max_per_image,
+                base_seed=args.seed,
+                basename_cache=basename_cache,
+                cache_lock=cache_lock,
+            ),
+            ann_files,
+        ):
+            images_seen += int(result["converted"])
+            missing_images += int(result["missing"])
+            unreadable_images += int(result["unreadable"])
+            skipped_boxes += int(result["invalid"])
+            samples.extend(result["samples"])
 
     rng.shuffle(samples)
     if args.max_samples > 0 and len(samples) > args.max_samples:
