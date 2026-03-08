@@ -27,6 +27,9 @@ Options:
   --base_model PATH
   --click_head_from PATH
   --output_dir PATH
+  --data_paths CSV
+  --image_folders CSV
+  --max_samples_per_dataset CSV
   --free_reasoning_sft true|false
   --append_assistant_eos true|false
   --lm_loss_weight FLOAT
@@ -47,6 +50,9 @@ BASE_MODEL="${BASE_MODEL:-}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
+DATA_PATHS_OVERRIDE="${DATA_PATHS_OVERRIDE:-}"
+IMAGE_FOLDERS_OVERRIDE="${IMAGE_FOLDERS_OVERRIDE:-}"
+PER_DS_LIMITS_OVERRIDE="${PER_DS_LIMITS_OVERRIDE:-}"
 FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
 APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
 LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-0.5}"
@@ -77,6 +83,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output_dir)
             OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --data_paths)
+            DATA_PATHS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --image_folders)
+            IMAGE_FOLDERS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --max_samples_per_dataset)
+            PER_DS_LIMITS_OVERRIDE="$2"
             shift 2
             ;;
         --free_reasoning_sft)
@@ -153,31 +171,48 @@ declare -a ALL_DATASETS=(
     "gta/gta_data/gta_data_wo_web.json:gta/gta_data/image:60000"
 )
 
-# Auto-detect available datasets
-DATA_PATHS=""
-IMAGE_FOLDERS=""
-PER_DS_LIMITS=""
-for entry in "${ALL_DATASETS[@]}"; do
-    IFS=':' read -r json_file img_dir limit <<< "$entry"
-    actual_img_dir="$img_dir"
-    if [ "$json_file" = "groundcua_bbox.json" ] && [ ! -d "$DATA_DIR/$img_dir" ] && [ -d "$DATA_DIR/GroundCUA" ]; then
-        actual_img_dir="GroundCUA"
+if [ -n "$DATA_PATHS_OVERRIDE" ]; then
+    DATA_PATHS="$DATA_PATHS_OVERRIDE"
+    IMAGE_FOLDERS="$IMAGE_FOLDERS_OVERRIDE"
+    PER_DS_LIMITS="$PER_DS_LIMITS_OVERRIDE"
+    if [ -z "$IMAGE_FOLDERS" ]; then
+        echo "ERROR: --image_folders is required when --data_paths is set"
+        exit 1
     fi
-    if [ -f "$DATA_DIR/$json_file" ]; then
-        if [ -n "$DATA_PATHS" ]; then
-            DATA_PATHS="$DATA_PATHS,$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$actual_img_dir"
-            PER_DS_LIMITS="$PER_DS_LIMITS,$limit"
-        else
-            DATA_PATHS="$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$DATA_DIR/$actual_img_dir"
-            PER_DS_LIMITS="$limit"
+    if [ -z "$PER_DS_LIMITS" ]; then
+        PER_DS_LIMITS="0"
+    fi
+    echo "  ✓ using explicit dataset override"
+    echo "    data_paths=$DATA_PATHS"
+    echo "    image_folders=$IMAGE_FOLDERS"
+    echo "    max_samples_per_dataset=$PER_DS_LIMITS"
+else
+    # Auto-detect available datasets
+    DATA_PATHS=""
+    IMAGE_FOLDERS=""
+    PER_DS_LIMITS=""
+    for entry in "${ALL_DATASETS[@]}"; do
+        IFS=':' read -r json_file img_dir limit <<< "$entry"
+        actual_img_dir="$img_dir"
+        if [ "$json_file" = "groundcua_bbox.json" ] && [ ! -d "$DATA_DIR/$img_dir" ] && [ -d "$DATA_DIR/GroundCUA" ]; then
+            actual_img_dir="GroundCUA"
         fi
-        echo "  ✓ $json_file -> $actual_img_dir (limit=$limit)"
-    else
-        echo "  ✗ $json_file (not found, skipping)"
-    fi
-done
+        if [ -f "$DATA_DIR/$json_file" ]; then
+            if [ -n "$DATA_PATHS" ]; then
+                DATA_PATHS="$DATA_PATHS,$DATA_DIR/$json_file"
+                IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$actual_img_dir"
+                PER_DS_LIMITS="$PER_DS_LIMITS,$limit"
+            else
+                DATA_PATHS="$DATA_DIR/$json_file"
+                IMAGE_FOLDERS="$DATA_DIR/$actual_img_dir"
+                PER_DS_LIMITS="$limit"
+            fi
+            echo "  ✓ $json_file -> $actual_img_dir (limit=$limit)"
+        else
+            echo "  ✗ $json_file (not found, skipping)"
+        fi
+    done
+fi
 
 if [ -z "$DATA_PATHS" ]; then
     echo "ERROR: No datasets found in $DATA_DIR"
