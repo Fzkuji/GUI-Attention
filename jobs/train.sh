@@ -23,6 +23,7 @@ Usage:
 
 Options:
   --num_gpus N
+  --init_ckpt PATH
   --resume_ckpt PATH
   --base_model PATH
   --click_head_from PATH
@@ -47,6 +48,7 @@ EOF
 
 NUM_GPUS="${NUM_GPUS:-8}"
 BASE_MODEL="${BASE_MODEL:-}"
+INIT_CKPT="${INIT_CKPT:-}"
 RESUME_CKPT="${RESUME_CKPT:-}"
 CLICK_HEAD_FROM="${CLICK_HEAD_FROM:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --resume_ckpt)
             RESUME_CKPT="$2"
+            shift 2
+            ;;
+        --init_ckpt)
+            INIT_CKPT="$2"
             shift 2
             ;;
         --base_model)
@@ -219,7 +225,13 @@ if [ -z "$DATA_PATHS" ]; then
     exit 1
 fi
 
-# Resume
+# Resume / init-only checkpoint loading
+INIT_ARG=""
+if [ -n "$INIT_CKPT" ]; then
+    echo "Initializing weights from: $INIT_CKPT"
+    INIT_ARG="--init_ckpt $INIT_CKPT"
+fi
+
 RESUME_ARG=""
 if [ -n "$RESUME_CKPT" ]; then
     echo "Resuming from: $RESUME_CKPT"
@@ -283,5 +295,6 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --bf16 true \
     --gradient_checkpointing true \
     --report_to none \
+    $INIT_ARG \
     $RESUME_ARG \
     2>&1 | tee "$LOG_DIR/train_v15_dual.txt"

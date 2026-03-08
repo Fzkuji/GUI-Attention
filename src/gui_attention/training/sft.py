@@ -185,6 +185,7 @@ class ScriptArgs:
         "help": "Path to GUI-Actor checkpoint (safetensors dir) to initialize both LookHead and ClickHead from pointer_head weights"
     })
     # Resume
+    init_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to initialize model weights from without resuming optimizer/step state"})
     resume_ckpt: Optional[str] = field(default=None, metadata={"help": "Checkpoint dir to resume training from"})
 
 
@@ -1100,11 +1101,13 @@ def main():
         click_head_from=sa.click_head_from,
     )
 
-    # Load checkpoint if resuming
-    if sa.resume_ckpt:
-        ckpt = sa.resume_ckpt
+    # Load checkpoint weights for init/resume
+    ckpt_to_load = sa.resume_ckpt or sa.init_ckpt
+    if ckpt_to_load:
+        ckpt = ckpt_to_load
         if rank == 0:
-            print(f"Loading model weights from checkpoint: {ckpt}")
+            mode = "resume" if sa.resume_ckpt else "init-only"
+            print(f"Loading model weights from checkpoint ({mode}): {ckpt}")
         if sa.use_lora:
             from peft import set_peft_model_state_dict
             adapter_file = os.path.join(ckpt, "adapter_model.safetensors")
