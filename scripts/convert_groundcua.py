@@ -113,6 +113,26 @@ def _iter_annotation_files(data_dir: Path) -> Iterable[Path]:
     yield from sorted(data_dir.rglob("*.json"))
 
 
+def _iter_image_files(root: Path) -> Iterable[Path]:
+    image_root = root / "images"
+    search_root = image_root if image_root.exists() else root
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    for path in search_root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in exts:
+            yield path
+
+
+def _build_basename_index(root: Path) -> dict[str, Path | None]:
+    image_files = list(_iter_image_files(root))
+    index: dict[str, Path | None] = {}
+    file_iter = image_files
+    if tqdm is not None:
+        file_iter = tqdm(image_files, desc="Index GroundCUA images")
+    for path in file_iter:
+        index.setdefault(path.name, path.resolve())
+    return index
+
+
 def _resolve_image_path(
     *,
     root: Path,
@@ -291,7 +311,8 @@ def main() -> None:
     missing_images = 0
     unreadable_images = 0
     skipped_boxes = 0
-    basename_cache: dict[str, Path | None] = {}
+    print("Building GroundCUA image index...")
+    basename_cache = _build_basename_index(root)
     cache_lock = threading.Lock()
 
     print(f"Processing {files_seen} annotation files with {max(1, args.workers)} workers...")
