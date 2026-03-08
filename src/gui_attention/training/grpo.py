@@ -38,6 +38,8 @@ from transformers import StoppingCriteriaList
 
 from gui_attention.modeling.attention import (
     extract_anchor_hidden_states,
+    identify_attended_image,
+    token_to_spatial,
     extract_visual_hidden_states,
 )
 from gui_attention.inputs.builder import MultiRoundInputBuilder
@@ -45,9 +47,10 @@ from gui_attention.constants import (
     HIGH_RES_MAX_PIXELS,
     LOW_RES_MAX_PIXELS,
 )
-from gui_attention.inputs.crop import crop_image, point_in_bbox
+from gui_attention.inputs.crop import crop_image, crop_image_bbox, point_in_bbox
 from gui_attention.inputs.labels import compute_overlap_mask
 from gui_attention.modeling.model import Qwen25VLWithDualHead, build_model
+from gui_attention.runtime.proposals import box_center, select_top_proposal_bbox
 from gui_attention.runtime.reasoning import (
     ActionSpanStoppingCriteria,
     decode_reasoning_content,
@@ -137,8 +140,8 @@ def _get_visual_module(model):
 class Trajectory:
     """A single saccade trajectory for one sample."""
     round_preds: list                   # [(x, y)|None, ...] per round; look rounds carry next focus
-    round_crop_bboxes: list             # [None|bbox, ...] aligned with rounds
-    look_token_indices: list            # [None|idx, ...] aligned with rounds
+    round_crop_bboxes: list             # proposal boxes selected by look rounds (round0 proposal is index 0)
+    look_token_indices: list            # retained for compatibility; proposal-mode stores None
     round_actions: list                 # ["look"|"click", ...] aligned with rounds
     round_generated_token_ids: list     # [list[int], ...] LM-generated reasoning continuation tokens
     round_raw_responses: list           # raw generated assistant content per round
@@ -254,12 +257,52 @@ class GRPOTrainer:
         ).squeeze(-1)
         return token_log_probs.sum()
 
+    @staticmethod
+    def _attn_np(attn: torch.Tensor):
+        return attn.detach().cpu().float().numpy()
+
+    def _fallback_bbox_from_point(self, img, center_x, center_y):
+        _, fallback_bbox = crop_image(
+            img,
+            center_x,
+            center_y,
+            crop_size=self.ga.crop_size,
+            crop_upscale=self.ga.crop_upscale,
+        )
+        return fallback_bbox
+
+    def _proposal_bbox_from_attn(
+        self,
+        img,
+        img_attn_2d: torch.Tensor,
+        *,
+        parent_bbox=(0.0, 0.0, 1.0, 1.0),
+        fallback_center=None,
+    ):
+        try:
+            proposal_bbox, _, _ = select_top_proposal_bbox(
+                self._attn_np(img_attn_2d),
+                parent_bbox=parent_bbox,
+            )
+        except Exception:
+            if fallback_center is None:
+                raise
+            proposal_bbox = self._fallback_bbox_from_point(
+                img, fallback_center[0], fallback_center[1]
+            )
+        _, proposal_bbox = crop_image_bbox(
+            img,
+            proposal_bbox,
+            target_pixels=self.ga.low_res_max_pixels,
+        )
+        return proposal_bbox
+
     def _build_reasoning_context(
         self,
         sample,
         img,
         history_used_responses,
-        history_points,
+        history_crop_bboxes,
         *,
         current_crop=None,
         current_bbox=None,
@@ -286,13 +329,11 @@ class GRPOTrainer:
             )
 
         for hist_idx in range(1, len(history_used_responses)):
-            prev_px, prev_py = history_points[hist_idx - 1]
-            prev_crop, prev_bbox = crop_image(
+            prev_crop_bbox = history_crop_bboxes[hist_idx - 1]
+            prev_crop, prev_bbox = crop_image_bbox(
                 img,
-                prev_px,
-                prev_py,
-                crop_size=self.ga.crop_size,
-                crop_upscale=self.ga.crop_upscale,
+                prev_crop_bbox,
+                target_pixels=self.ga.low_res_max_pixels,
             )
             r_inputs, cur_text, cur_images = self.builder.extend_with_crop(
                 cur_text,
@@ -353,7 +394,7 @@ class GRPOTrainer:
     # -- generate one trajectory (sampling) -----------------------------------
 
     def _generate_trajectory(self, sample, img) -> Optional[Trajectory]:
-        """Run one free-reasoning trajectory with sampled LM reasoning and action heads."""
+        """Run one free-reasoning trajectory with proposal-based look crops."""
         device = _get_model_device(self.model)
         bbox_gt = sample["bbox_gt"]
         img_tok = self.model.config.image_token_id
@@ -392,7 +433,6 @@ class GRPOTrainer:
                     do_sample=True,
                 )
 
-                round_crop_bboxes.append(None)
                 round_actions.append(parsed.action)
                 round_generated_token_ids.append(gen_ids)
                 round_raw_responses.append(parsed.raw_content)
@@ -412,25 +452,22 @@ class GRPOTrainer:
                 except Exception:
                     return None
             else:
-                prev_focus = round_preds[-1]
-                if prev_focus is None:
+                if ri - 1 >= len(round_crop_bboxes):
                     return None
-                cropped, crop_bbox = crop_image(
+                current_request_bbox = round_crop_bboxes[ri - 1]
+                cropped, crop_bbox = crop_image_bbox(
                     img,
-                    prev_focus[0],
-                    prev_focus[1],
-                    crop_size=self.ga.crop_size,
-                    crop_upscale=self.ga.crop_upscale,
+                    current_request_bbox,
+                    target_pixels=self.ga.low_res_max_pixels,
                 )
 
                 history_responses = list(round_used_responses)
-                history_points = list(round_preds)
                 try:
                     prompt_inputs, _, _ = self._build_reasoning_context(
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        round_crop_bboxes[:ri - 1],
                         current_crop=cropped,
                         current_bbox=crop_bbox,
                         for_generation=True,
@@ -444,7 +481,6 @@ class GRPOTrainer:
                     do_sample=True,
                 )
 
-                round_crop_bboxes.append(crop_bbox)
                 round_actions.append(parsed.action)
                 round_generated_token_ids.append(gen_ids)
                 round_raw_responses.append(parsed.raw_content)
@@ -458,7 +494,7 @@ class GRPOTrainer:
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        round_crop_bboxes[:ri - 1],
                         current_crop=cropped,
                         current_bbox=crop_bbox,
                         current_response=parsed.used_content,
@@ -489,14 +525,22 @@ class GRPOTrainer:
 
             if ri == 0:
                 nh0, nw0 = grid_dims[0]
-                _, _, logits = self.model.dual_head.look(vis_embeds, anchor)
-                logits_1d = logits.squeeze(0) / temperature
-                probs = F.softmax(logits_1d, dim=-1)
-                sampled_idx = torch.multinomial(probs, 1).item()
-                pred_x = ((sampled_idx % nw0) + 0.5) / nw0
-                pred_y = ((sampled_idx // nw0) + 0.5) / nh0
-                round_preds.append((pred_x, pred_y))
-                look_token_indices.append(sampled_idx)
+                attn0, _, _ = self.model.dual_head.look(vis_embeds, anchor)
+                attn_1d = attn0.squeeze(0)
+                n_low = vis_ranges[0][1]
+                low_attn = attn_1d[:n_low]
+                best_idx = low_attn.argmax().item()
+                low_attn_2d = low_attn.view(nh0, nw0)
+                peak_x, peak_y = token_to_spatial(best_idx, nw0, nh0, attn_weights=low_attn)
+                proposal_bbox = self._proposal_bbox_from_attn(
+                    img,
+                    low_attn_2d,
+                    parent_bbox=(0.0, 0.0, 1.0, 1.0),
+                    fallback_center=(peak_x, peak_y),
+                )
+                round_preds.append(box_center(proposal_bbox))
+                round_crop_bboxes.append(proposal_bbox)
+                look_token_indices.append(None)
                 continue
 
             n_total = vis_embeds.shape[0]
@@ -574,21 +618,31 @@ class GRPOTrainer:
                     reward=0.0,
                 )
 
-            _, _, logits = self.model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-            logits_1d = logits.squeeze(0) / temperature
-            probs = F.softmax(logits_1d, dim=-1)
-            sampled_idx = torch.multinomial(probs, 1).item()
-            img_idx, local_sampled = self._locate_visual_token(sampled_idx, vis_ranges)
-            if img_idx is None or img_idx >= len(grid_dims) or img_idx >= len(self.builder.image_infos):
+            attn_ri, _, _ = self.model.dual_head.look(vis_embeds, anchor, mask=full_mask)
+            attn_1d = attn_ri.squeeze(0)
+            img_idx, local_idx = identify_attended_image(attn_1d, vis_ranges)
+            if img_idx >= len(grid_dims) or img_idx >= len(self.builder.image_infos):
                 return None
 
             nh_a, nw_a = grid_dims[img_idx]
+            off_a, n_a = vis_ranges[img_idx]
             info = self.builder.image_infos[img_idx]
+            img_attn = attn_1d[off_a:off_a + n_a]
             bx1, by1, bx2, by2 = info.global_bbox
-            pred_x = bx1 + (((local_sampled % nw_a) + 0.5) / nw_a) * (bx2 - bx1)
-            pred_y = by1 + (((local_sampled // nw_a) + 0.5) / nh_a) * (by2 - by1)
-            round_preds.append((pred_x, pred_y))
-            look_token_indices.append(sampled_idx)
+            lx, ly = token_to_spatial(local_idx, nw_a, nh_a, attn_weights=img_attn)
+            fallback_center = (
+                bx1 + lx * (bx2 - bx1),
+                by1 + ly * (by2 - by1),
+            )
+            next_bbox = self._proposal_bbox_from_attn(
+                img,
+                img_attn.view(nh_a, nw_a),
+                parent_bbox=info.global_bbox,
+                fallback_center=fallback_center,
+            )
+            round_preds.append(box_center(next_bbox))
+            round_crop_bboxes.append(next_bbox)
+            look_token_indices.append(None)
 
         click_pred = next((p for p in reversed(round_preds) if p is not None), (0.5, 0.5))
         hit = point_in_bbox(click_pred[0], click_pred[1], bbox_gt)
@@ -753,7 +807,6 @@ class GRPOTrainer:
 
         for ri in range(traj.n_rounds):
             history_responses = traj.round_used_responses[:ri]
-            history_points = [p for p in traj.round_preds[:ri] if p is not None]
 
             if ri == 0:
                 try:
@@ -761,38 +814,33 @@ class GRPOTrainer:
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        [],
                         for_generation=True,
                     )
                     r_inputs, _, _ = self._build_reasoning_context(
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        [],
                         current_response=traj.round_used_responses[ri],
                     )
                 except Exception:
                     return None
             else:
-                prev_focus = traj.round_preds[ri - 1]
-                if prev_focus is None:
+                if ri - 1 >= len(traj.round_crop_bboxes):
                     return None
-                cropped, _ = crop_image(
+                current_request_bbox = traj.round_crop_bboxes[ri - 1]
+                cropped, crop_bbox = crop_image_bbox(
                     img,
-                    prev_focus[0],
-                    prev_focus[1],
-                    crop_size=self.ga.crop_size,
-                    crop_upscale=self.ga.crop_upscale,
+                    current_request_bbox,
+                    target_pixels=self.ga.low_res_max_pixels,
                 )
-                crop_bbox = traj.round_crop_bboxes[ri]
-                if crop_bbox is None:
-                    return None
                 try:
                     prompt_inputs, _, _ = self._build_reasoning_context(
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        traj.round_crop_bboxes[:ri - 1],
                         current_crop=cropped,
                         current_bbox=crop_bbox,
                         for_generation=True,
@@ -801,7 +849,7 @@ class GRPOTrainer:
                         sample,
                         img,
                         history_responses,
-                        history_points,
+                        traj.round_crop_bboxes[:ri - 1],
                         current_crop=cropped,
                         current_bbox=crop_bbox,
                         current_response=traj.round_used_responses[ri],
@@ -836,17 +884,11 @@ class GRPOTrainer:
             grid_dims = self.builder.get_image_grid_dims(inp["image_grid_thw"], merge)
             if ri == 0:
                 nh0, nw0 = grid_dims[0]
-                _, _, logits = self.model.dual_head.look(vis_embeds, anchor)
-                logits_1d = logits.squeeze(0) / temperature
-                sampled_idx = traj.look_token_indices[ri]
-                if sampled_idx is None or sampled_idx >= logits_1d.shape[0]:
-                    return None
-                total_log_prob = total_log_prob + F.log_softmax(logits_1d, dim=-1)[sampled_idx]
                 continue
 
-            crop_bbox = traj.round_crop_bboxes[ri]
-            if crop_bbox is None or nh0 is None or nw0 is None:
+            if nh0 is None or nw0 is None:
                 return None
+            crop_bbox = traj.round_crop_bboxes[ri - 1]
             n_total = vis_embeds.shape[0]
             n_low = vis_ranges[0][1]
             latest_img_idx = len(vis_ranges) - 1
@@ -883,13 +925,6 @@ class GRPOTrainer:
                     traj.click_token_index
                 ]
                 break
-
-            _, _, logits = self.model.dual_head.look(vis_embeds, anchor, mask=full_mask)
-            logits_1d = logits.squeeze(0) / temperature
-            sampled_idx = traj.look_token_indices[ri]
-            if sampled_idx is None or sampled_idx >= logits_1d.shape[0]:
-                return None
-            total_log_prob = total_log_prob + F.log_softmax(logits_1d, dim=-1)[sampled_idx]
 
         kl_penalty = torch.tensor(0.0, device=device)
         if self.ga.kl_coeff > 0 and self.ref_dual_head is not None:
