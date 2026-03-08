@@ -163,6 +163,7 @@ class ScriptArgs:
     # Loss weights
     lm_loss_weight: float = field(default=0.5, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
+    look_overlap_loss_weight: float = field(default=1.0, metadata={"help": "Weight for low-res revisit penalty during LookHead saccades."})
     click_loss_weight: float = field(default=4.0, metadata={"help": "Weight for ClickHead KL loss."})
     lm_reasoning_token_weight: float = field(default=0.1, metadata={"help": "Weight for ordinary reasoning tokens in LM loss."})
     lm_format_token_weight: float = field(default=0.5, metadata={"help": "Weight for pointer boundary and EOS tokens in LM loss."})
@@ -405,6 +406,7 @@ class SaccadeTrainer:
         total_loss_value = 0.0  # scalar for logging only
         lm_loss_value = 0.0
         look_loss_value = 0.0
+        look_overlap_loss_value = 0.0
         click_loss_value = 0.0
         n_valid = 0
         round_preds = []
@@ -680,6 +682,9 @@ class SaccadeTrainer:
 
                 # Mask: current crop overlap in low-res + old crop tokens
                 this_crop_mask = compute_overlap_mask(nh0, nw0, crop_bbox)
+                visited_low_mask = torch.zeros(nh0 * nw0, dtype=torch.bool)
+                for prev_bbox in round_crop_bboxes:
+                    visited_low_mask |= compute_overlap_mask(nh0, nw0, prev_bbox)
                 full_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
                 full_mask[:n_low] = this_crop_mask.to(device)
                 for prev_i in range(1, latest_img_idx):
@@ -814,6 +819,14 @@ class SaccadeTrainer:
                             round_loss = round_loss + self.sa.look_loss_weight * look_loss
                             look_loss_value += self.sa.look_loss_weight * look_loss.item()
                             n_valid += 1
+
+                        if self.sa.look_overlap_loss_weight > 0 and visited_low_mask.any():
+                            low_attn = attn.squeeze(0)[:n_low]
+                            overlap_penalty = low_attn[visited_low_mask.to(device)].sum()
+                            round_loss = round_loss + self.sa.look_overlap_loss_weight * overlap_penalty
+                            look_overlap_loss_value += (
+                                self.sa.look_overlap_loss_weight * overlap_penalty.item()
+                            )
                     else:
                         with torch.no_grad():
                             attn, _, _ = self.model.dual_head.look(
@@ -862,12 +875,13 @@ class SaccadeTrainer:
             pass
 
         # Loss was already backward'd each round; return a sample-level
-        # decomposition with a shared denominator so total = lm + look + click.
+        # decomposition with a shared denominator so total = lm + look + overlap + click.
         denom = max(n_valid, 1)
         loss_parts = {
-            "total": (lm_loss_value + look_loss_value + click_loss_value) / denom,
+            "total": (lm_loss_value + look_loss_value + look_overlap_loss_value + click_loss_value) / denom,
             "lm": lm_loss_value / denom,
             "look": look_loss_value / denom,
+            "look_overlap": look_overlap_loss_value / denom,
             "click": click_loss_value / denom,
         }
         return loss_parts["total"], n_valid, round_preds, click_pred, loss_parts
@@ -898,6 +912,7 @@ class SaccadeTrainer:
             self.metrics["total_loss"].append(loss_parts["total"])
             self.metrics["lm_loss"].append(loss_parts["lm"])
             self.metrics["look_loss"].append(loss_parts["look"])
+            self.metrics["look_overlap_loss"].append(loss_parts["look_overlap"])
             self.metrics["click_loss"].append(loss_parts["click"])
         return loss if nv > 0 else 0.0, nv
 
@@ -933,6 +948,7 @@ class SaccadeTrainer:
                   f"max_saccade_rounds={self.sa.max_saccade_rounds}")
             print(f"  click_phase_step={self.sa.click_phase_step} (ClickHead starts at step {self.sa.click_phase_step})")
             print(f"  lm_loss_weight={self.sa.lm_loss_weight}  look_loss_weight={self.sa.look_loss_weight}  "
+                  f"look_overlap_loss_weight={self.sa.look_overlap_loss_weight}  "
                   f"click_loss_weight={self.sa.click_loss_weight}")
             print(f"  lm_token_weights: reason={self.sa.lm_reasoning_token_weight} "
                   f"format={self.sa.lm_format_token_weight} "
@@ -1003,6 +1019,7 @@ class SaccadeTrainer:
                         loss=f"{ar_recent('total_loss', loss_val):.3f}" if (self.metrics["total_loss"] or loss_val is not None) else "-",
                         lm=f"{ar_recent('lm_loss', 0.0):.3f}" if self.metrics["lm_loss"] else "-",
                         look=f"{ar_recent('look_loss', 0.0):.3f}" if self.metrics["look_loss"] else "-",
+                        ovlp=f"{ar_recent('look_overlap_loss', 0.0):.3f}" if self.metrics["look_overlap_loss"] else "-",
                         click=f"{ar_recent('click_loss', 0.0):.3f}" if self.metrics["click_loss"] else "-",
                         hit=f"{ar_recent('hit_rate', 0.0):.1%}" if self.metrics["hit_rate"] else "-",
                         rounds=f"{ar_recent('avg_rounds', 0.0):.1f}" if self.metrics["avg_rounds"] else "-",
@@ -1028,9 +1045,14 @@ class SaccadeTrainer:
                         )
                         lm_str = f" lm={ar('lm_loss'):.3f}" if self.metrics["lm_loss"] else ""
                         look_str = f" look={ar('look_loss'):.3f}" if self.metrics["look_loss"] else ""
+                        ovlp_str = (
+                            f" ovlp={ar('look_overlap_loss'):.3f}"
+                            if self.metrics["look_overlap_loss"]
+                            else ""
+                        )
                         click_str = f" click={ar('click_loss'):.3f}" if self.metrics["click_loss"] else ""
                         phase = "Look+Click" if self.in_click_phase else "Look"
-                        print(f"  [Step {self.global_step}] [{phase}]{loss_str}{lm_str}{look_str}{click_str} "
+                        print(f"  [Step {self.global_step}] [{phase}]{loss_str}{lm_str}{look_str}{ovlp_str}{click_str} "
                               f"hit={ar('hit_rate'):.1%} dist={ar('avg_dist'):.4f} "
                               f"rounds={ar('avg_rounds'):.1f} "
                               f"crop_rounds={ar('crop_rounds'):.1f} vis_tok={ar('vis_tokens'):.0f} "

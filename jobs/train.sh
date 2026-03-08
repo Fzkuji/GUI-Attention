@@ -31,6 +31,7 @@ Options:
   --append_assistant_eos true|false
   --lm_loss_weight FLOAT
   --look_loss_weight FLOAT
+  --look_overlap_loss_weight FLOAT
   --click_loss_weight FLOAT
   --lm_reasoning_token_weight FLOAT
   --lm_format_token_weight FLOAT
@@ -51,6 +52,7 @@ FREE_REASONING_SFT="${FREE_REASONING_SFT:-true}"
 APPEND_ASSISTANT_EOS="${APPEND_ASSISTANT_EOS:-true}"
 LM_LOSS_WEIGHT="${LM_LOSS_WEIGHT:-0.5}"
 LOOK_LOSS_WEIGHT="${LOOK_LOSS_WEIGHT:-1.0}"
+LOOK_OVERLAP_LOSS_WEIGHT="${LOOK_OVERLAP_LOSS_WEIGHT:-1.0}"
 CLICK_LOSS_WEIGHT="${CLICK_LOSS_WEIGHT:-4.0}"
 LM_REASONING_TOKEN_WEIGHT="${LM_REASONING_TOKEN_WEIGHT:-0.1}"
 LM_FORMAT_TOKEN_WEIGHT="${LM_FORMAT_TOKEN_WEIGHT:-0.5}"
@@ -93,6 +95,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --look_loss_weight)
             LOOK_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --look_overlap_loss_weight)
+            LOOK_OVERLAP_LOSS_WEIGHT="$2"
             shift 2
             ;;
         --click_loss_weight)
@@ -227,6 +233,7 @@ torchrun --nproc_per_node=$NUM_GPUS \
     --lora_lr 5e-5 \
     --lm_loss_weight "$LM_LOSS_WEIGHT" \
     --look_loss_weight "$LOOK_LOSS_WEIGHT" \
+    --look_overlap_loss_weight "$LOOK_OVERLAP_LOSS_WEIGHT" \
     --click_loss_weight "$CLICK_LOSS_WEIGHT" \
     --lm_reasoning_token_weight "$LM_REASONING_TOKEN_WEIGHT" \
     --lm_format_token_weight "$LM_FORMAT_TOKEN_WEIGHT" \
