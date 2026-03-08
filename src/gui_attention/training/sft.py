@@ -984,6 +984,33 @@ class SaccadeTrainer:
                     if self.rank == 0 and self.global_step == self.sa.click_phase_step:
                         print(f"  *** Step {self.global_step}: ClickHead activated ***")
 
+                if self.rank == 0:
+                    n_recent = max(self.args.logging_steps * ga * self.world_size * bs, 1)
+
+                    def ar_recent(k, default=None):
+                        vals = self.metrics[k][-n_recent:]
+                        if vals:
+                            return sum(vals) / len(vals)
+                        return default
+
+                    all_lrs = self.scheduler.get_last_lr()
+                    lr_val = all_lrs[0]
+                    bb_lr_val = all_lrs[1] if len(all_lrs) > 1 else lr_val
+                    phase = "Look+Click" if self.in_click_phase else "Look"
+                    pbar.set_postfix(
+                        step=self.global_step,
+                        phase=phase,
+                        loss=f"{ar_recent('total_loss', loss_val):.3f}" if (self.metrics["total_loss"] or loss_val is not None) else "-",
+                        lm=f"{ar_recent('lm_loss', 0.0):.3f}" if self.metrics["lm_loss"] else "-",
+                        look=f"{ar_recent('look_loss', 0.0):.3f}" if self.metrics["look_loss"] else "-",
+                        click=f"{ar_recent('click_loss', 0.0):.3f}" if self.metrics["click_loss"] else "-",
+                        hit=f"{ar_recent('hit_rate', 0.0):.1%}" if self.metrics["hit_rate"] else "-",
+                        rounds=f"{ar_recent('avg_rounds', 0.0):.1f}" if self.metrics["avg_rounds"] else "-",
+                        head_lr=f"{lr_val:.2e}",
+                        bb_lr=f"{bb_lr_val:.2e}",
+                        refresh=False,
+                    )
+
                 # Logging
                 if self.rank == 0 and self.global_step % self.args.logging_steps == 0:
                     if micro % ga == 0:
