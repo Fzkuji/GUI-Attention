@@ -104,6 +104,42 @@ def _iter_annotation_files(data_dir: Path) -> Iterable[Path]:
     yield from sorted(data_dir.rglob("*.json"))
 
 
+def _resolve_image_path(
+    *,
+    root: Path,
+    data_dir: Path,
+    ann_path: Path,
+    rel_image: str,
+    basename_cache: dict[str, Path | None],
+) -> Path | None:
+    rel_path = Path(str(rel_image))
+    candidates: list[Path] = []
+    if rel_path.is_absolute():
+        candidates.append(rel_path)
+    candidates.extend([
+        data_dir / rel_path,
+        root / rel_path,
+        ann_path.parent / rel_path,
+        ann_path.parent / rel_path.name,
+        ann_path.with_suffix(rel_path.suffix or ".png"),
+        ann_path.with_suffix(".png"),
+        ann_path.with_suffix(".jpg"),
+        ann_path.with_suffix(".jpeg"),
+        ann_path.with_suffix(".webp"),
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    basename = rel_path.name
+    if basename:
+        if basename not in basename_cache:
+            matches = list(root.rglob(basename))
+            basename_cache[basename] = matches[0].resolve() if matches else None
+        return basename_cache[basename]
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -147,6 +183,7 @@ def main() -> None:
     images_seen = 0
     missing_images = 0
     skipped_boxes = 0
+    basename_cache: dict[str, Path | None] = {}
 
     for ann_path in _iter_annotation_files(data_dir):
         files_seen += 1
@@ -158,8 +195,14 @@ def main() -> None:
         rel_image = entries[0].get("image_path")
         if not rel_image:
             continue
-        image_path = data_dir / rel_image
-        if not image_path.exists():
+        image_path = _resolve_image_path(
+            root=root,
+            data_dir=data_dir,
+            ann_path=ann_path,
+            rel_image=rel_image,
+            basename_cache=basename_cache,
+        )
+        if image_path is None or not image_path.exists():
             missing_images += 1
             continue
 
@@ -175,7 +218,7 @@ def main() -> None:
             instruction = _make_instruction(entry, rng)
             image_samples.append(
                 {
-                    "image": rel_image,
+                    "image": str(image_path),
                     "conversations": [
                         {"from": "human", "value": f"<image>\n{instruction}"},
                         {"from": "assistant", "value": "", "bbox_gt": bbox},
