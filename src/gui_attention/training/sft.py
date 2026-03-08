@@ -65,9 +65,9 @@ def make_lm_labels_and_weights(
     tokenizer,
     round_idx=0,
     *,
-    reasoning_weight=0.2,
-    format_weight=1.0,
-    look_weight=1.5,
+    reasoning_weight=0.1,
+    format_weight=0.5,
+    look_weight=1.0,
     click_weight=2.0,
 ):
     """Create per-round LM labels plus token weights for weighted CE."""
@@ -164,9 +164,9 @@ class ScriptArgs:
     lm_loss_weight: float = field(default=0.5, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
     click_loss_weight: float = field(default=2.0, metadata={"help": "Weight for ClickHead KL loss."})
-    lm_reasoning_token_weight: float = field(default=0.2, metadata={"help": "Weight for ordinary reasoning tokens in LM loss."})
-    lm_format_token_weight: float = field(default=1.0, metadata={"help": "Weight for pointer boundary and EOS tokens in LM loss."})
-    lm_look_token_weight: float = field(default=1.5, metadata={"help": "Weight for <look_pad> in LM loss."})
+    lm_reasoning_token_weight: float = field(default=0.1, metadata={"help": "Weight for ordinary reasoning tokens in LM loss."})
+    lm_format_token_weight: float = field(default=0.5, metadata={"help": "Weight for pointer boundary and EOS tokens in LM loss."})
+    lm_look_token_weight: float = field(default=1.0, metadata={"help": "Weight for <look_pad> in LM loss."})
     lm_click_token_weight: float = field(default=2.0, metadata={"help": "Weight for <pointer_pad> click token in LM loss."})
     # LoRA
     use_lora: bool = field(default=True)
