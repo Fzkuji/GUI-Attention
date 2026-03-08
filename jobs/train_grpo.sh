@@ -12,6 +12,28 @@
 
 set -e
 
+usage() {
+    cat <<'EOF'
+Usage:
+  bash jobs/train_grpo.sh [options]
+
+Options:
+  --num_gpus N
+  --sft_ckpt PATH
+  --base_model PATH
+  --output_dir PATH
+  --group_size N
+  --save_steps N
+  --reasoning_max_new_tokens N
+  --reward_round_penalty FLOAT
+  --reward_format FLOAT
+  --reward_malformed_penalty FLOAT
+  --help
+
+Environment variables are still supported, but CLI flags take precedence.
+EOF
+}
+
 NUM_GPUS="${NUM_GPUS:-8}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 SAVE_STEPS="${SAVE_STEPS:-50}"
@@ -19,6 +41,63 @@ REASONING_MAX_NEW_TOKENS="${REASONING_MAX_NEW_TOKENS:-48}"
 REWARD_ROUND_PENALTY="${REWARD_ROUND_PENALTY:-0.02}"
 REWARD_FORMAT="${REWARD_FORMAT:-0.05}"
 REWARD_MALFORMED_PENALTY="${REWARD_MALFORMED_PENALTY:-0.05}"
+SFT_CKPT="${SFT_CKPT:-}"
+BASE_MODEL="${BASE_MODEL:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --num_gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
+        --sft_ckpt)
+            SFT_CKPT="$2"
+            shift 2
+            ;;
+        --base_model)
+            BASE_MODEL="$2"
+            shift 2
+            ;;
+        --output_dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --group_size)
+            GROUP_SIZE="$2"
+            shift 2
+            ;;
+        --save_steps)
+            SAVE_STEPS="$2"
+            shift 2
+            ;;
+        --reasoning_max_new_tokens)
+            REASONING_MAX_NEW_TOKENS="$2"
+            shift 2
+            ;;
+        --reward_round_penalty)
+            REWARD_ROUND_PENALTY="$2"
+            shift 2
+            ;;
+        --reward_format)
+            REWARD_FORMAT="$2"
+            shift 2
+            ;;
+        --reward_malformed_penalty)
+            REWARD_MALFORMED_PENALTY="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 CODE_DIR=$(dirname "$SCRIPT_DIR")
