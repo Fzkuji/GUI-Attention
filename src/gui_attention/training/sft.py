@@ -163,7 +163,7 @@ class ScriptArgs:
     # Loss weights
     lm_loss_weight: float = field(default=0.5, metadata={"help": "Weight for LM (next-token prediction) loss."})
     look_loss_weight: float = field(default=1.0, metadata={"help": "Weight for LookHead KL loss."})
-    click_loss_weight: float = field(default=2.0, metadata={"help": "Weight for ClickHead KL loss."})
+    click_loss_weight: float = field(default=4.0, metadata={"help": "Weight for ClickHead KL loss."})
     lm_reasoning_token_weight: float = field(default=0.1, metadata={"help": "Weight for ordinary reasoning tokens in LM loss."})
     lm_format_token_weight: float = field(default=0.5, metadata={"help": "Weight for pointer boundary and EOS tokens in LM loss."})
     lm_look_token_weight: float = field(default=1.0, metadata={"help": "Weight for <look_pad> in LM loss."})
