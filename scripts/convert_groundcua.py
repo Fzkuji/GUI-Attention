@@ -22,11 +22,16 @@ import json
 import os
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
 from PIL import Image, UnidentifiedImageError
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 TEXT_TEMPLATES = (
@@ -289,9 +294,12 @@ def main() -> None:
     basename_cache: dict[str, Path | None] = {}
     cache_lock = threading.Lock()
 
+    print(f"Processing {files_seen} annotation files with {max(1, args.workers)} workers...")
+
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        for result in executor.map(
-            lambda ann_path: _process_annotation_file(
+        futures = [
+            executor.submit(
+                _process_annotation_file,
                 ann_path,
                 root=root,
                 data_dir=data_dir,
@@ -299,9 +307,14 @@ def main() -> None:
                 base_seed=args.seed,
                 basename_cache=basename_cache,
                 cache_lock=cache_lock,
-            ),
-            ann_files,
-        ):
+            )
+            for ann_path in ann_files
+        ]
+        future_iter = as_completed(futures)
+        if tqdm is not None:
+            future_iter = tqdm(future_iter, total=len(futures), desc="GroundCUA convert")
+        for future in future_iter:
+            result = future.result()
             images_seen += int(result["converted"])
             missing_images += int(result["missing"])
             unreadable_images += int(result["unreadable"])
