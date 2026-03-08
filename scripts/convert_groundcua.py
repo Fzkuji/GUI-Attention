@@ -22,7 +22,7 @@ import random
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 
 TEXT_TEMPLATES = (
@@ -182,6 +182,7 @@ def main() -> None:
     files_seen = 0
     images_seen = 0
     missing_images = 0
+    unreadable_images = 0
     skipped_boxes = 0
     basename_cache: dict[str, Path | None] = {}
 
@@ -206,8 +207,12 @@ def main() -> None:
             missing_images += 1
             continue
 
-        with Image.open(image_path) as img:
-            width, height = img.size
+        try:
+            with Image.open(image_path) as img:
+                width, height = img.size
+        except (UnidentifiedImageError, OSError):
+            unreadable_images += 1
+            continue
 
         image_samples = []
         for entry in entries:
@@ -244,6 +249,7 @@ def main() -> None:
     print(f"Annotation files scanned: {files_seen}")
     print(f"Images converted: {images_seen}")
     print(f"Missing images skipped: {missing_images}")
+    print(f"Unreadable images skipped: {unreadable_images}")
     print(f"Invalid bboxes skipped: {skipped_boxes}")
     print(f"Samples written: {len(samples)}")
     print(f"Output: {output_path}")
