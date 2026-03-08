@@ -159,17 +159,21 @@ IMAGE_FOLDERS=""
 PER_DS_LIMITS=""
 for entry in "${ALL_DATASETS[@]}"; do
     IFS=':' read -r json_file img_dir limit <<< "$entry"
+    actual_img_dir="$img_dir"
+    if [ "$json_file" = "groundcua_bbox.json" ] && [ ! -d "$DATA_DIR/$img_dir" ] && [ -d "$DATA_DIR/GroundCUA" ]; then
+        actual_img_dir="GroundCUA"
+    fi
     if [ -f "$DATA_DIR/$json_file" ]; then
         if [ -n "$DATA_PATHS" ]; then
             DATA_PATHS="$DATA_PATHS,$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$img_dir"
+            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$actual_img_dir"
             PER_DS_LIMITS="$PER_DS_LIMITS,$limit"
         else
             DATA_PATHS="$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$DATA_DIR/$img_dir"
+            IMAGE_FOLDERS="$DATA_DIR/$actual_img_dir"
             PER_DS_LIMITS="$limit"
         fi
-        echo "  ✓ $json_file (limit=$limit)"
+        echo "  ✓ $json_file -> $actual_img_dir (limit=$limit)"
     else
         echo "  ✗ $json_file (not found, skipping)"
     fi
