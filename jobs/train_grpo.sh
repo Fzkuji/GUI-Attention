@@ -123,6 +123,7 @@ declare -a ALL_DATASETS=(
     "guiact_bbox.json:GUIAct/GUIAct/web_imgs:0"
     "androidcontrol_bbox.json:AndroidControl/AndroidControl/tfrecord/images:0"
     "wave_ui_bbox.json:Wave-UI/Wave-UI/images_fixed:0"
+    "groundcua_bbox.json:GroundCUA/data:120000"
     "uground_bbox.json:Uground/Uground/images:60000"
     "gta/gta_data/gta_data_wo_web.json:gta/gta_data/image:60000"
 )
@@ -132,17 +133,21 @@ IMAGE_FOLDERS=""
 PER_DS_LIMITS=""
 for entry in "${ALL_DATASETS[@]}"; do
     IFS=':' read -r json_file img_dir limit <<< "$entry"
+    actual_img_dir="$img_dir"
+    if [ "$json_file" = "groundcua_bbox.json" ] && [ ! -d "$DATA_DIR/$img_dir" ] && [ -d "$DATA_DIR/GroundCUA" ]; then
+        actual_img_dir="GroundCUA"
+    fi
     if [ -f "$DATA_DIR/$json_file" ]; then
         if [ -n "$DATA_PATHS" ]; then
             DATA_PATHS="$DATA_PATHS,$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$img_dir"
+            IMAGE_FOLDERS="$IMAGE_FOLDERS,$DATA_DIR/$actual_img_dir"
             PER_DS_LIMITS="$PER_DS_LIMITS,$limit"
         else
             DATA_PATHS="$DATA_DIR/$json_file"
-            IMAGE_FOLDERS="$DATA_DIR/$img_dir"
+            IMAGE_FOLDERS="$DATA_DIR/$actual_img_dir"
             PER_DS_LIMITS="$limit"
         fi
-        echo "  ✓ $json_file (limit=$limit)"
+        echo "  ✓ $json_file -> $actual_img_dir (limit=$limit)"
     else
         echo "  ✗ $json_file (not found, skipping)"
     fi
