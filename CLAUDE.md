@@ -20,6 +20,27 @@
 - 最终 `ClickHead` 只在高分辨 crop 证据上做精点击
 - 低分辨全图更偏向用于探索 / stop 决策
 
+## 1.1 当前版本线
+
+当前真正还在维护和对比的版本线有四条：
+
+- `GUI-Actor-3B-Qwen2.5-VL`  
+  原始 baseline。
+
+- `ours_v15_dual`  
+  当前最核心的 SFT 主线。当前所有“proposal-based look crop + 双头 + free reasoning”都默认指这条。
+
+- `ours_grpo`  
+  以 `ours_v15_dual` 为初始化的 GRPO 主线。
+
+- `ours_v15_dual_groundcua`  
+  当前准备做的高分辨桌面适配二阶段 SFT 线。
+
+建议：
+
+- 后续不要继续把不同实验都堆到 `ours_v15_dual` 一个目录里
+- 新方向统一开独立输出目录
+
 ## 2. 代码入口
 
 ### SFT
@@ -222,6 +243,14 @@ cp -aL snapshot/. GroundCUA/
 - `51174` images converted
 - `3197522` samples written
 
+当前更推荐的训练策略不是直接全量硬上，而是：
+
+- 先全量转换保留 JSON
+- 训练时先做：
+  - `60000`
+  - `120000`
+  的二阶段 SFT 快速实验
+
 ## 7. 可视化约定
 
 ### 7.1 当前可视化能看什么
@@ -316,6 +345,13 @@ GRPO 第一版继续坚持：
 
 - 系统取 top-1 proposal
 - 模型只学 `look / click`
+
+更具体的执行顺序：
+
+1. 从 `ours_v15_dual/checkpoint-1500` 用 `--init_ckpt` 启动 `GroundCUA` 二阶段 SFT  
+2. 训练期间同时看训练集和 `ScreenSpot-Pro` 可视化  
+3. 再做 `ScreenSpot-Pro / v2` 对照评估  
+4. 如果 `v2` 还稳、`Pro` 仍差，再推进 GRPO
 
 ## 11. 常见坑
 

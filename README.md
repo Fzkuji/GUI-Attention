@@ -28,6 +28,19 @@
 - `ScreenSpot-Pro` 仍明显偏低
 - 当前主要问题更像是 **探索 / stop policy**，不是基础点击能力完全坏掉
 
+### 当前主要版本 / 输出目录
+
+- `GUI-Actor-3B-Qwen2.5-VL`：原始 baseline
+- `results/ours_v15_dual`：当前最核心的 SFT 主线
+- `results/ours_grpo`：当前 proposal-aligned GRPO 主线
+- `results/ours_v15_dual_groundcua`：准备做的高分辨桌面二阶段 SFT 线
+
+当前最常被引用的 SFT checkpoint：
+
+- `checkpoint-500`
+- `checkpoint-1000`
+- `checkpoint-1500`
+
 ## 2. 目录结构
 
 ```text
@@ -130,6 +143,11 @@ python scripts/convert_groundcua.py \
 
 - `51174` 张图片
 - `3197522` 条训练样本
+
+建议：
+
+- JSON 先全量转换保留
+- 训练时先从 `60000` 或 `120000` 做 quick test
 
 ### 5.3 从 HF cache 复制 GroundCUA 的注意事项
 
@@ -342,3 +360,13 @@ PYTHONPATH=src python eval/visualize_saccade.py \
 2. 再重新评 `ScreenSpot-Pro`
 3. 再继续做 proposal-aligned GRPO
 4. RL 第一版只优化 `look/click`，不要先优化 proposal 选择
+
+更细一点：
+
+1. 从 `results/ours_v15_dual/checkpoint-1500` 用 `--init_ckpt` 启动 `GroundCUA` 单独二阶段 SFT
+2. 训练期间同步看：
+   - `GroundCUA` 训练集可视化
+   - `ScreenSpot-Pro` 可视化
+3. 重点判断是否仍存在大量 `round0 look -> round1 click -> miss`
+4. 再重新评 `ScreenSpot-Pro / ScreenSpot-v2`
+5. 如果 `v2` 基本维持、但 `Pro` 仍差，再继续 proposal-aligned GRPO
