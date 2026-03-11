@@ -1,29 +1,91 @@
 # GUI-Attention
 
-**Saccade Foveation for Efficient GUI Grounding**
+基于 `GUI-Actor-3B-Qwen2.5-VL` 的多轮 GUI grounding 系统。
 
-Multi-round visual search: low-res overview → crop/zoom → refine, inspired by human saccadic eye movement.
+当前主线不是固定方框裁剪，而是：
 
-## Architecture (v15)
+- 第 0 轮：低分辨全图 overview
+- 后续轮次：根据 `LookHead` attention 生成 `top-1 basin proposal bbox`
+- 把该 bbox 裁出后统一 resize 到固定视觉预算
+- 模型生成 `<look_pad>` / `<pointer_pad>` 决定继续看还是点击
+- `ClickHead` 在高分辨证据上做最终点击
 
-- **Base model**: [GUI-Actor-3B-Qwen2.5-VL](https://huggingface.co/microsoft/GUI-Actor-3B-Qwen2.5-VL) (Qwen2.5-VL-3B + pointer head)
-- **Dual Head**: LookHead (where to crop next) + ClickHead (precise click on crop)
-- **Dual Tokens**: `<look_pad>` (explore) / `<pointer_pad>` (commit/click) — model decides autoregressively
-- **LoRA** fine-tuning on backbone, full-param on heads
+## 1. 当前状态
 
+当前版本已经完成：
+
+- 双头结构：`LookHead + ClickHead`
+- `LookHead` / `ClickHead` 都从 GUI-Actor 原始 `pointer_head` 复制初始化
+- proposal-based look crop
+- free-reasoning SFT
+- aligned GRPO（proposal-based look crop）
+- 训练集可视化 / ScreenSpot-Pro 可视化
+- GroundCUA 数据接入和转换
+
+当前最重要的结论：
+
+- `ScreenSpot-v2` 已经接近 GUI-Actor baseline
+- `ScreenSpot-Pro` 仍明显偏低
+- 当前主要问题更像是 **探索 / stop policy**，不是基础点击能力完全坏掉
+
+## 2. 目录结构
+
+```text
+src/gui_attention/
+  inputs/
+    builder.py
+    crop.py
+    labels.py
+  modeling/
+    attention.py
+    dual_head.py
+    model.py
+  runtime/
+    foveation.py
+    inference.py
+    proposals.py
+    reasoning.py
+  training/
+    grpo.py
+    sft.py
+
+eval/
+  eval_screenspot.py
+  eval_train_hit.py
+  visualize_saccade.py
+
+jobs/
+  train.sh
+  train_grpo.sh
 ```
-Round 0: [low-res full image ~1M pixels] [instruction]
-         → LookHead → predict crop center
 
-Round 1+: [low-res full] + [high-res crop ~924×924]
-         → Model generates <look_pad> (saccade) or <pointer_pad> (click)
-         → <look_pad>  → LookHead → next crop
-         → <pointer_pad> → ClickHead → precise click coordinate
+## 3. 当前默认训练配置（SFT）
 
-Stop: model generates <pointer_pad>, or max_rounds reached
-```
+当前 SFT 主设定：
 
-## Setup
+- base model：`GUI-Actor-3B-Qwen2.5-VL`
+- low-res 全图：`1001600` pixels
+- `look` 裁图：`top1_basin_proposal -> resize_to 1001600 pixels`
+- fallback square crop：`308x308 x3 -> 924x924`
+- `max_saccade_rounds = 6`
+- dual tokens：开启
+- free reasoning SFT：开启
+- assistant EOS：开启
+
+当前 loss 权重：
+
+- `lm_loss_weight = 0.5`
+- `look_loss_weight = 1.0`
+- `click_loss_weight = 4.0`
+
+当前 LM token 权重：
+
+- 普通 reasoning token：`0.1`
+- 格式 / EOS：`0.5`
+- `<look_pad>`：`1.0`
+- `<pointer_pad>`：`2.0`
+
+## 4. 安装
 
 ```bash
 git clone https://github.com/Fzkuji/GUI-Attention.git
@@ -31,209 +93,252 @@ cd GUI-Attention
 pip install -e .
 ```
 
-## Training
+## 5. 数据准备
 
-**Important**: Base model must be GUI-Actor (not vanilla Qwen2.5-VL). The backbone hidden states and pointer head weights must match.
+### 5.1 常规数据
+
+`jobs/train.sh` 会自动检测工作区里的这些 JSON：
+
+- `guiact_bbox.json`
+- `androidcontrol_bbox.json`
+- `wave_ui_bbox.json`
+- `groundcua_bbox.json`
+- `uground_bbox.json`
+- `gta/gta_data/gta_data_wo_web.json`
+
+### 5.2 GroundCUA 转换
+
+如果已经把原始 `GroundCUA` 下载到：
 
 ```bash
-# On training server (8× GPU)
+/mnt/data/zichuanfu/GUI-Attention-Workspace/data/GroundCUA
+```
+
+则转换命令：
+
+```bash
 cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
-NUM_GPUS=8 bash jobs/train.sh
+
+python scripts/convert_groundcua.py \
+  --groundcua_dir /mnt/data/zichuanfu/GUI-Attention-Workspace/data/GroundCUA \
+  --output_json /mnt/data/zichuanfu/GUI-Attention-Workspace/data/groundcua_bbox.json \
+  --max_per_image 0 \
+  --workers 16
 ```
 
-Key config in `jobs/train.sh`:
-- `--model_name_or_path`: GUI-Actor-3B-Qwen2.5-VL
-- `--click_head_from`: Same GUI-Actor model (ClickHead init from pointer_head)
-- `--use_dual_tokens true`: Enable `<look_pad>/<pointer_pad>` decision
-- `--click_phase_step 0`: Both heads train from step 0
-- `--low_res_max_pixels 1001600`: Match GUI-Actor's 1M resolution
-- `--crop_size 308 --crop_upscale 3`: 308px crop → ×3 upscale → 924px (1089 tokens)
-- `--max_saccade_rounds 6`: Up to 5 crop rounds + 1 initial
+当前完整转换结果约：
 
-To resume from checkpoint:
+- `51174` 张图片
+- `3197522` 条训练样本
+
+### 5.3 从 HF cache 复制 GroundCUA 的注意事项
+
+如果从 HuggingFace cache 复制到项目数据目录，必须使用：
+
 ```bash
-# Set RESUME_CKPT env var (train.sh passes it as --resume_ckpt)
-RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
+cp -aL <snapshot>/. /mnt/data/zichuanfu/GUI-Attention-Workspace/data/GroundCUA/
 ```
 
-## Evaluation
+不要用 `cp -a`，否则会保留符号链接，导致 `images/*.png` 变成 broken symlink。
 
-All eval scripts also use **GUI-Actor as base model**.
+## 6. 训练
 
-**Important**: Use `--no_adaptive_crop` to match training (fixed crop_size=308×3=924). Default `adaptive_crop=True` uses 756² pixel budget which differs from training.
+### 6.1 主线 SFT 训练
 
 ```bash
-# ScreenSpot-Pro (8 GPU, DDP)
+cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
+
+bash jobs/train.sh --num_gpus 8
+```
+
+### 6.2 真正 resume（恢复训练状态）
+
+```bash
+bash jobs/train.sh \
+  --num_gpus 8 \
+  --resume_ckpt /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500
+```
+
+### 6.3 二阶段初始化继续训（不恢复旧训练状态）
+
+这个场景要用 `--init_ckpt`，不要用 `--resume_ckpt`。
+
+例如只用 `GroundCUA` 做二阶段 SFT：
+
+```bash
+bash jobs/train.sh \
+  --num_gpus 7 \
+  --init_ckpt /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --output_dir /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual_groundcua \
+  --data_paths /mnt/data/zichuanfu/GUI-Attention-Workspace/data/groundcua_bbox.json \
+  --image_folders /mnt/data/zichuanfu/GUI-Attention-Workspace/data/GroundCUA \
+  --max_samples_per_dataset 0
+```
+
+### 6.4 显式指定单个 / 多个数据集
+
+```bash
+bash jobs/train.sh \
+  --num_gpus 8 \
+  --data_paths /path/a.json,/path/b.json \
+  --image_folders /path/images_a,/path/images_b \
+  --max_samples_per_dataset 60000,60000
+```
+
+## 7. GRPO
+
+当前 GRPO 已经和 proposal-based look crop 对齐。
+
+第一版 GRPO 的设计原则是：
+
+- `look` 时系统自动选择 `top-1 proposal bbox`
+- RL 重点优化 `look / click`
+- 不先让 RL 学 proposal 编号选择
+
+命令：
+
+```bash
+cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
+
+bash jobs/train_grpo.sh \
+  --num_gpus 8 \
+  --sft_ckpt /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500
+```
+
+可选参数：
+
+```bash
+bash jobs/train_grpo.sh \
+  --num_gpus 8 \
+  --sft_ckpt /path/to/checkpoint \
+  --output_dir /path/to/output \
+  --group_size 8 \
+  --save_steps 50 \
+  --reasoning_max_new_tokens 48 \
+  --reward_round_penalty 0.02 \
+  --reward_format 0.05 \
+  --reward_malformed_penalty 0.05
+```
+
+## 8. 评估
+
+### 8.1 ScreenSpot-Pro
+
+```bash
+cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
+
 torchrun --nproc_per_node=8 eval/eval_screenspot.py \
-    --dataset pro \
-    --data_dir /path/to/ScreenSpot-Pro \
-    --checkpoint /path/to/checkpoint-500 \
-    --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --rounds 6 \
-    --use_dual_tokens \
-    --no_adaptive_crop
+  --dataset pro \
+  --data_dir /mnt/data/zichuanfu/GUI-Attention-Workspace/data/ScreenSpot-Pro \
+  --checkpoint /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --base_model /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --rounds 6 \
+  --use_dual_tokens \
+  --no_adaptive_crop
+```
 
-# ScreenSpot v1 (downloads from HuggingFace)
+### 8.2 ScreenSpot-v1
+
+注意：`v1` 不需要 `--data_dir`。
+
+```bash
 torchrun --nproc_per_node=8 eval/eval_screenspot.py \
-    --dataset v1 \
-    --checkpoint /path/to/checkpoint-500 \
-    --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --rounds 6 \
-    --use_dual_tokens \
-    --no_adaptive_crop
+  --dataset v1 \
+  --checkpoint /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --base_model /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --rounds 6 \
+  --use_dual_tokens \
+  --no_adaptive_crop
+```
 
-# ScreenSpot v2
+### 8.3 ScreenSpot-v2
+
+```bash
 torchrun --nproc_per_node=8 eval/eval_screenspot.py \
-    --dataset v2 \
-    --data_dir /path/to/v2_data \
-    --checkpoint /path/to/checkpoint-500 \
-    --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --rounds 6 \
-    --use_dual_tokens \
-    --no_adaptive_crop
-
-# Or use the batch script:
-CHECKPOINT=/path/to/checkpoint NUM_GPUS=8 bash jobs/eval_all_screenspot.sh
+  --dataset v2 \
+  --data_dir /mnt/data/zichuanfu/GUI-Attention-Workspace/data/ScreenSpot-v2 \
+  --checkpoint /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --base_model /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --rounds 6 \
+  --use_dual_tokens \
+  --no_adaptive_crop
 ```
 
-### Evaluate GUI-Actor baseline (no saccade)
+### 8.4 GUI-Actor baseline 对照
 
-Use GUI-Actor's own eval code:
-```bash
-cd /path/to/GUI-Actor
-# Delete old results first (script silently exits if results exist)
-rm -f screenspot-Pro_all_preds_StandardResize.txt screenspot-Pro_all_preds_StandardResize.json
-PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/screenSpot_pro.py \
-    --model_name_or_path /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --data_path /path/to/ScreenSpot-Pro \
-    --model_type qwen25vl
-```
-
-### Evaluate on training data
-
-```bash
-PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/eval_train_hit.py \
-    --model_path /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --data_path /path/to/guiact_bbox.json,/path/to/androidcontrol_bbox.json \
-    --image_folder /path/to/images,/path/to/images \
-    --max_samples 2000
-```
-
-## Visualization
-
-```bash
-python eval/visualize_saccade.py \
-    --checkpoint /path/to/checkpoint \
-    --base_model /path/to/GUI-Actor-3B-Qwen2.5-VL \
-    --screenspot_dir /path/to/ScreenSpot-Pro \
-    --sample_index 42 \
-    --output viz_sample42.png
-```
-
-## GRPO Training (after SFT)
-
-```bash
-SFT_CKPT=/path/to/sft-checkpoint NUM_GPUS=8 bash jobs/train_grpo.sh
-```
-
-## Project Structure
-
-```
-src/gui_attention/
-  train.py          # SaccadeTrainer: multi-round training with per-round backward
-  model.py          # Qwen25VLWithDualHead: backbone + LookHead + ClickHead
-  dual_head.py      # DualActionHead (LookHead + ClickHead)
-  builder.py        # MultiRoundInputBuilder: tokenizes multi-image conversations
-  inference.py      # Autoregressive saccade inference (generate → head)
-  foveation.py      # SaccadeLoop: round state tracking
-  grpo.py           # GRPO reinforcement learning trainer
-  attention.py      # Hidden state extraction + spatial utilities
-  crop.py           # Image cropping + coordinate helpers
-  labels.py         # Binary/Gaussian labels + crop masking
-  constants.py      # Tokens, chat template, resolution defaults
-eval/
-  eval_screenspot.py    # Unified ScreenSpot v1/v2/Pro evaluation
-  eval_train_hit.py     # Single-round hit rate on training data
-  visualize_saccade.py  # Multi-round visualization
-jobs/
-  train.sh              # SFT training script
-  train_grpo.sh         # GRPO training script
-  eval_all_screenspot.sh
-```
-
-## Server Quick Reference (Tencent 8×H20)
-
-Paths:
-```
-CODE=/mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
-MODEL_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/models
-DATA_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/data
-RESULT_DIR=/mnt/data/zichuanfu/GUI-Attention-Workspace/results
-```
-
-### Train (v15 SFT)
-```bash
-cd $CODE && git pull
-NUM_GPUS=8 bash jobs/train.sh
-# Output: $RESULT_DIR/ours_v15_dual/
-# To resume: RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
-```
-
-### Eval ScreenSpot-Pro (our model)
-```bash
-cd $CODE
-torchrun --nproc_per_node=8 eval/eval_screenspot.py \
-    --dataset pro \
-    --data_dir $DATA_DIR/ScreenSpot-Pro \
-    --checkpoint $RESULT_DIR/ours_v15_dual/checkpoint-500 \
-    --base_model $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
-    --rounds 6 \
-    --use_dual_tokens \
-    --no_adaptive_crop
-```
-
-### Eval ScreenSpot-Pro (GUI-Actor baseline)
 ```bash
 cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Actor
-rm -f screenspot-Pro_all_preds_StandardResize.txt  # must delete or script silently exits
+
+rm -f /tmp/gui_actor_pro/screenspot-Pro_all_preds_StandardResize.txt
+rm -f /tmp/gui_actor_pro/screenspot-Pro_all_preds_StandardResize.json
+
 PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/screenSpot_pro.py \
-    --model_name_or_path $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
-    --data_path $DATA_DIR/ScreenSpot-Pro \
-    --model_type qwen25vl
+  --model_type qwen25vl \
+  --model_name_or_path /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --data_path /mnt/data/zichuanfu/GUI-Attention-Workspace/data/ScreenSpot-Pro \
+  --save_path /tmp/gui_actor_pro
 ```
 
-### Eval on training data (single-round hit rate)
+## 9. 可视化
+
+### 9.1 ScreenSpot-Pro
+
 ```bash
-cd $CODE
-PYTHONPATH=src:$PYTHONPATH HF_HUB_OFFLINE=1 python eval/eval_train_hit.py \
-    --model_path $MODEL_DIR/GUI-Actor-3B-Qwen2.5-VL \
-    --data_path $DATA_DIR/guiact_bbox.json,$DATA_DIR/androidcontrol_bbox.json,$DATA_DIR/wave_ui_bbox.json,$DATA_DIR/uground_bbox.json \
-    --image_folder $DATA_DIR,$DATA_DIR,$DATA_DIR,$DATA_DIR \
-    --max_samples 2000
+cd /mnt/data/zichuanfu/GUI-Attention-Workspace/GUI-Attention
+
+PYTHONPATH=src python eval/visualize_saccade.py \
+  --checkpoint /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --base_model /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --dataset pro \
+  --data_dir /mnt/data/zichuanfu/GUI-Attention-Workspace/data/ScreenSpot-Pro \
+  --sample_index 42 \
+  --num_samples 10 \
+  --output viz_sft_batch.png \
+  --proposal_topk 4 \
+  --device cuda:0
 ```
 
-### Continue training from checkpoint
+### 9.2 训练集样本
+
 ```bash
-cd $CODE && git pull
-RESUME_CKPT=$RESULT_DIR/ours_v15_dual/checkpoint-500 NUM_GPUS=8 bash jobs/train.sh
-# Must set RESUME_CKPT explicitly; no auto-resume from output_dir
+PYTHONPATH=src python eval/visualize_saccade.py \
+  --checkpoint /mnt/data/zichuanfu/GUI-Attention-Workspace/results/ours_v15_dual/checkpoint-1500 \
+  --base_model /mnt/data/zichuanfu/GUI-Attention-Workspace/models/GUI-Actor-3B-Qwen2.5-VL \
+  --dataset train \
+  --train_json /mnt/data/zichuanfu/GUI-Attention-Workspace/data/groundcua_bbox.json \
+  --image_root /mnt/data/zichuanfu/GUI-Attention-Workspace/data/GroundCUA \
+  --sample_index 0 \
+  --num_samples 10 \
+  --output viz_train_groundcua.png \
+  --device cuda:0
 ```
 
-## Results (v15 checkpoint-500)
+## 10. 当前结果判断
 
-| Benchmark | Hit@1 | Overlap@1 |
-|-----------|-------|-----------|
-| ScreenSpot-Pro | 18.34% | 29.41% |
-| ScreenSpot v1 | 70.75% | 78.54% |
-| ScreenSpot v2 | 74.82% | 81.35% |
+### 已确认的对照
 
-GUI-Actor baseline: 43.20% on ScreenSpot-Pro (single-round, no saccade).
+- 原始 GUI-Actor 本地 `ScreenSpot-Pro`：约 `43.20`
+- 当前 proposal-based 多轮模型：
+  - `ScreenSpot-v2`：约 `88.43`
+  - `ScreenSpot-Pro`：仍明显偏低
 
-## Related Projects
+这说明：
 
-- [GUI-Actor](https://github.com/microsoft/GUI-Actor) — Pointer head architecture (base model)
-- [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL) — Vision-language backbone
+- 当前基础单轮 / 简单场景能力已经基本保住
+- 真正的短板在高分辨桌面图上的探索与停留策略
 
-## License
+## 11. 当前最重要的问题
 
-Apache License 2.0
+1. `ScreenSpot-Pro` 仍远低于 GUI-Actor baseline
+2. 模型倾向于：
+   - `round0 look`
+   - `round1 过早 click`
+3. `LookHead` 当前更像候选区域提议器，而不是稳定的精定位器
+4. GRPO 的格式稳定性还不够强
+
+## 12. 当前推荐实验顺序
+
+1. 先做 `GroundCUA` 单独二阶段 SFT
+2. 再重新评 `ScreenSpot-Pro`
+3. 再继续做 proposal-aligned GRPO
+4. RL 第一版只优化 `look/click`，不要先优化 proposal 选择
